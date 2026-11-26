@@ -85,7 +85,7 @@ See [Deploying](deploying.md#build-and-deploy-commands) for when each runs.
 
 ## Compose files
 
-Each app has a hand-written `apps/<name>/compose.yaml`. ship uploads it, plus `apps/<name>/Dockerfile` for release apps.
+Each app has a hand-written `apps/<name>/compose.yaml`. `ship config edit <name>` or the TUI app action opens it in your editor, creating it if missing; ship validates it and keeps a `.bak` before saving. ship uploads it, plus `apps/<name>/Dockerfile` for release apps.
 
 - Use `image: ${IMAGE}`; ship writes it to `/opt/apps/<name>/.ship.env`.
 - A healthcheck is required: a deploy fails if the container has none or it never becomes healthy.

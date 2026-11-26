@@ -2,6 +2,7 @@ package cli
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -52,6 +53,56 @@ const twoServerDoc = `servers:
           repo: example/app
         backup: {}
 `
+
+func TestConfigEditTargets(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ship.yaml")
+	if err := os.WriteFile(path, []byte(oneServerDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ship, err := resolveConfigEditTarget(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ship.path != path || ship.kind != editShipConfig {
+		t.Fatalf("ship target = %#v", ship)
+	}
+
+	app, err := resolveConfigEditTarget(path, "app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(dir, "apps", "app", "compose.yaml")
+	if app.path != want || app.kind != editCompose {
+		t.Fatalf("app target = %#v, want %s", app, want)
+	}
+
+	if _, err := resolveConfigEditTarget(path, "missing"); err == nil || !strings.Contains(err.Error(), "not in") {
+		t.Fatalf("unknown app error = %v", err)
+	}
+}
+
+func TestAskReopenDefaultsToYes(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"\n", true},
+		{"y\n", true},
+		{"YES\n", true},
+		{"n\n", false},
+		{"no\n", false},
+		{"maybe\nn\n", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		var out bytes.Buffer
+		if got := askReopen(bufio.NewReader(strings.NewReader(tc.in)), &out); got != tc.want {
+			t.Errorf("askReopen(%q) = %v, want %v (output %q)", tc.in, got, tc.want, out.String())
+		}
+	}
+}
 
 func decodeConfig(t *testing.T, doc string) *config.Config {
 	t.Helper()

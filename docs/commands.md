@@ -28,9 +28,18 @@ ship <server> backups <app>                      list server archives
 ship <server> restore <app> <archive> [--yes]    pre-restore backup, stop, restore, health-check
 ship <server> diff [app]                         compare local config with the server's records
 ship <server> import <app…>|--all [--overwrite]  import apps from the server's records
+ship config edit [app]                           edit ship.yaml or apps/<app>/compose.yaml locally
 ship version                                     print the ship version
 ship update [--check]                            update ship to the latest release
 ```
+
+## Editing config files
+
+`ship config edit` opens the found [`ship.yaml`](configuration.md#where-ship-looks) in your editor. `ship config edit <app>` opens `apps/<app>/compose.yaml` beside that file; if it does not exist yet, the editor starts empty and the file is created on save.
+
+The editor is `$VISUAL`, then `$EDITOR`, then `vi` (`notepad` on Windows); values such as `code --wait` are allowed. ship edits a temporary copy. If you leave it unchanged nothing is written. Otherwise the result is validated with the same rules as a TUI save (`ship.yaml`) or the compose checks, then the original is replaced and the previous file is kept as `.bak`. An invalid file is not written: ship prints the error and asks `Reopen editor? [Y/n]`, keeping your edits in the temporary copy if you reopen. A save is refused if the real file changed on disk while you were editing.
+
+This command only touches local files, so it never contacts a server and `--dry-run` has no effect.
 
 `status` without an app lists every app and the proxy. `backup` without an app backs up all apps. `deploy all` keeps going when an app fails, prints a summary and exits non-zero if any failed.
 
@@ -52,3 +61,4 @@ Destructive actions (`lock-ssh`, `rollback`, `vps reboot`, `restore`) prompt on 
 |---|---|
 | `SHIP_CONFIG` | path to `ship.yaml`; see [where ship looks](configuration.md#where-ship-looks) |
 | `SHIP_NO_UPDATE_CHECK=1` | turns off the daily [update check](updates.md) |
+| `$VISUAL`, `$EDITOR` | editor for `ship config edit` and the TUI; defaults to `vi` (`notepad` on Windows) |

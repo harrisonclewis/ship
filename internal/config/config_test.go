@@ -203,7 +203,7 @@ func TestEmptyConfigAndServersWithoutApps(t *testing.T) {
 }
 
 func TestServerNamesAreReservedCommandWords(t *testing.T) {
-	for _, name := range []string{"setup", "deploy", "status", "version", "update", "help", "all", "proxy"} {
+	for _, name := range []string{"setup", "deploy", "status", "version", "update", "help", "config", "all", "proxy"} {
 		t.Run(name, func(t *testing.T) {
 			doc := strings.Replace(validYAML, "  prod:", "  "+name+":", 1)
 			_, err := decode(t, doc)
@@ -214,6 +214,14 @@ func TestServerNamesAreReservedCommandWords(t *testing.T) {
 				t.Fatalf("error = %v, want reserved", err)
 			}
 		})
+	}
+}
+
+func TestConfigServerNameErrorMentionsConfigCommand(t *testing.T) {
+	doc := strings.Replace(validYAML, "  prod:", "  config:", 1)
+	_, err := decode(t, doc)
+	if err == nil || !strings.Contains(err.Error(), "ship config edit") {
+		t.Fatalf("error = %v, want the config command named", err)
 	}
 }
 

@@ -11,6 +11,7 @@ The Servers tab lists every server in `ship.yaml` with its IP, its apps and the 
 | `↑`/`↓`, `j`/`k` | move |
 | `Enter` | open the server |
 | `a` | add a server |
+| `e` | edit ship.yaml |
 | `r` | refresh status |
 | `Tab`, `1`/`2` | switch between Servers and Activity |
 | `q` | quit |
@@ -30,7 +31,7 @@ The server page shows each app with its current and previous version, health and
 | `r` | refresh |
 | `Esc` | back |
 
-**App actions:** deploy latest or build, deploy a version, roll back, restart, maintenance on/off, back up, list backups, restore, logs, edit env, edit, delete, compare with server.
+**App actions:** deploy latest or build, deploy a version, roll back, restart, maintenance on/off, back up, list backups, restore, logs, edit env, edit, edit compose.yaml, delete, compare with server.
 
 Apps marked **on server** exist only on the server and can be imported; **DIFF** means your config differs from what was last deployed. See [Server records](server-records.md).
 
@@ -50,14 +51,16 @@ One action runs per server at a time; actions on different servers run side by s
 
 Adding or editing a server or app opens a form. A server's form takes its host and, optionally, the SSH private key to log in with. Build and deploy commands get a numbered multi-line editor: `alt+Enter` or `ctrl+j` adds a line, `ctrl+e` opens your `$EDITOR`.
 
+Press `e` on the Servers tab to open `ship.yaml`, or `f` in an app's actions to open `apps/<name>/compose.yaml`. Both use your `$VISUAL`, `$EDITOR` or `vi` (`notepad` on Windows) through a temporary copy, and return to the TUI when the editor closes. If there are no changes, nothing is written. If there are, the file is validated; an invalid ship.yaml or compose file shows the error and offers to reopen the editor or discard the changes, keeping the temporary copy while you decide. A missing compose file opens empty and is created on save.
+
 Saving:
 
 - checks the whole config first and refuses anything invalid,
 - keeps your comments, key order and blank lines,
-- keeps the previous file as `ship.yaml.bak`,
-- refuses if `ship.yaml` changed on disk since the TUI loaded it,
+- keeps the previous file as `.bak`,
+- refuses if the file changed on disk since the TUI loaded or opened it,
 - creates `~/.config/ship/ship.yaml` if you have no config yet.
 
-Deleting a server or app only removes it from `ship.yaml`; nothing on the server changes. Edits are saved even with `--dry-run`, because they only touch your local file.
+Deleting a server or app only removes it from `ship.yaml`; nothing on the server changes. Edits are saved even with `--dry-run`, because they only touch your local files.
 
-The TUI doesn't write compose files: add `apps/<name>/compose.yaml` yourself (see [Adding an app](apps.md)).
+See [Adding an app](apps.md) for what a compose file needs.

@@ -13,11 +13,12 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/harrisonclewis/ship/internal/config"
+	"github.com/harrisonclewis/ship/internal/localedit"
 )
 
 // ErrConfigChanged means ship.yaml no longer matches what this document
 // loaded.
-var ErrConfigChanged = errors.New("ship.yaml changed on disk since it was loaded; reload it and try again")
+var ErrConfigChanged = localedit.ErrChanged
 
 // ServerValues are the fields the server form edits.
 type ServerValues struct {
@@ -215,71 +216,14 @@ func (d *Doc) Save() error {
 		return err
 	}
 
-	if d.exists {
-		current, err := os.ReadFile(d.path)
-		if err != nil {
-			return err
-		}
-		if !bytes.Equal(current, d.original) {
-			return ErrConfigChanged
-		}
-	} else if _, err := os.Stat(d.path); err == nil {
-		return ErrConfigChanged
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-
-	dir := filepath.Dir(d.path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	mode := d.mode
-	if mode == 0 {
-		mode = 0o600
-	}
-	if !d.exists {
-		mode = 0o600
-	}
-	f, err := os.CreateTemp(dir, "."+filepath.Base(d.path)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	cleanup := func() {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-	}
-	if err := f.Chmod(mode); err != nil {
-		cleanup()
-		return err
-	}
-	if _, err := f.Write(rendered); err != nil {
-		cleanup()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		cleanup()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-
-	if d.exists && len(d.original) > 0 {
-		bak := d.path + ".bak"
-		if err := os.WriteFile(bak, d.original, mode); err != nil {
-			_ = os.Remove(tmp)
-			return fmt.Errorf("write %s: %w", bak, err)
-		}
-	}
-	if err := os.Rename(tmp, d.path); err != nil {
-		_ = os.Remove(tmp)
+	if _, err := localedit.ReplaceFile(d.path, d.original, rendered, d.exists, d.mode); err != nil {
 		return err
 	}
 	d.original = rendered
 	d.exists = true
-	d.mode = mode
+	if d.mode == 0 {
+		d.mode = 0o600
+	}
 	return nil
 }
 

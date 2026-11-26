@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/harrisonclewis/ship/internal/config"
+	"github.com/harrisonclewis/ship/internal/localedit"
 	"github.com/harrisonclewis/ship/internal/ops"
 	"github.com/harrisonclewis/ship/internal/yamldoc"
 )
@@ -180,6 +181,73 @@ func press(t *testing.T, m *model, key string) (*model, tea.Cmd) {
 
 func statusFor(server string, apps ...ops.AppStatus) statusMsg {
 	return statusMsg{server: server, report: ops.StatusReport{Server: server, Proxy: "running", Apps: apps}}
+}
+
+func TestEditShipConfigFromServers(t *testing.T) {
+	m, _ := testModel(t, tuiTestDoc)
+	m, cmd := press(t, m, "e")
+	if cmd == nil || m.edit == nil {
+		t.Fatal("e did not start a local edit session")
+	}
+	if m.edit.target.path != m.path || m.edit.target.kind != editShipConfig {
+		t.Fatalf("edit target = %#v, want %s", m.edit.target, m.path)
+	}
+	_ = m.edit.session.Close()
+	m.edit = nil
+}
+
+func TestEditComposeFromAppActions(t *testing.T) {
+	m, _ := testModel(t, tuiTestDoc)
+	m, _ = press(t, m, "enter")
+	m, _ = press(t, m, "enter")
+	if m.page != pageAppActions {
+		t.Fatalf("page = %v, want app actions", m.page)
+	}
+	m, cmd := press(t, m, "f")
+	if cmd == nil || m.edit == nil {
+		t.Fatal("f did not start a local edit session")
+	}
+	want := filepath.Join(filepath.Dir(m.path), "apps", "app", "compose.yaml")
+	if m.edit.target.path != want || m.edit.target.kind != editCompose {
+		t.Fatalf("edit target = %#v, want %s", m.edit.target, want)
+	}
+	_ = m.edit.session.Close()
+	m.edit = nil
+}
+
+func TestInvalidShipEditOffersReopenOrDiscard(t *testing.T) {
+	m, _ := testModel(t, tuiTestDoc)
+	session, err := localedit.Begin(m.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.edit = &editSession{
+		target:  editTarget{path: m.path, label: m.path, validator: localedit.ValidateShipYAML, kind: editShipConfig},
+		session: session,
+		editor:  localedit.Editor{Name: "true"},
+	}
+	if err := os.WriteFile(session.TempPath(), []byte("servers: [\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m.finishLocalEdit(editDoneMsg{})
+	if m.confirm == nil || m.confirm.yesHint != "reopen" || m.confirm.noHint != "discard" {
+		t.Fatalf("confirm = %#v, want a reopen/discard choice", m.confirm)
+	}
+	before, err := os.ReadFile(m.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, _ = press(t, m, "n")
+	if m.edit != nil || m.confirm != nil {
+		t.Fatalf("discard left edit=%v confirm=%v", m.edit, m.confirm)
+	}
+	after, err := os.ReadFile(m.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("an invalid edit changed ship.yaml")
+	}
 }
 
 func TestTabsAndOpenServer(t *testing.T) {

@@ -116,7 +116,17 @@ func (m *model) hints() []keyHint {
 		return []keyHint{{"enter", "next/finish"}, {"tab", "next field"}, {"esc", "cancel"}}
 	}
 	if m.confirm != nil {
-		return []keyHint{{"enter/y", "confirm"}, {"esc/n", "cancel"}}
+		if m.confirm.ack {
+			return []keyHint{{"enter", "close"}}
+		}
+		yes, no := "confirm", "cancel"
+		if m.confirm.yesHint != "" {
+			yes = m.confirm.yesHint
+		}
+		if m.confirm.noHint != "" {
+			no = m.confirm.noHint
+		}
+		return []keyHint{{"enter/y", yes}, {"esc/n", no}}
 	}
 	switch m.page {
 	case pageActivity:
@@ -141,7 +151,7 @@ func (m *model) hints() []keyHint {
 	case pageCompare:
 		return []keyHint{{"u", "use server version"}, {"k/esc", "keep mine"}, {"↑/↓", "scroll"}}
 	default:
-		return []keyHint{{"enter", "open"}, {"a", "add server"}, {"r", "refresh"}, {"tab", "switch"}, {"q", "quit"}}
+		return []keyHint{{"enter", "open"}, {"a", "add server"}, {"e", "edit ship.yaml"}, {"r", "refresh"}, {"tab", "switch"}, {"q", "quit"}}
 	}
 }
 
@@ -764,7 +774,20 @@ func (m *model) viewConfirm() string {
 		width = 30
 	}
 	content := wrapText(c.body, width-4)
-	lines := []string{strings.Join(content, "\n"), "", styleMuted.Render("Enter/y confirm   ·   Esc/n cancel")}
+	footer := "Enter/y confirm   ·   Esc/n cancel"
+	if c.ack {
+		footer = "Enter to close"
+	} else if c.yesHint != "" || c.noHint != "" {
+		yes, no := "confirm", "cancel"
+		if c.yesHint != "" {
+			yes = c.yesHint
+		}
+		if c.noHint != "" {
+			no = c.noHint
+		}
+		footer = "Enter/y " + yes + "   ·   Esc/n " + no
+	}
+	lines := []string{strings.Join(content, "\n"), "", styleMuted.Render(footer)}
 	body := lipgloss.Place(m.width, m.bodyHeight(), lipgloss.Center, lipgloss.Center,
 		panel(c.title, strings.Join(lines, "\n"), width, 0, true))
 	return body

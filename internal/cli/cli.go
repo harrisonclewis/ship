@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"github.com/charmbracelet/huh"
 
 	"github.com/harrisonclewis/ship/internal/config"
+	"github.com/harrisonclewis/ship/internal/localedit"
 	"github.com/harrisonclewis/ship/internal/ops"
 	"github.com/harrisonclewis/ship/internal/remote"
 	"github.com/harrisonclewis/ship/internal/tui"
@@ -108,6 +110,8 @@ doneFlags:
 		})
 	case "update":
 		return update.Run(args[1:], o.out)
+	case "config":
+		return cmdConfig(o, args[1:])
 	case "help":
 		printUsage(out)
 		return nil
@@ -206,6 +210,152 @@ func requireNoArgs(name string, args []string, fn func() error) error {
 
 func loadConfig() (*config.Config, error) {
 	return config.LoadDefault()
+}
+
+type configEditKind int
+
+const (
+	editShipConfig configEditKind = iota
+	editCompose
+)
+
+type configEditTarget struct {
+	path      string
+	label     string
+	validator localedit.Validator
+	kind      configEditKind
+}
+
+func cmdConfig(o *options, args []string) error {
+	if len(args) == 0 || args[0] != "edit" || len(args) > 2 {
+		return usageErr("usage: ship config edit [app]")
+	}
+	path, err := config.Find()
+	if err != nil {
+		return err
+	}
+	app := ""
+	if len(args) == 2 {
+		app = args[1]
+	}
+	target, err := resolveConfigEditTarget(path, app)
+	if err != nil {
+		return err
+	}
+	return editConfigFile(o, target)
+}
+
+func resolveConfigEditTarget(path, app string) (configEditTarget, error) {
+	if app == "" {
+		return configEditTarget{
+			path:      path,
+			label:     path,
+			validator: localedit.ValidateShipYAML,
+			kind:      editShipConfig,
+		}, nil
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return configEditTarget{}, err
+	}
+	srv, ok := cfg.ServerForApp(app)
+	if !ok {
+		return configEditTarget{}, fmt.Errorf("app %q is not in %s on any server", app, path)
+	}
+	return configEditTarget{
+		path:      srv.ComposePath(app),
+		label:     "apps/" + app + "/compose.yaml",
+		validator: localedit.ValidateCompose,
+		kind:      editCompose,
+	}, nil
+}
+
+func editConfigFile(o *options, target configEditTarget) error {
+	editor, err := localedit.Resolve()
+	if err != nil {
+		return err
+	}
+	session, err := localedit.Begin(target.path)
+	if err != nil {
+		return err
+	}
+	keepTemp := false
+	defer func() {
+		if !keepTemp {
+			_ = session.Close()
+		}
+	}()
+	in := o.in
+	if in == nil {
+		in = os.Stdin
+	}
+	reader := bufio.NewReader(in)
+
+	for {
+		cmd := editor.Command(session.TempPath())
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = in, o.out, o.errOut
+		if err := cmd.Run(); err != nil {
+			keepTemp = true
+			fmt.Fprintf(o.errOut, "Your edits are in %s\n", session.TempPath())
+			return fmt.Errorf("editor %s: %w", editor.Name, err)
+		}
+
+		changed, err := session.Changed()
+		if err != nil {
+			keepTemp = true
+			fmt.Fprintf(o.errOut, "Your edits are in %s\n", session.TempPath())
+			return err
+		}
+		if !changed {
+			fmt.Fprintf(o.out, "No changes to %s.\n", target.label)
+			return nil
+		}
+
+		if err := session.Validate(target.validator); err != nil {
+			fmt.Fprintf(o.errOut, "%s is not valid:\n%v\n\n", target.label, err)
+			if !askReopen(reader, o.out) {
+				return fmt.Errorf("discarded changes to %s; the file was not changed", target.label)
+			}
+			continue
+		}
+
+		if err := session.Save(); err != nil {
+			keepTemp = true
+			if errors.Is(err, localedit.ErrChanged) {
+				fmt.Fprintf(o.errOut, "%s changed on disk while you were editing; not saved.\nYour edits are in %s\n", target.label, session.TempPath())
+			} else {
+				fmt.Fprintf(o.errOut, "Could not save %s; your edits are in %s\n", target.label, session.TempPath())
+			}
+			return err
+		}
+		if session.BackupWritten() {
+			fmt.Fprintf(o.out, "Saved %s (previous kept as %s.bak).\n", target.label, target.path)
+		} else {
+			fmt.Fprintf(o.out, "Saved %s.\n", target.label)
+		}
+		return nil
+	}
+}
+
+// askReopen reads a y/n answer, defaulting to yes on an empty line.
+func askReopen(reader *bufio.Reader, out io.Writer) bool {
+	for {
+		fmt.Fprint(out, "Reopen editor? [Y/n] ")
+		line, err := reader.ReadString('\n')
+		switch strings.ToLower(strings.TrimSpace(line)) {
+		case "", "y", "yes":
+			if err == nil || strings.TrimSpace(line) != "" {
+				return true
+			}
+			return false
+		case "n", "no":
+			return false
+		}
+		if err != nil {
+			return false
+		}
+		fmt.Fprintln(out, "Please answer y or n.")
+	}
 }
 
 func confirm(o *options, title string) error {
@@ -602,6 +752,8 @@ Commands:
   diff [app]                    compare local apps with the server's records
   import <app...>|--all         copy server apps into ship.yaml and apps/
                                 (--overwrite replaces existing apps/files)
+  config edit [app]             edit ship.yaml, or apps/<app>/compose.yaml,
+                                in $VISUAL/$EDITOR (no server contact)
   version                       print the ship version
   update [--check]              update ship to the latest release
 

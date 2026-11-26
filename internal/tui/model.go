@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/huh"
 
 	"github.com/harrisonclewis/ship/internal/config"
+	"github.com/harrisonclewis/ship/internal/localedit"
 	"github.com/harrisonclewis/ship/internal/ops"
 	"github.com/harrisonclewis/ship/internal/yamldoc"
 )
@@ -85,6 +86,7 @@ const (
 	aaLogs
 	aaEnvEdit
 	aaEdit
+	aaEditCompose
 	aaDelete
 	aaCompare
 	aaImport
@@ -110,6 +112,7 @@ var appActionDefs = []appActionDef{
 	{"g", "Logs", "Follow logs in the terminal", aaLogs, false},
 	{"e", "Edit env", "sudoedit the app's secret .env", aaEnvEdit, false},
 	{"i", "Edit app", "Change the app in ship.yaml", aaEdit, false},
+	{"f", "Edit compose.yaml", "Open apps/<app>/compose.yaml in your editor", aaEditCompose, false},
 	{"x", "Delete app", "Remove it from ship.yaml only", aaDelete, true},
 }
 
@@ -119,9 +122,33 @@ var importComposeAction = appActionDef{"i", "Import compose file", "No record (o
 var importUnreadableAction = appActionDef{"i", "Import compose file", "Record unreadable (newer ship?); copy only its compose files", aaImport, false}
 
 type confirmDialog struct {
-	title string
-	body  string
-	yes   func() tea.Cmd
+	title   string
+	body    string
+	yes     func() tea.Cmd
+	no      func() tea.Cmd
+	ack     bool
+	yesHint string
+	noHint  string
+}
+
+type editKind int
+
+const (
+	editShipConfig editKind = iota
+	editCompose
+)
+
+type editTarget struct {
+	path      string
+	label     string
+	validator localedit.Validator
+	kind      editKind
+}
+
+type editSession struct {
+	target  editTarget
+	session *localedit.Session
+	editor  localedit.Editor
 }
 
 type model struct {
@@ -177,6 +204,7 @@ type model struct {
 
 	form          *formHost
 	confirm       *confirmDialog
+	edit          *editSession
 	toast         *toast
 	toastSet      time.Time
 	pendingReboot string
@@ -221,6 +249,10 @@ type terminalReadyMsg struct {
 	cmd     *exec.Cmd
 	display string
 	err     error
+}
+
+type editDoneMsg struct {
+	err error
 }
 
 func newModel(cfg *config.Config, backend Backend, doc *yamldoc.Doc, path string, dryRun bool) *model {
@@ -387,6 +419,8 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showToast(toastInfo, "Terminal closed.")
 		}
 		return m, nil
+	case editDoneMsg:
+		return m, m.finishLocalEdit(msg)
 	}
 	// huh moves between fields and groups with its own messages (and blinks
 	// the cursor), so everything else goes to the open form.
@@ -431,6 +465,14 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if m.confirm != nil {
+		if m.confirm.ack {
+			switch key {
+			case "y", "enter", "n", "esc", "q":
+				m.confirm = nil
+				m.offerPendingReboot()
+			}
+			return m, nil
+		}
 		switch key {
 		case "y", "enter":
 			yes := m.confirm.yes
@@ -442,7 +484,13 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.offerPendingReboot()
 		case "n", "esc", "q":
+			no := m.confirm.no
 			m.confirm = nil
+			if no != nil {
+				cmd := no()
+				m.offerPendingReboot()
+				return m, cmd
+			}
 			m.offerPendingReboot()
 		}
 		return m, nil
@@ -512,6 +560,15 @@ func (m *model) handleTabKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) {
 	case "a":
 		if m.page == pageServers {
 			m.openServerForm("", true)
+		}
+	case "e":
+		if m.page == pageServers {
+			return m, m.beginLocalEdit(editTarget{
+				path:      m.path,
+				label:     m.path,
+				validator: localedit.ValidateShipYAML,
+				kind:      editShipConfig,
+			})
 		}
 	case "r":
 		if m.page == pageServers {
@@ -1226,6 +1283,14 @@ func (m *model) openConfirm(title, body string, yes func() tea.Cmd) {
 	m.confirm = &confirmDialog{title: title, body: body, yes: yes}
 }
 
+func (m *model) openConfirmChoice(title, body string, yes, no func() tea.Cmd) {
+	m.confirm = &confirmDialog{title: title, body: body, yes: yes, no: no, yesHint: "reopen", noHint: "discard"}
+}
+
+func (m *model) openNotice(title, body string) {
+	m.confirm = &confirmDialog{title: title, body: body, ack: true}
+}
+
 func (m *model) showToast(kind toastKind, msg string) {
 	m.toast = &toast{kind: kind, msg: msg}
 	m.resizeViewport()
@@ -1345,6 +1410,18 @@ func (m *model) runAppAction(action appAction) tea.Cmd {
 		return m.prepareTerminal(TerminalRequest{Kind: TerminalEnvEdit, Server: server, App: app})
 	case aaEdit:
 		m.openAppForm(app, false)
+	case aaEditCompose:
+		srv, err := m.backend.Server(server)
+		if err != nil {
+			m.showToast(toastError, err.Error())
+			return nil
+		}
+		return m.beginLocalEdit(editTarget{
+			path:      srv.ComposePath(app),
+			label:     "apps/" + app + "/compose.yaml",
+			validator: localedit.ValidateCompose,
+			kind:      editCompose,
+		})
 	case aaDelete:
 		m.openConfirm("Delete app", "Remove "+app+" from ship.yaml? This only edits the file; the app's compose files, data and deployed containers are not changed.", func() tea.Cmd {
 			return m.deleteApp(server, app)
@@ -1409,6 +1486,95 @@ func terminalLabel(req TerminalRequest) string {
 		return "Logs " + req.App
 	}
 	return "Edit env " + req.App
+}
+
+func (m *model) beginLocalEdit(target editTarget) tea.Cmd {
+	if m.edit != nil {
+		m.showToast(toastWarning, "Finish the open editor first.")
+		return nil
+	}
+	editor, err := localedit.Resolve()
+	if err != nil {
+		m.showToast(toastError, err.Error())
+		return nil
+	}
+	session, err := localedit.Begin(target.path)
+	if err != nil {
+		m.showToast(toastError, err.Error())
+		return nil
+	}
+	m.edit = &editSession{target: target, session: session, editor: editor}
+	return m.execEditor()
+}
+
+func (m *model) execEditor() tea.Cmd {
+	if m.edit == nil {
+		return nil
+	}
+	cmd := m.edit.editor.Command(m.edit.session.TempPath())
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+		return editDoneMsg{err: err}
+	})
+}
+
+func (m *model) finishLocalEdit(msg editDoneMsg) tea.Cmd {
+	e := m.edit
+	if e == nil {
+		return nil
+	}
+	if msg.err != nil {
+		m.edit = nil
+		m.openNotice("Editor failed", fmt.Sprintf("%v\n\nYour edits are in %s", msg.err, e.session.TempPath()))
+		return nil
+	}
+	changed, err := e.session.Changed()
+	if err != nil {
+		m.edit = nil
+		m.openNotice("Edit failed", fmt.Sprintf("%v\n\nYour edits are in %s", err, e.session.TempPath()))
+		return nil
+	}
+	if !changed {
+		_ = e.session.Close()
+		m.edit = nil
+		m.showToast(toastInfo, "No changes to "+e.target.label+".")
+		return nil
+	}
+	if err := e.session.Validate(e.target.validator); err != nil {
+		m.openConfirmChoice("Invalid "+e.target.label,
+			fmt.Sprintf("%v\n\nYour edits are kept in %s.", err, e.session.TempPath()),
+			func() tea.Cmd { return m.execEditor() },
+			func() tea.Cmd {
+				if m.edit != nil {
+					_ = m.edit.session.Close()
+					m.edit = nil
+				}
+				m.showToast(toastInfo, "Discarded changes to "+e.target.label+".")
+				return nil
+			})
+		return nil
+	}
+	if err := e.session.Save(); err != nil {
+		m.edit = nil
+		if errors.Is(err, localedit.ErrChanged) {
+			m.openNotice("Not saved", fmt.Sprintf("%s changed on disk while you were editing; not saved.\n\nYour edits are in %s", e.target.label, e.session.TempPath()))
+		} else {
+			m.openNotice("Could not save", fmt.Sprintf("%v\n\nYour edits are in %s", err, e.session.TempPath()))
+		}
+		return nil
+	}
+	_ = e.session.Close()
+	m.edit = nil
+	if e.target.kind == editShipConfig {
+		if err := m.reloadConfig(); err != nil {
+			m.showToast(toastError, err.Error())
+			return nil
+		}
+		m.showToast(toastSuccess, "Saved "+e.target.label+".")
+		return m.refreshAllStatuses()
+	}
+	m.recomputeAllDiffs()
+	m.showToast(toastSuccess, "Saved "+e.target.label+".")
+	return nil
 }
 
 func (m *model) loadBackups(server, app string) tea.Cmd {

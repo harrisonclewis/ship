@@ -71,6 +71,7 @@ var reservedServerNames = map[string]bool{
 	"version":     true,
 	"update":      true,
 	"help":        true,
+	"config":      true,
 	"all":         true,
 }
 
@@ -375,6 +376,9 @@ func (c *Config) Validate() error {
 
 func validateServerName(name string) error {
 	if reservedServerNames[name] {
+		if name == "config" {
+			return errors.New(`servers.config: "config" is reserved for "ship config edit"; rename the server`)
+		}
 		return fmt.Errorf("servers.%s: %q is reserved", name, name)
 	}
 	if !appNameRE.MatchString(name) {
@@ -738,6 +742,16 @@ func (c *Config) Server(name string) (*Server, error) {
 		return nil, fmt.Errorf("unknown server %q (configured: %s)", name, strings.Join(c.ServerNames(), ", "))
 	}
 	return s, nil
+}
+
+// ServerForApp returns the first server in name order that defines app.
+func (c *Config) ServerForApp(name string) (*Server, bool) {
+	for _, n := range c.ServerNames() {
+		if srv := c.Servers[n]; srv != nil && srv.Apps[name] != nil {
+			return srv, true
+		}
+	}
+	return nil, false
 }
 
 // AppNames returns app names sorted for deterministic output.
