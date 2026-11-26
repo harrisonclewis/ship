@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -25,7 +26,7 @@ func TestYAMLEditKeepsCommentsAndWritesBuildDeployFields(t *testing.T) {
 		Domains:           []string{"app.example.com"},
 		Upstream:          "app:8080",
 		SourceType:        "image",
-		SourcePath:        "/tmp/app",
+		SourcePath:        "~/app",
 		Env:               "FOO=bar",
 		BuildCommands:     "npm ci\nnpm run build",
 		DeployCommands:    "php artisan migrate --force",
@@ -78,7 +79,8 @@ func TestYAMLEditKeepsCommentsAndWritesBuildDeployFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if app.Source.Type != "image" || app.Source.Path != "/tmp/app" {
+	home, _ := os.UserHomeDir()
+	if app.Source.Type != "image" || app.Source.Path != filepath.Join(home, "app") {
 		t.Fatalf("source = %+v", app.Source)
 	}
 	if !strings.Contains(app.Build.Commands, "npm ci") {
@@ -185,14 +187,15 @@ func TestYAMLSaveCreatesPrivateConfigAndEmptyServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm() != 0o600 {
+	// Windows has no Unix permission bits; the mode check only means something elsewhere.
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("file mode = %o, want 600", fi.Mode().Perm())
 	}
 	di, err := os.Stat(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if di.Mode().Perm() != 0o700 {
+	if runtime.GOOS != "windows" && di.Mode().Perm() != 0o700 {
 		t.Fatalf("directory mode = %o, want 700", di.Mode().Perm())
 	}
 

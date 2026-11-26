@@ -38,7 +38,7 @@ servers:
         upstream: web:3000
         source:
           type: image
-          path: /tmp/web
+          path: ~/web
         backup: {}
 `
 
@@ -386,7 +386,7 @@ func TestAppFormLoadsSourceAndDeployValues(t *testing.T) {
 	m.serverName = "staging"
 	m.appName = "web"
 	v := m.newAppFormValues("staging", "web", false)
-	if v.SourceType != "image" || v.SourcePath != "/tmp/web" {
+	if v.SourceType != "image" || v.SourcePath != "~/web" {
 		t.Fatalf("image source not loaded: %+v", v)
 	}
 	if !v.DeployMaintenance {

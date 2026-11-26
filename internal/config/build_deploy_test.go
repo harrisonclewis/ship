@@ -15,7 +15,7 @@ func imageApp(extra string) string {
         upstream: web:3000
         source:
           type: image
-          path: /tmp/web
+          path: ~/web
 ` + extra
 }
 

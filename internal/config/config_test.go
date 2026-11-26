@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-const validYAML = `backup_dir_local: /tmp/ship-backups
+const validYAML = `backup_dir_local: ~/ship-backups
 servers:
   prod:
     host: ops@203.0.113.10
@@ -37,7 +37,7 @@ servers:
         upstream: commerce:3000
         source:
           type: image
-          path: /tmp/commerce
+          path: ~/commerce
         health:
           http_path: /
         backup: {}
@@ -85,7 +85,8 @@ func TestDecodeValid(t *testing.T) {
 	if got := srv.AppsSpec(); got != "lewbox:10001" {
 		t.Fatalf("AppsSpec = %q", got)
 	}
-	if got := c.BackupDirLocal; got != "/tmp/ship-backups" {
+	home, _ := os.UserHomeDir()
+	if got := c.BackupDirLocal; got != filepath.Join(home, "ship-backups") {
 		t.Fatalf("BackupDirLocal = %q", got)
 	}
 }
@@ -160,15 +161,15 @@ func TestRejectInvalidConfig(t *testing.T) {
 		{"bad upstream", strings.Replace(validYAML, "lewbox:8080", "lewbox", 1), "upstream"},
 		{"bad upstream port", strings.Replace(validYAML, "lewbox:8080", "lewbox:70000", 1), "port"},
 		{"bad repo", strings.Replace(validYAML, "repo: harlew-dev/lewbox", "repo: lewbox", 1), "repo"},
-		{"relative image path", strings.Replace(validYAML, "path: /tmp/commerce", "path: commerce", 1), "absolute"},
-		{"image with repo", strings.Replace(validYAML, "type: image\n          path: /tmp/commerce", "type: image\n          path: /tmp/commerce\n          repo: x/y", 1), "repo/asset"},
+		{"relative image path", strings.Replace(validYAML, "path: ~/commerce", "path: commerce", 1), "absolute"},
+		{"image with repo", strings.Replace(validYAML, "type: image\n          path: ~/commerce", "type: image\n          path: ~/commerce\n          repo: x/y", 1), "repo/asset"},
 		{"sqlite without uid", strings.Replace(validYAML, "        uid: 10001\n", "", 1), "uid is required"},
 		{"path traversal", strings.Replace(validYAML, "data: [/srv/lewbox]", "data: [/srv/../etc]", 1), "clean absolute"},
 		{"env dollar", strings.Replace(validYAML, "172.30.0.0/24", "$SECRET", 1), "env."},
 		{"reserved env", strings.Replace(validYAML, "LEWBOX_TRUSTED_PROXIES:", "IMAGE:", 1), "reserved"},
 		{"bad health path", strings.Replace(validYAML, "http_path: /v0/health", "http_path: v0/health", 1), "http_path"},
 		{"unpinned caddy", strings.Replace(validYAML, "caddy_image: caddy:2.10-alpine", "caddy_image: caddy", 1), "pin"},
-		{"relative backup dir", strings.Replace(validYAML, "backup_dir_local: /tmp/ship-backups", "backup_dir_local: backups", 1), "absolute"},
+		{"relative backup dir", strings.Replace(validYAML, "backup_dir_local: ~/ship-backups", "backup_dir_local: backups", 1), "absolute"},
 		{"removed registry owner", validYAML + "registry_owner: harlew-dev\n", "registry_owner"},
 	}
 	for _, tc := range cases {
@@ -185,10 +186,10 @@ func TestRejectInvalidConfig(t *testing.T) {
 }
 
 func TestEmptyConfigAndServersWithoutApps(t *testing.T) {
-	if _, err := decode(t, "backup_dir_local: /tmp/b\nservers: {}\n"); err != nil {
+	if _, err := decode(t, "backup_dir_local: ~/b\nservers: {}\n"); err != nil {
 		t.Fatalf("config with no servers rejected: %v", err)
 	}
-	if _, err := decode(t, "backup_dir_local: /tmp/b\n"); err != nil {
+	if _, err := decode(t, "backup_dir_local: ~/b\n"); err != nil {
 		t.Fatalf("empty config rejected: %v", err)
 	}
 	doc := strings.Split(validYAML, "    apps:")[0] + "    apps: {}\n"

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -97,8 +98,8 @@ var archiveNameRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,150}\.tar\.gz$`)
 
 func validArchivePath(app, p string) error {
 	if !strings.HasPrefix(p, "/var/backups/ship/"+app+"/") ||
-		strings.Contains(p, "..") || filepath.Clean(p) != p ||
-		!archiveNameRE.MatchString(filepath.Base(p)) {
+		strings.Contains(p, "..") || path.Clean(p) != p ||
+		!archiveNameRE.MatchString(path.Base(p)) {
 		return fmt.Errorf("unexpected archive path %q for %s", p, app)
 	}
 	return nil
@@ -106,8 +107,8 @@ func validArchivePath(app, p string) error {
 
 func validRemoteArchive(app, p string) bool {
 	if strings.HasPrefix(p, "/var/backups/ship/"+app+"/") &&
-		!strings.Contains(p, "..") && filepath.Clean(p) == p &&
-		archiveNameRE.MatchString(filepath.Base(p)) {
+		!strings.Contains(p, "..") && path.Clean(p) == p &&
+		archiveNameRE.MatchString(path.Base(p)) {
 		return true
 	}
 	return regexp.MustCompile(`^/tmp/ship-restore-` + regexp.QuoteMeta(app) + `-[0-9]+\.tar\.gz$`).MatchString(p)
@@ -179,7 +180,8 @@ func downloadSHA(s *remote.Session, localDir, remotePath, wantSHA string) (strin
 	if !strings.EqualFold(sum, wantSHA) {
 		return "", fmt.Errorf("checksum mismatch for %s: want %s, got %s", remotePath, wantSHA, sum)
 	}
-	dst := filepath.Join(localDir, filepath.Base(remotePath))
+	// remotePath is a server (POSIX) path; localDir is a local one.
+	dst := filepath.Join(localDir, path.Base(remotePath))
 	if existing, err := fileSHA(dst); err == nil {
 		if existing == sum {
 			return dst, nil
