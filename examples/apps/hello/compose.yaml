@@ -1,0 +1,29 @@
+name: hello
+
+services:
+  hello:
+    image: ${IMAGE:?run ship deploy hello first}
+    restart: unless-stopped
+    volumes:
+      - /srv/hello:/data
+    environment:
+      HELLO_DB: ${HELLO_DB:-/data/hello.db}
+    env_file:
+      - path: .env
+        required: false
+    networks: [web]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+networks:
+  web:
+    external: true

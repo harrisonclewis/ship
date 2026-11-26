@@ -1,0 +1,6 @@
+/bin/
+/dist/
+/ship
+/ship.yaml
+*.test
+/apps/

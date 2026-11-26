@@ -1,0 +1,162 @@
+name: Release
+
+# Push an annotated tag like v0.2.0 to build, sign and upload a draft release.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Format, vet and test
+        run: make check
+
+      - name: Build release binaries
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          make dist VERSION="${VERSION#v}"
+          for asset in \
+            ship-linux-x64 ship-linux-arm64 \
+            ship-darwin-arm64 ship-darwin-x64 \
+            ship-windows-x64.exe ship-windows-arm64.exe; do
+            test -s "dist/$asset"
+          done
+
+      - name: Smoke test the Linux build
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test "$(./dist/ship-linux-x64 --version)" = "ship ${TAG#v}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ship-binaries
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke:
+    name: smoke ${{ matrix.asset }}
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            asset: ship-linux-x64
+          - runner: ubuntu-24.04-arm
+            asset: ship-linux-arm64
+          - runner: macos-15
+            asset: ship-darwin-arm64
+          - runner: macos-15-intel
+            asset: ship-darwin-x64
+          - runner: windows-latest
+            asset: ship-windows-x64.exe
+
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ship-binaries
+          path: out
+
+      - name: Check the binary runs and reports the tag version
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          chmod +x "out/${{ matrix.asset }}" 2>/dev/null || true
+          output="$("./out/${{ matrix.asset }}" --version | tr -d '\r')"
+          test "$output" = "ship ${TAG#v}"
+
+  release:
+    name: publish
+    needs:
+      - build
+      - smoke
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ship-binaries
+          path: out
+
+      - name: Write and sign checksums
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          SIGNING_KEY: ${{ secrets.SHIP_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "The SHIP_RELEASE_SIGNING_KEY secret is not set." >&2
+            exit 1
+          fi
+          cd out
+          assets=(ship-linux-x64 ship-linux-arm64 ship-darwin-arm64 ship-darwin-x64 ship-windows-x64.exe ship-windows-arm64.exe)
+          for asset in "${assets[@]}"; do
+            test -s "$asset"
+          done
+          sha256sum "${assets[@]}" > SHA256SUMS
+          # Clients verify Ed25519 over "ship-release v<version>\n" + SHA256SUMS,
+          # which binds the version so an old release cannot be relabelled.
+          key="$RUNNER_TEMP/release-key.pem"
+          message="$RUNNER_TEMP/signed-message"
+          trap 'rm -f "$key" "$message" "$RUNNER_TEMP/release-key.pub"' EXIT
+          (umask 077 && printf '%s\n' "$SIGNING_KEY" > "$key")
+          { printf 'ship-release v%s\n' "${TAG#v}"; cat SHA256SUMS; } > "$message"
+          openssl pkeyutl -sign -rawin -inkey "$key" \
+            -in "$message" -out SHA256SUMS.sig
+          openssl pkey -in "$key" -pubout -out "$RUNNER_TEMP/release-key.pub"
+          openssl pkeyutl -verify -rawin -pubin -inkey "$RUNNER_TEMP/release-key.pub" \
+            -in "$message" -sigfile SHA256SUMS.sig
+          cat SHA256SUMS
+
+      - name: Publish the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # A draft with no notes: write and apply the notes by hand after the
+          # assets are checked.
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --notes "" \
+            --title "$TAG" \
+            out/ship-linux-x64 out/ship-linux-arm64 \
+            out/ship-darwin-arm64 out/ship-darwin-x64 \
+            out/ship-windows-x64.exe out/ship-windows-arm64.exe \
+            out/SHA256SUMS out/SHA256SUMS.sig

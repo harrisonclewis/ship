@@ -1,0 +1,23 @@
+name: web
+
+services:
+  web:
+    image: ${IMAGE:?run ship deploy web first}
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    networks: [web]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 6
+
+networks:
+  web:
+    external: true

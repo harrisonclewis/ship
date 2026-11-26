@@ -1,0 +1,85 @@
+# Example ship.yaml. Copy this folder to ~/.config/ship (or anywhere, with
+# SHIP_CONFIG=/path/to/ship.yaml), set the servers and apps, and keep secrets in
+# /opt/apps/<app>/.env on each server (ship <server> env edit <app>).
+
+# `ship <server> backup` downloads archives here, under <server>/<app>/.
+backup_dir_local: ~/backups/vps
+
+servers:
+  prod:
+    # For the first `ship prod setup`, use root@<ip>, then switch to admin_user
+    # and run `ship prod lock-ssh`.
+    host: ops@203.0.113.10
+    # Optional: the private key for this server. Without it, ssh uses your
+    # ssh config and agent.
+    identity_file: ~/.ssh/id_ed25519
+    admin_user: ops
+    arch: linux/amd64
+    caddy_image: caddy:2.10-alpine
+
+    apps:
+      # Built on the server from a GitHub release binary.
+      hello:
+        domains: [hello.example.com]
+        upstream: hello:8080
+        source:
+          type: github-release
+          repo: example/hello
+          asset: hello_linux_{arch}
+        uid: 10001
+        data: [/srv/hello]
+        health:
+          http_path: /health
+        backup:
+          sqlite: [/srv/hello/hello.db]
+        env:
+          HELLO_DB: /data/hello.db
+
+      # Built on this machine from a local repo and loaded onto the server over ssh.
+      web:
+        domains: [example.com]
+        redirects: [www.example.com]
+        upstream: web:3000
+        source:
+          type: image
+          path: ~/code/web
+        health:
+          http_path: /
+        # Run on this machine in source.path before the image is built.
+        build:
+          commands: |
+            npm ci --audit false
+            npm run build
+        # Run on the server in the new image just before it goes live. The
+        # site shows a 503 maintenance page from backup until health checks pass.
+        deploy:
+          commands: |
+            npm run migrate
+          maintenance: true
+        backup: {}
+        env: {}
+
+  staging:
+    host: ops@203.0.113.20
+    admin_user: ops
+    arch: linux/amd64
+    caddy_image: caddy:2.10-alpine
+
+    apps:
+      # The same app folder can be deployed to more than one server; domains
+      # must still be unique across every server.
+      hello:
+        domains: [hello.staging.example.com]
+        upstream: hello:8080
+        source:
+          type: github-release
+          repo: example/hello
+          asset: hello_linux_{arch}
+        uid: 10001
+        data: [/srv/hello]
+        health:
+          http_path: /health
+        backup:
+          sqlite: [/srv/hello/hello.db]
+        env:
+          HELLO_DB: /data/hello.db

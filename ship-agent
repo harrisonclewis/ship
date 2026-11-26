@@ -1,0 +1,1338 @@
+#!/usr/bin/env bash
+# ship-agent: server-side operations for the `ship` CLI.
+#
+# Installed at /usr/local/sbin/ship-agent and run as root:
+#   sudo ship-agent version
+#   sudo ship-agent setup <admin-user> <caddy-image> <app:uid,...>
+#   sudo ship-agent lock-ssh <admin-user>
+#   sudo ship-agent vps-update | reboot
+#   sudo ship-agent proxy-update <caddy-image>        (Caddyfile on stdin)
+#   sudo ship-agent app-files <app>                   (tar of app files on stdin)
+#   sudo ship-agent image-load <app> <version>        (compressed docker save on stdin)
+#   sudo ship-agent deploy <app> <version|latest>
+#   sudo ship-agent rollback <app>
+#   sudo ship-agent maintenance-check
+#   sudo ship-agent maintenance <app> <on|off>
+#   sudo ship-agent status [--format=kv] [app]
+#   sudo ship-agent logs <app> [service]
+#   sudo ship-agent restart <app>
+#   sudo ship-agent backup <app|all> <label>
+#   sudo ship-agent backups <app>
+#   sudo ship-agent restore <app> <archive> --yes
+#
+# Safety rules: every argument is validated before use, no argument is ever
+# eval'd, backups are taken before switches, health is checked before success,
+# and a failed switch restores the previous image. Secrets are read from stdin
+# and never printed. Docker published ports bypass ufw: only the proxy
+# publishes ports.
+set -euo pipefail
+umask 022
+
+AGENT_VERSION=3
+
+APPS=/opt/apps
+PROXY=/opt/proxy
+BACKUPS=/var/backups/ship
+WEB_SUBNET=172.30.0.0/24
+CADDY_DEFAULT=caddy:2.10-alpine
+
+APP_RE='^[a-z][a-z0-9-]{0,30}[a-z0-9]$'
+TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+VER_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+LABEL_RE='^[A-Za-z0-9._-]+$'
+SERVICE_RE='^[a-z][a-z0-9-]{0,30}[a-z0-9]$'
+USER_RE='^[a-z_][a-z0-9_-]{0,31}$'
+IMAGE_RE='^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9_][A-Za-z0-9._-]{0,127}|@sha256:[a-f0-9]{64})$'
+ARCHIVE_RE='^[A-Za-z0-9._-]+\.tar\.gz$'
+
+TMPLIST=$(mktemp /tmp/ship-agent-list.XXXXXX)
+cleanup() {
+  local d
+  [ -f "$TMPLIST" ] || return 0
+  while IFS= read -r d; do
+    [ -n "$d" ] && rm -rf "$d"
+  done < "$TMPLIST"
+  rm -f "$TMPLIST"
+}
+trap cleanup EXIT
+
+die() { printf 'ship-agent: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*" >&2; }
+step() { printf '\n== %s\n' "$*" >&2; }
+
+# Note: callers capture mktmp's output in $(...), which runs in a subshell.
+# Record the path in a file as well, so the EXIT trap in the parent cleans it.
+mktmp() {
+  local d
+  d=$(mktemp -d /tmp/ship-agent.XXXXXX)
+  printf '%s\n' "$d" >> "$TMPLIST"
+  printf '%s' "$d"
+}
+
+usage() {
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+}
+
+validate_app() {
+  local app=${1:-}
+  [[ $app =~ $APP_RE ]] || die "invalid app name '$app'"
+  [ -f "$APPS/$app/.ship-meta" ] || die "app '$app' is not installed; run ship deploy $app"
+}
+
+meta_get() {
+  local app=$1 key=$2
+  awk -v k="$key" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$APPS/$app/.ship-meta"
+}
+
+meta_list() {
+  local v
+  v=$(meta_get "$1" "$2")
+  # Values are validated tokens; splitting on spaces is intended.
+  # shellcheck disable=SC2086
+  [ -n "$v" ] && printf '%s\n' $v
+}
+
+state_get() {
+  local f="$APPS/$1/.ship-state"
+  [ -f "$f" ] || return 0
+  awk -F= -v k="$2" '$1 == k { print $2; exit }' "$f"
+}
+
+set_state() {
+  local app=$1 cur=$2 prev=$3 tmp
+  [[ $cur =~ $VER_RE ]] || die "refusing to record version '$cur'"
+  [ -z "$prev" ] || [[ $prev =~ $VER_RE ]] || die "refusing to record previous '$prev'"
+  tmp=$(mktemp "$APPS/$app/.ship-state.XXXXXX")
+  printf 'current=%s\nprevious=%s\n' "$cur" "$prev" > "$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$APPS/$app/.ship-state"
+}
+
+image_for() {
+  local app=$1 ver=$2 repo
+  repo=$(meta_get "$app" image_repo)
+  [ -n "$repo" ] || die "no image_repo in metadata for $app"
+  [[ $repo =~ ^[a-z0-9][a-z0-9._/-]*$ ]] || die "invalid image_repo '$repo'"
+  printf '%s:%s\n' "$repo" "$ver"
+}
+
+write_ship_env() {
+  local app=$1 image=$2 tmp
+  [[ $image =~ $IMAGE_RE ]] || die "refusing to write IMAGE='$image'"
+  tmp=$(mktemp)
+  {
+    printf 'IMAGE=%s\n' "$image"
+    if [ -f "$APPS/$app/.ship-env" ]; then
+      cat "$APPS/$app/.ship-env"
+    fi
+  } > "$tmp"
+  chmod 0600 "$tmp"
+  mv "$tmp" "$APPS/$app/.ship.env"
+}
+
+compose_app() {
+  local app=$1
+  shift
+  local args=(--project-directory "$APPS/$app")
+  [ -f "$APPS/$app/.ship.env" ] && args+=(--env-file "$APPS/$app/.ship.env")
+  docker compose "${args[@]}" "$@"
+}
+
+compose_proxy() {
+  docker compose --project-directory "$PROXY" --env-file "$PROXY/.env" "$@"
+}
+
+reload_caddy() {
+  for _ in 1 2 3 4 5; do
+    compose_proxy exec -T caddy caddy reload --config /etc/caddy/Caddyfile && return 0
+    sleep 1
+  done
+  return 1
+}
+
+maintenance_mount() {
+  local id
+  id=$(compose_proxy ps -q caddy 2>/dev/null | head -n1 || true)
+  [ -n "$id" ] || return 1
+  docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$id" 2>/dev/null \
+    | grep -qx '/etc/caddy/maintenance'
+}
+
+maintenance_check() {
+  if maintenance_mount; then
+    printf 'maintenance=ok\n'
+  else
+    printf 'maintenance=missing\n'
+  fi
+}
+
+maintenance_app() {
+  local app=$1 state=$2
+  validate_app "$app"
+  case "$state" in
+    on)
+      maintenance_mount \
+        || die "the proxy has no maintenance mount; run 'ship $(server_label "$app") setup' then 'ship $(server_label "$app") proxy update'"
+      install -d -m 0755 "$PROXY/maintenance"
+      printf 'maintenance on for %s\n' "$app" > "$PROXY/maintenance/.$app.tmp"
+      chmod 0644 "$PROXY/maintenance/.$app.tmp"
+      mv -f "$PROXY/maintenance/.$app.tmp" "$PROXY/maintenance/$app"
+      note "maintenance page on for $app"
+      ;;
+    off)
+      install -d -m 0755 "$PROXY/maintenance"
+      rm -f "$PROXY/maintenance/$app"
+      note "maintenance page off for $app"
+      ;;
+    *) die "usage: ship-agent maintenance <app> <on|off>" ;;
+  esac
+}
+
+ensure_app_user() {
+  local app=$1 uid=$2 gid
+  [ -n "$uid" ] || return 0
+  [[ $app =~ $APP_RE ]] || die "invalid app user '$app'"
+  [[ $uid =~ ^[0-9]+$ ]] || die "invalid uid '$uid'"
+  if getent group "$app" >/dev/null; then
+    gid=$(getent group "$app" | cut -d: -f3)
+    [ "$gid" = "$uid" ] || note "warning: group $app has gid $gid, wanted $uid"
+  else
+    groupadd --system --gid "$uid" "$app" || die "groupadd $app failed"
+  fi
+  if ! id "$app" >/dev/null 2>&1; then
+    useradd --system --uid "$uid" --gid "$app" --no-create-home \
+      --home-dir "/srv/$app" --shell /usr/sbin/nologin "$app" || die "useradd $app failed"
+  fi
+}
+
+health_status() {
+  local app=$1 svc id
+  svc=$(meta_get "$app" service)
+  [ -n "$svc" ] || { printf 'unknown\n'; return; }
+  id=$(compose_app "$app" ps -q "$svc" 2>/dev/null | head -n1 || true)
+  [ -n "$id" ] || { printf 'missing\n'; return; }
+  docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id" 2>/dev/null || printf 'unknown\n'
+}
+
+is_healthy() { [ "$(health_status "$1")" = healthy ]; }
+
+require_healthy() {
+  local app=$1 h
+  h=$(health_status "$app")
+  [ "$h" = healthy ] || die "$app is not healthy (health: $h)"
+}
+
+http_check() {
+  local app=$1 path upstream image
+  path=$(meta_get "$app" http_path)
+  [ -n "$path" ] || return 0
+  upstream=$(meta_get "$app" upstream)
+  image=$(sed -n 's/^CADDY_IMAGE=//p' "$PROXY/.env" 2>/dev/null | tail -n1)
+  [ -n "$image" ] || image=$CADDY_DEFAULT
+  docker run --rm --network web --entrypoint wget "$image" \
+    -q -T 5 -O /dev/null "http://$upstream$path"
+}
+
+ensure_data_dirs() {
+  local app=$1 uid p
+  uid=$(meta_get "$app" uid)
+  [ -z "$uid" ] || ensure_app_user "$app" "$uid"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if [ ! -d "$p" ]; then
+      mkdir -p "$(dirname "$p")"
+      if [ -n "$uid" ]; then
+        install -d -m 0700 -o "$app" -g "$app" "$p"
+      else
+        install -d -m 0755 "$p"
+      fi
+    fi
+  done < <(meta_list "$app" data)
+}
+
+has_data() {
+  local app=$1 p svc
+  while IFS= read -r p; do
+    [ -n "$p" ] && [ -e "$p" ] && return 0
+  done < <(meta_list "$app" sqlite)
+  while IFS= read -r p; do
+    [ -n "$p" ] && [ -e "$p" ] && return 0
+  done < <(meta_list "$app" files)
+  # A database only counts once its service runs (not before a first deploy).
+  svc=$(meta_get "$app" postgres_service)
+  [ -n "$svc" ] && [ -n "$(compose_app "$app" ps -q "$svc" 2>/dev/null || true)" ] && return 0
+  return 1
+}
+
+prune_images() {
+  local app=$1 repo cur prev ref tag
+  repo=$(meta_get "$app" image_repo)
+  cur=$(state_get "$app" current)
+  prev=$(state_get "$app" previous)
+  [ -n "$repo" ] || return 0
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    [ "${ref%:*}" = "$repo" ] || continue
+    tag=${ref##*:}
+    [ "$tag" = "$cur" ] && continue
+    [ "$tag" = "$prev" ] && continue
+    docker rmi "$ref" >/dev/null 2>&1 || true
+  done < <(docker image ls --format '{{.Repository}}:{{.Tag}}')
+}
+
+prune_backups() {
+  local app=$1
+  local dir="$BACKUPS/$app"
+  [ -d "$dir" ] || return 0
+  find "$dir" -maxdepth 1 -type f -name 'daily-*' -mtime +14 -delete
+  { ls -1dt "$dir"/pre-* 2>/dev/null || true; } | tail -n +6 | while IFS= read -r f; do rm -f "$f"; done
+  { ls -1dt "$dir"/manual-* 2>/dev/null || true; } | tail -n +11 | while IFS= read -r f; do rm -f "$f"; done
+}
+
+backup_app() {
+  local app=$1 label=$2
+  validate_app "$app"
+  [[ $label =~ $LABEL_RE ]] || die "invalid backup label '$label'"
+
+  local uid user work stage ts destdir archive tmp sha p svc pdb puser check
+  local have=0
+  uid=$(meta_get "$app" uid)
+  user=$app
+  work=$(mktmp)
+  # The app user must be able to traverse the staging directory to write the
+  # sqlite .backup; keep it non-listable (0711) and leave files 0600/0644.
+  chmod 0711 "$work"
+  stage="$work/stage"
+  mkdir -p "$stage/fs" "$stage/pg"
+
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    [ -f "$p" ] || continue
+    [ -n "$uid" ] || die "sqlite backup for $app requires uid in metadata"
+    mkdir -p "$stage/fs$(dirname "$p")"
+    if [ -n "$uid" ]; then
+      id "$user" >/dev/null 2>&1 || die "user $user is missing; run ship setup"
+      chown "$user:$user" "$stage/fs$(dirname "$p")"
+      runuser -u "$user" -- sqlite3 "$p" ".backup '$stage/fs$p'"
+      check=$(runuser -u "$user" -- sqlite3 "$stage/fs$p" 'PRAGMA integrity_check;')
+    else
+      sqlite3 "$p" ".backup '$stage/fs$p'"
+      check=$(sqlite3 "$stage/fs$p" 'PRAGMA integrity_check;')
+    fi
+    [ "$check" = ok ] || die "sqlite integrity check failed for $p: $check"
+    have=1
+  done < <(meta_list "$app" sqlite)
+
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    [ -e "$p" ] || die "backup file is missing: $p"
+    mkdir -p "$stage/fs$(dirname "$p")"
+    cp -a "$p" "$stage/fs$p"
+    have=1
+  done < <(meta_list "$app" files)
+
+  svc=$(meta_get "$app" postgres_service)
+  if [ -n "$svc" ]; then
+    pdb=$(meta_get "$app" postgres_db)
+    puser=$(meta_get "$app" postgres_user)
+    (umask 077; compose_app "$app" exec -T "$svc" pg_dump -U "$puser" "$pdb" > "$stage/pg/$svc.sql")
+    have=1
+  fi
+
+  if [ -f "$APPS/$app/.env" ]; then
+    cp -a "$APPS/$app/.env" "$stage/app.env"
+    chmod 0600 "$stage/app.env"
+  fi
+  if [ -f "$APPS/$app/.ship-state" ]; then
+    cp -a "$APPS/$app/.ship-state" "$stage/app.state"
+  fi
+
+  if [ "$have" = 0 ]; then
+    note "note: $app has no configured data; archiving .env/.ship-state only"
+  fi
+
+  ts=$(date -u +%Y%m%dT%H%M%SZ)
+  destdir="$BACKUPS/$app"
+  install -d -m 0700 "$destdir"
+  archive="$destdir/$label-$ts.tar.gz"
+  [ ! -e "$archive" ] || archive="$destdir/$label-$ts-$$.tar.gz"
+  tmp="$work/archive.tar.gz"
+  local members=(fs pg)
+  [ -f "$stage/app.env" ] && members+=(app.env)
+  [ -f "$stage/app.state" ] && members+=(app.state)
+  (umask 077; tar -C "$stage" -cpzf "$tmp" -- "${members[@]}")
+  chmod 0600 "$tmp"
+  install -m 0600 "$tmp" "$archive"
+  sha=$(sha256sum "$archive" | cut -d' ' -f1)
+  prune_backups "$app"
+  printf 'app=%s archive=%s sha256=%s\n' "$app" "$archive" "$sha"
+  note "backup $archive ($sha)"
+}
+
+backup_all() {
+  local label=$1 meta app failed=()
+  for meta in "$APPS"/*/.ship-meta; do
+    [ -e "$meta" ] || continue
+    app=$(basename "$(dirname "$meta")")
+    # One failing app must not skip the others' backups.
+    ( backup_app "$app" "$label" ) || failed+=("$app")
+  done
+  [ "${#failed[@]}" -eq 0 ] || die "backup failed for: ${failed[*]}"
+}
+
+deploy_release() {
+  local app=$1 tag=$2
+  local repo asset base image work want got reported loc sums name
+  repo=$(meta_get "$app" repo)
+  asset=$(meta_get "$app" asset)
+  [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "invalid release repo '$repo'"
+  [[ $asset =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid release asset '$asset'"
+  base="https://github.com/$repo/releases"
+
+  if [ "$tag" = latest ]; then
+    loc=$(curl -fsS --retry 3 -o /dev/null -D - "$base/latest" \
+      | awk 'tolower($1) == "location:" { print $2 }' | tr -d '\r' | tail -n1)
+    [ -n "$loc" ] || die "could not resolve the latest release for $repo"
+    case "$loc" in
+      "https://github.com/$repo/releases/tag/"*) tag=${loc##*/} ;;
+      *) die "unexpected latest-release redirect: $loc" ;;
+    esac
+    [[ $tag =~ $TAG_RE ]] || die "latest release redirect has no valid tag"
+  fi
+  [[ $tag =~ $TAG_RE ]] || die "not a release tag: $tag"
+  RESOLVED_TAG=$tag
+  image="$app:$tag"
+
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    note "image $image already built"
+    DEPLOY_IMAGE=$image
+    return 0
+  fi
+
+  work=$(mktmp)
+  sums=""
+  for name in SHA256SUMS checksums.txt; do
+    if curl -fsSL --retry 3 -o "$work/$name" "$base/download/$tag/$name"; then
+      sums="$work/$name"
+      break
+    fi
+  done
+  [ -n "$sums" ] || die "release $tag has no SHA256SUMS or checksums.txt"
+  note "downloading $asset for $tag"
+  curl -fsSL --retry 3 -o "$work/$asset" "$base/download/$tag/$asset"
+  want=$(awk -v f="$asset" '$2 == f || $2 == "*"f { print $1 }' "$sums")
+  [[ $want =~ ^[a-f0-9]{64}$ ]] || die "checksum file has no line for $asset"
+  got=$(sha256sum "$work/$asset" | cut -d' ' -f1)
+  [ "$want" = "$got" ] || die "checksum mismatch for $asset: want $want, got $got"
+  note "sha256 ok ($got)"
+
+  cp "$work/$asset" "$work/$app"
+  [ -f "$APPS/$app/Dockerfile" ] || die "missing $APPS/$app/Dockerfile"
+  docker build -q --build-arg "VERSION=$tag" --build-arg "BINARY=$app" \
+    -f "$APPS/$app/Dockerfile" -t "$image" "$work" >/dev/null
+  if ! reported=$(docker run --rm --network none "$image" version); then
+    docker rmi "$image" >/dev/null 2>&1 || true
+    die "could not run 'version' in $image"
+  fi
+  [ "$reported" = "$tag" ] || {
+    docker rmi "$image" >/dev/null 2>&1 || true
+    die "binary reports '$reported', expected $tag"
+  }
+  note "built $image"
+  DEPLOY_IMAGE=$image
+}
+
+deploy_image() {
+  local app=$1 ver=$2 image
+  [[ $ver =~ $VER_RE ]] || die "invalid image version '$ver'"
+  image=$(image_for "$app" "$ver")
+  docker image inspect "$image" >/dev/null 2>&1 \
+    || die "image $image is not loaded on the server; run 'ship deploy $app' to build and load it"
+  note "using loaded image $image"
+  RESOLVED_TAG=$ver
+  DEPLOY_IMAGE=$image
+}
+
+# app_files takes one tar stream on stdin, validates every member, and stages
+# the files inside the app directory before moving them into place.
+app_files() {
+  local app=${1:-} work tmp name
+  [[ $app =~ $APP_RE ]] || die "invalid app name '$app'"
+  work=$(mktmp)
+  cat > "$work/files.tar"
+  [ -s "$work/files.tar" ] || die "empty app file archive on stdin"
+
+  local -A seen=()
+  while IFS= read -r name; do
+    case "$name" in
+      compose.yaml|Dockerfile|.ship-meta|.ship-env|.ship-deploy.sh) ;;
+      *) die "unexpected app file in upload: '$name'" ;;
+    esac
+    [ -z "${seen[$name]:-}" ] || die "duplicate app file in upload: '$name'"
+    seen[$name]=1
+  done < <(tar -tf "$work/files.tar")
+  [ -n "${seen[compose.yaml]:-}" ] || die "upload is missing compose.yaml"
+  [ -n "${seen[.ship-meta]:-}" ] || die "upload is missing .ship-meta"
+  [ -n "${seen[.ship-env]:-}" ] || die "upload is missing .ship-env"
+
+  install -d -m 0755 "$APPS/$app"
+  tmp=$(mktemp -d "$APPS/$app/.upload.XXXXXX")
+  printf '%s\n' "$tmp" >> "$TMPLIST"
+  tar --no-same-owner --no-same-permissions -xf "$work/files.tar" -C "$tmp"
+  for name in "${!seen[@]}"; do
+    [ -f "$tmp/$name" ] || die "upload member '$name' is not a regular file"
+    [ ! -L "$tmp/$name" ] || die "upload member '$name' is a link"
+    chown root:root "$tmp/$name"
+    chmod 0644 "$tmp/$name"
+  done
+  for name in "${!seen[@]}"; do
+    mv -f "$tmp/$name" "$APPS/$app/$name"
+  done
+  rm -rf "$tmp"
+  note "installed app files for $app"
+}
+
+# image_load takes a gzip-compressed docker save stream on stdin and verifies
+# that the expected tag ended up in the local image store.
+image_load() {
+  local app=$1 ver=$2 image
+  [[ $app =~ $APP_RE ]] || die "invalid app name '$app'"
+  [[ $ver =~ $VER_RE ]] || die "invalid image version '$ver'"
+  image=$(image_for "$app" "$ver")
+  note "loading $image from stdin"
+  docker load >/dev/null
+  docker image inspect "$image" >/dev/null 2>&1 \
+    || die "docker load did not produce $image"
+  note "loaded $image"
+}
+
+rollback_to() {
+  local app=$1 target=$2 saved_previous=$3
+  note "switching back to $target"
+  write_ship_env "$app" "$(image_for "$app" "$target")"
+  if compose_app "$app" up -d --wait --wait-timeout 120 && is_healthy "$app"; then
+    set_state "$app" "$target" "$saved_previous"
+    note "rolled the image back to $target. Database migrations are not undone."
+  else
+    note "rollback to $target failed; logs:"
+    compose_app "$app" logs --tail 60 || true
+  fi
+}
+
+deploy_script_present() {
+  local f="$APPS/$1/.ship-deploy.sh"
+  [ -f "$f" ] && [ -s "$f" ]
+}
+
+run_deploy_commands() {
+  local app=$1 svc
+  svc=$(meta_get "$app" service)
+  if [ -z "$svc" ]; then
+    note "no service in metadata for $app; cannot run deploy commands"
+    return 1
+  fi
+  note "running deploy commands for $app in $svc"
+  # Set before starting: a partly-run script means the data may already have
+  # changed, so a later failure must leave the maintenance page on.
+  DEPLOY_COMMANDS_RAN=1
+  compose_app "$app" run --rm --no-deps -T --entrypoint sh "$svc" -e -s \
+    < "$APPS/$app/.ship-deploy.sh"
+}
+
+# take_backup runs backup_app in a subshell with errexit so a failure stops it
+# without killing the deploy before it can turn maintenance off. It always
+# returns 0 and reports through TAKE_BACKUP_RC / TAKE_BACKUP_ARCHIVE.
+take_backup() {
+  local app=$1 label=$2 out rc
+  out=$(mktemp)
+  set +e
+  ( set -e; backup_app "$app" "$label" > "$out" )
+  rc=$?
+  set -e
+  TAKE_BACKUP_RC=$rc
+  TAKE_BACKUP_ARCHIVE=$(awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^archive=/) { sub(/^archive=/, "", $i); print $i; exit } }' "$out")
+  rm -f "$out"
+  return 0
+}
+
+restore_previous_image() {
+  local app=$1 prev=$2 prevprev=$3 resolved=$4
+  if [ -n "$prev" ] && [ "$prev" != "$resolved" ]; then
+    rollback_to "$app" "$prev" "$prevprev"
+  elif [ -z "$prev" ]; then
+    note "no previous version; stopping $app"
+    compose_app "$app" stop || true
+  else
+    note "keeping the running $prev container"
+  fi
+}
+
+# server_label prints the server name the CLI recorded in .ship-meta, for
+# copy-pasteable hints.
+server_label() {
+  local server
+  server=$(meta_get "$1" server 2>/dev/null || true)
+  [[ $server =~ $APP_RE ]] || server='<server>'
+  printf '%s\n' "$server"
+}
+
+recovery_hint() {
+  local app=$1 archive=$2 server
+  server=$(server_label "$app")
+  if [ -n "$archive" ]; then
+    note "pre-deploy backup: $archive"
+  else
+    note "no pre-deploy archive was taken"
+  fi
+  note "recover with:"
+  [ -n "$archive" ] && note "  ship $server restore $app $archive"
+  note "  ship $server maintenance off $app"
+}
+
+# deploy_app switches one app to a version. run_commands is "no" for rollback,
+# because the uploaded deploy script belongs to the version being rolled back
+# from, not to the image being restored.
+deploy_app() {
+  local app=$1 version=$2 run_commands=${3:-yes}
+  local source prev prevprev image resolved maintenance archive deploy_script
+  validate_app "$app"
+  source=$(meta_get "$app" source)
+  case "$source" in
+    github-release)
+      [ "$version" = latest ] || [[ $version =~ $TAG_RE ]] || die "not a release tag: $version"
+      ;;
+    image)
+      [[ $version =~ $VER_RE ]] || die "invalid image version '$version'"
+      ;;
+    *) die "unknown source '$source' for $app" ;;
+  esac
+
+  prev=$(state_get "$app" current)
+  prevprev=$(state_get "$app" previous)
+  maintenance=$(meta_get "$app" maintenance)
+  [ "$maintenance" = on ] || maintenance=off
+
+  if [ "$prev" = "$version" ] && is_healthy "$app"; then
+    note "$app $version is already running and healthy"
+    [ "$maintenance" = on ] && { maintenance_app "$app" off || true; }
+    return 0
+  fi
+
+  if [ "$maintenance" = on ]; then
+    maintenance_mount \
+      || die "the proxy has no maintenance mount; run 'ship $(server_label "$app") setup' then 'ship $(server_label "$app") proxy update'"
+  fi
+
+  RESOLVED_TAG=
+  DEPLOY_IMAGE=
+  if [ "$source" = github-release ]; then
+    deploy_release "$app" "$version"
+  else
+    deploy_image "$app" "$version"
+  fi
+  image=$DEPLOY_IMAGE
+  resolved=$RESOLVED_TAG
+  [ -n "$image" ] || die "no image was produced"
+  [ -n "$resolved" ] || die "no resolved version was produced"
+
+  # Data directories need no maintenance page; create them before it goes on.
+  ensure_data_dirs "$app"
+
+  if [ "$maintenance" = on ]; then
+    maintenance_app "$app" on
+  fi
+  DEPLOY_COMMANDS_RAN=0
+  archive=""
+
+  if [ "$prev" != "$resolved" ] && has_data "$app"; then
+    note "backing up $app before ${prev:-none} -> $resolved"
+    TAKE_BACKUP_RC=0
+    TAKE_BACKUP_ARCHIVE=
+    take_backup "$app" "pre-$resolved"
+    if [ "$TAKE_BACKUP_RC" -ne 0 ]; then
+      note "backup of $app failed before deploy commands ran; the app was not switched"
+      [ "$maintenance" = on ] && { maintenance_app "$app" off || true; }
+      exit 1
+    fi
+    archive=$TAKE_BACKUP_ARCHIVE
+    [ -n "$archive" ] || note "warning: could not read the backup archive path"
+  fi
+
+  if ! write_ship_env "$app" "$image"; then
+    note "could not write the app environment; the app was not switched"
+    [ "$maintenance" = on ] && { maintenance_app "$app" off || true; }
+    exit 1
+  fi
+
+  deploy_script=no
+  if [ "$run_commands" = yes ] && deploy_script_present "$app"; then
+    deploy_script=yes
+  fi
+  if [ "$deploy_script" = yes ]; then
+    if ! run_deploy_commands "$app"; then
+      note "deploy commands for $app failed; logs:"
+      compose_app "$app" logs --tail 60 || true
+      restore_previous_image "$app" "$prev" "$prevprev" "$resolved"
+      recovery_hint "$app" "$archive"
+      exit 1
+    fi
+  fi
+
+  note "starting $app $resolved"
+  if compose_app "$app" up -d --wait --wait-timeout 120 && is_healthy "$app" && http_check "$app"; then
+    if [ "$prev" != "$resolved" ]; then
+      set_state "$app" "$resolved" "${prev:-}"
+    else
+      set_state "$app" "$resolved" "$prevprev"
+    fi
+    prune_images "$app"
+    if [ "$maintenance" = on ]; then
+      maintenance_app "$app" off
+    fi
+    note "$app $resolved is running and healthy"
+    return 0
+  fi
+
+  note "deploy of $app $resolved failed; logs:"
+  compose_app "$app" logs --tail 60 || true
+  restore_previous_image "$app" "$prev" "$prevprev" "$resolved"
+  if [ "$DEPLOY_COMMANDS_RAN" = 1 ]; then
+    note "deploy commands ran for $app; leaving the maintenance page ON"
+    recovery_hint "$app" "$archive"
+  else
+    [ "$maintenance" = on ] && { maintenance_app "$app" off || true; }
+  fi
+  exit 1
+}
+
+rollback_app() {
+  local app=$1 current prev
+  validate_app "$app"
+  current=$(state_get "$app" current)
+  prev=$(state_get "$app" previous)
+  [[ $prev =~ $VER_RE ]] || die "no previous version recorded for $app"
+  note "rolling back $app from ${current:-none} to $prev. The database is not restored."
+  deploy_app "$app" "$prev" no
+}
+
+restart_app() {
+  local app=$1
+  validate_app "$app"
+  compose_app "$app" up -d --force-recreate --wait --wait-timeout 120
+  require_healthy "$app"
+  http_check "$app"
+  note "$app restarted and healthy"
+}
+
+logs_cmd() {
+  local app=$1 svc=${2:-}
+  validate_app "$app"
+  if [ -n "$svc" ]; then
+    [[ $svc =~ $SERVICE_RE ]] || die "invalid service '$svc'"
+    compose_app "$app" logs -f --tail 100 "$svc"
+  else
+    compose_app "$app" logs -f --tail 100
+  fi
+}
+
+status_one() {
+  local app=$1 cur prev h
+  cur=$(state_get "$app" current)
+  prev=$(state_get "$app" previous)
+  h=$(health_status "$app")
+  printf 'app=%s current=%s previous=%s health=%s\n' \
+    "$app" "${cur:-none}" "${prev:-none}" "$h"
+}
+
+proxy_status() {
+  local id
+  [ -f "$PROXY/compose.yaml" ] || { printf 'missing\n'; return 0; }
+  id=$(compose_proxy ps -q caddy 2>/dev/null | head -n1 || true)
+  [ -n "$id" ] || { printf 'missing\n'; return 0; }
+  docker inspect -f '{{.State.Status}}' "$id" 2>/dev/null || printf 'unknown\n'
+}
+
+reboot_flag() {
+  if [ -f /var/run/reboot-required ]; then
+    printf 'yes\n'
+  else
+    printf 'no\n'
+  fi
+}
+
+status_app_kv() {
+  local app=$1 cur prev h maintenance=off
+  validate_app "$app"
+  cur=$(state_get "$app" current)
+  prev=$(state_get "$app" previous)
+  h=$(health_status "$app")
+  [ -f "$PROXY/maintenance/$app" ] && maintenance=on
+  printf 'app name=%s current=%s previous=%s health=%s maintenance=%s\n' \
+    "$app" "${cur:--}" "${prev:--}" "$h" "$maintenance"
+}
+
+status_cmd() {
+  local format=$1 app=${2:-} meta proxy
+  proxy=$(proxy_status)
+  if [ -n "$app" ]; then
+    validate_app "$app"
+    if [ "$format" = kv ]; then
+      printf 'server proxy=%s reboot_required=%s\n' "$proxy" "$(reboot_flag)"
+      status_app_kv "$app"
+    else
+      status_one "$app"
+    fi
+    return 0
+  fi
+  if [ "$format" = kv ]; then
+    printf 'server proxy=%s reboot_required=%s\n' "$proxy" "$(reboot_flag)"
+    for meta in "$APPS"/*/.ship-meta; do
+      [ -e "$meta" ] || continue
+      status_app_kv "$(basename "$(dirname "$meta")")"
+    done
+    return 0
+  fi
+  for meta in "$APPS"/*/.ship-meta; do
+    [ -e "$meta" ] || continue
+    status_one "$(basename "$(dirname "$meta")")"
+  done
+  if [ -f "$PROXY/compose.yaml" ]; then
+    note "proxy:"
+    compose_proxy ps 2>/dev/null || true
+  fi
+  printf 'reboot_required=%s\n' "$(reboot_flag)"
+}
+
+backups_list() {
+  local app=$1 dir f size m
+  validate_app "$app"
+  dir="$BACKUPS/$app"
+  [ -d "$dir" ] || { note "no backups for $app"; return 0; }
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    size=$(stat -c %s "$f")
+    m=$(stat -c %Y "$f")
+    printf 'path=%s size=%s mtime=%s\n' "$f" "$size" "$m"
+  done < <(ls -1t "$dir"/*.tar.gz 2>/dev/null || true)
+}
+
+restore_app() {
+  local app=$1 archive=$2 flag=${3:-}
+  validate_app "$app"
+  [ "$flag" = --yes ] || die "restore requires --yes (the CLI confirms first)"
+  [[ $archive =~ ^$BACKUPS/$app/[A-Za-z0-9._-]+\.tar\.gz$ ]] \
+    || [[ $archive =~ ^/tmp/ship-restore-$app-[0-9]+\.tar\.gz$ ]] \
+    || die "archive must be under $BACKUPS/$app or /tmp/ship-restore-$app-*"
+  [ -f "$archive" ] || die "archive not found: $archive"
+  [[ $(basename "$archive") =~ $ARCHIVE_RE ]] || die "not a .tar.gz archive: $archive"
+
+  note "taking a pre-restore backup of $app"
+  backup_app "$app" pre-restore
+
+  local work members=() m cur p source allowed=() a ok
+  while IFS= read -r p; do
+    [ -n "$p" ] && allowed+=("$p")
+  done < <(meta_list "$app" data)
+  while IFS= read -r p; do
+    [ -n "$p" ] && allowed+=("$p")
+  done < <(meta_list "$app" sqlite)
+  while IFS= read -r p; do
+    [ -n "$p" ] && allowed+=("$p")
+  done < <(meta_list "$app" files)
+
+  while IFS= read -r m; do
+    case "$m" in
+      /*|*..*) die "unsafe archive member: $m" ;;
+      fs/*/) ;;
+      fs/?*)
+        p=${m#fs}
+        ok=0
+        for a in "${allowed[@]}"; do
+          if [ "$p" = "$a" ] || [[ $p == "$a"/* ]]; then
+            ok=1
+            break
+          fi
+        done
+        [ "$ok" = 1 ] || die "archive member is outside the app's configured paths: $m"
+        members+=("$m")
+        ;;
+    esac
+  done < <(tar -tzf "$archive")
+
+  work=$(mktmp)
+  tar -C "$work" -xpzf "$archive"
+
+  # Make sure the archived version's image exists before stopping the app, so
+  # a failed pull/build leaves the running service alone.
+  cur=""
+  if [ -f "$work/app.state" ]; then
+    cur=$(awk -F= '$1 == "current" { print $2; exit }' "$work/app.state")
+  fi
+  if [ -z "$cur" ]; then
+    cur=$(state_get "$app" current)
+  fi
+  if [ -n "$cur" ]; then
+    source=$(meta_get "$app" source)
+    case "$source" in
+      github-release) deploy_release "$app" "$cur" ;;
+      image) deploy_image "$app" "$cur" ;;
+      *) die "unknown source '$source' for $app" ;;
+    esac
+    write_ship_env "$app" "$DEPLOY_IMAGE"
+  fi
+
+  note "stopping $app"
+  compose_app "$app" stop
+  if [ -f "$work/app.env" ]; then
+    install -m 0600 -o root -g root "$work/app.env" "$APPS/$app/.env"
+  fi
+  if [ -f "$work/app.state" ]; then
+    install -m 0644 -o root -g root "$work/app.state" "$APPS/$app/.ship-state"
+  fi
+  ensure_data_dirs "$app"
+  if [ "${#members[@]}" -gt 0 ]; then
+    tar -C / -xpzf "$archive" --strip-components=1 -- "${members[@]}"
+  fi
+
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    rm -f "$p-wal" "$p-shm"
+  done < <(meta_list "$app" sqlite)
+
+  note "starting $app"
+  if ! compose_app "$app" up -d --wait --wait-timeout 120; then
+    compose_app "$app" logs --tail 60 || true
+    die "restore: $app did not start"
+  fi
+  if ! is_healthy "$app"; then
+    compose_app "$app" logs --tail 60 || true
+    die "restore: $app is not healthy"
+  fi
+  http_check "$app" || die "restore: $app failed its http health check"
+  note "restored $app from $archive"
+
+  case "$archive" in
+    /tmp/ship-restore-*) rm -f "$archive" ;;
+  esac
+}
+
+vps_update() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -q
+  apt-get -q -y -o Dpkg::Options::=--force-confold full-upgrade
+  apt-get -q -y autoremove --purge
+  if [ -f /var/run/reboot-required ]; then
+    printf 'reboot_required=yes\n'
+    if [ -f /var/run/reboot-required.pkgs ]; then
+      sed 's/^/reboot_package=/' /var/run/reboot-required.pkgs
+    fi
+  else
+    printf 'reboot_required=no\n'
+  fi
+}
+
+do_reboot() {
+  note "rebooting"
+  systemctl reboot
+}
+
+proxy_update() {
+  local image=${1:-} work new prev
+  [[ $image =~ $IMAGE_RE ]] || die "invalid caddy image '$image'"
+  install -d -m 0755 "$PROXY"
+
+  work=$(mktmp)
+  new="$work/Caddyfile"
+  cat > "$new"
+  [ -s "$new" ] || die "empty Caddyfile on stdin"
+
+  note "pulling $image"
+  docker pull "$image" >/dev/null
+  note "validating the Caddyfile"
+  docker run --rm --network none -v "$new:/etc/caddy/Caddyfile:ro" "$image" \
+    validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+  prev="$PROXY/Caddyfile.prev"
+  if [ -f "$PROXY/Caddyfile" ]; then
+    cp -a "$PROXY/Caddyfile" "$prev"
+  else
+    rm -f "$prev"
+  fi
+  # The container bind-mounts this one file, which pins its inode: a rename
+  # (install, mv) would leave Caddy reading the old file. Write in place.
+  cat "$new" > "$PROXY/Caddyfile"
+  chmod 0644 "$PROXY/Caddyfile"
+  printf 'CADDY_IMAGE=%s\n' "$image" > "$PROXY/.env"
+  chmod 0644 "$PROXY/.env"
+
+  if ! compose_proxy up -d --wait --wait-timeout 60 || ! reload_caddy; then
+    note "proxy update failed; restoring the previous Caddyfile"
+    if [ -f "$prev" ]; then
+      cat "$prev" > "$PROXY/Caddyfile"
+      compose_proxy up -d --wait --wait-timeout 60 || true
+      reload_caddy || true
+    else
+      rm -f "$PROXY/Caddyfile"
+      compose_proxy down || true
+    fi
+    die "proxy update failed"
+  fi
+  note "proxy reloaded; previous Caddyfile kept at $prev"
+}
+
+setup_server() {
+  local admin=${1:-} caddy=${2:-} appspec=${3:-}
+  [[ $admin =~ $USER_RE ]] || die "invalid admin user '$admin'"
+  [ "$admin" != root ] || die "admin_user must not be root"
+  [ "$admin" != deploy ] || die "admin_user must not be deploy"
+  [[ $caddy =~ $IMAGE_RE ]] || die "invalid caddy image '$caddy'"
+  export DEBIAN_FRONTEND=noninteractive
+
+  step "packages"
+  apt-get update -q
+  apt-get -q -y -o Dpkg::Options::=--force-confold full-upgrade
+  apt-get -q -y install ca-certificates curl gnupg openssl sqlite3 ufw \
+    unattended-upgrades python3
+
+  step "admin user $admin"
+  if ! id "$admin" >/dev/null 2>&1; then
+    adduser --disabled-password --gecos "" "$admin"
+  fi
+  usermod -aG sudo "$admin"
+  install -d -m 0700 -o "$admin" -g "$admin" "/home/$admin/.ssh"
+  if [ ! -s "/home/$admin/.ssh/authorized_keys" ]; then
+    [ -s /root/.ssh/authorized_keys ] || note "warning: root has no authorized_keys; $admin has no SSH key yet"
+    [ -s /root/.ssh/authorized_keys ] && install -m 0600 -o "$admin" -g "$admin" /root/.ssh/authorized_keys "/home/$admin/.ssh/authorized_keys"
+  fi
+  printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$admin" > "/etc/sudoers.d/90-$admin"
+  chmod 0440 "/etc/sudoers.d/90-$admin"
+
+  step "deploy user (CI: ship-agent deploy only)"
+  if ! id deploy >/dev/null 2>&1; then
+    adduser --system --group --shell /bin/bash --home /var/lib/deploy deploy
+  fi
+  install -d -m 0700 -o deploy -g deploy /var/lib/deploy/.ssh
+  if [ ! -f /var/lib/deploy/.ssh/authorized_keys ]; then
+    install -m 0600 -o deploy -g deploy /dev/null /var/lib/deploy/.ssh/authorized_keys
+  fi
+  # On a legacy server this file already exists and still points at
+  # lewbox-deploy; the migration changes it only after the new stack works.
+  if [ ! -f /etc/sudoers.d/91-deploy ]; then
+    printf 'deploy ALL=(root) NOPASSWD: /usr/local/sbin/ship-agent deploy *\n' > /etc/sudoers.d/91-deploy
+  fi
+  chmod 0440 /etc/sudoers.d/91-deploy
+  visudo -cq
+
+  step "app users"
+  if [ -n "$appspec" ]; then
+    local pair app uid pairs
+    IFS=',' read -ra pairs <<< "$appspec"
+    for pair in "${pairs[@]}"; do
+      app=${pair%%:*}
+      uid=${pair#*:}
+      [ "$pair" = "$app:$uid" ] || die "invalid app spec '$pair'"
+      ensure_app_user "$app" "$uid"
+    done
+  fi
+
+  step "firewall: SSH, HTTP, HTTPS (existing rules kept)"
+  if ! ufw status | grep -q '^Status: active'; then
+    ufw default deny incoming >/dev/null
+    ufw default allow outgoing >/dev/null
+  fi
+  ufw allow OpenSSH >/dev/null
+  ufw allow 80/tcp >/dev/null
+  ufw allow 443/tcp >/dev/null
+  ufw allow 443/udp >/dev/null
+  ufw --force enable >/dev/null
+  ufw status verbose
+
+  step "automatic security updates (reboot at 04:00 UTC when needed)"
+  cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+  cat > /etc/apt/apt.conf.d/52-ship-unattended <<'EOF'
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "04:00";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+EOF
+  systemctl enable --now unattended-upgrades >/dev/null
+
+  step "swap (existing swap is left alone)"
+  if ! swapon --show=NAME --noheadings | grep -qx /swapfile; then
+    if [ -f /swapfile ]; then
+      swapon /swapfile
+    elif [ -z "$(swapon --show=NAME --noheadings)" ]; then
+      fallocate -l 2G /swapfile
+      chmod 0600 /swapfile
+      mkswap /swapfile >/dev/null
+      swapon /swapfile
+    else
+      note "other swap is active; not adding /swapfile"
+    fi
+  fi
+  if [ -f /swapfile ]; then
+    grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  fi
+  echo 'vm.swappiness=10' > /etc/sysctl.d/90-swappiness.conf
+  sysctl -q -p /etc/sysctl.d/90-swappiness.conf
+
+  step "Docker"
+  if ! command -v docker >/dev/null 2>&1; then
+    install -d -m 0755 /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+    # shellcheck source=/dev/null
+    . /etc/os-release
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $VERSION_CODENAME stable" \
+      > /etc/apt/sources.list.d/docker.list
+    apt-get update -q
+    apt-get -q -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  fi
+  if ! docker compose version >/dev/null 2>&1; then
+    apt-get -q -y install docker-compose-plugin
+  fi
+  install -d -m 0755 /etc/docker
+  local want
+  want='{"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"},"live-restore":true}'
+  if python3 - "$want" <<'PY'
+import json
+import os
+import sys
+
+path = "/etc/docker/daemon.json"
+want = json.loads(sys.argv[1])
+current = {}
+if os.path.exists(path) and os.path.getsize(path) > 0:
+    with open(path) as f:
+        current = json.load(f)
+merged = dict(current, **want)
+if merged == current:
+    sys.exit(1)  # unchanged: keep the file and don't restart Docker
+with open(path, "w") as f:
+    json.dump(merged, f, indent=2, sort_keys=True)
+    f.write("\n")
+PY
+  then
+    note "daemon.json changed; restarting Docker (live-restore keeps containers up)"
+    systemctl restart docker
+  fi
+  systemctl enable --now docker >/dev/null
+  if docker network inspect web >/dev/null 2>&1; then
+    local subnet
+    subnet=$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' web)
+    [ "$subnet" = "$WEB_SUBNET" ] || note "warning: web subnet is $subnet, expected $WEB_SUBNET"
+  else
+    docker network create --subnet "$WEB_SUBNET" web >/dev/null
+  fi
+  docker --version
+  docker compose version
+
+  step "directories and proxy stack"
+  install -d -m 0755 "$APPS" "$PROXY"
+  install -d -m 0755 "$PROXY/maintenance"
+  install -d -m 0700 "$BACKUPS"
+  cat > "$PROXY/compose.yaml" <<'YAML'
+# Caddy for every app on this VPS. Managed by ship; edit ship.yaml instead.
+name: proxy
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: 10m, max-file: "3" }
+
+services:
+  caddy:
+    image: ${CADDY_IMAGE:?set CADDY_IMAGE in /opt/proxy/.env}
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./maintenance:/etc/caddy/maintenance:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [web]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    logging: *logging
+
+networks:
+  web:
+    external: true
+
+volumes:
+  caddy-data:
+  caddy-config:
+YAML
+  chmod 0644 "$PROXY/compose.yaml"
+  printf 'CADDY_IMAGE=%s\n' "$caddy" > "$PROXY/.env"
+  chmod 0644 "$PROXY/.env"
+  if [ ! -f "$PROXY/Caddyfile" ]; then
+    # shellcheck disable=SC2016 # literal backticks
+    printf '# Run `ship proxy update` to render sites.\n' > "$PROXY/Caddyfile"
+    chmod 0644 "$PROXY/Caddyfile"
+  fi
+
+  step "nightly backup timer"
+  cat > /etc/systemd/system/ship-backup.service <<'EOF'
+[Unit]
+Description=Back up every ship app
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ship-agent backup all daily
+EOF
+  cat > /etc/systemd/system/ship-backup.timer <<'EOF'
+[Unit]
+Description=Nightly ship backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 0644 /etc/systemd/system/ship-backup.service /etc/systemd/system/ship-backup.timer
+  systemctl daemon-reload
+  systemctl enable --now ship-backup.timer >/dev/null
+
+  step "done"
+  note "setup complete. Next: ssh $admin@<host> sudo true, then ship lock-ssh"
+}
+
+lock_ssh() {
+  local admin=${1:-}
+  [[ $admin =~ $USER_RE ]] || die "invalid admin user '$admin'"
+  [ "$admin" != root ] || die "refusing to lock out root as the admin user"
+  [ -s "/home/$admin/.ssh/authorized_keys" ] || die "$admin has no SSH keys; refusing"
+  cat > /etc/ssh/sshd_config.d/00-hardening.conf <<EOF
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+X11Forwarding no
+MaxAuthTries 3
+AllowUsers $admin deploy
+EOF
+  chmod 0644 /etc/ssh/sshd_config.d/00-hardening.conf
+  sshd -t
+  systemctl reload ssh 2>/dev/null || systemctl reload sshd
+  sshd -T | grep -E '^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|allowusers) '
+}
+
+main() {
+  [ "$(id -u)" = 0 ] || die "run as root (sudo ship-agent ...)"
+  local action=${1:-}
+  if [ $# -gt 0 ]; then
+    shift
+  fi
+  case "$action" in
+    version)
+      [ $# -eq 0 ] || die "usage: ship-agent version"
+      printf '%s\n' "$AGENT_VERSION"
+      ;;
+    setup)
+      [ $# -eq 3 ] || die "usage: ship-agent setup <admin-user> <caddy-image> <app:uid,...>"
+      setup_server "$@"
+      ;;
+    lock-ssh)
+      [ $# -eq 1 ] || die "usage: ship-agent lock-ssh <admin-user>"
+      lock_ssh "$1"
+      ;;
+    vps-update)
+      [ $# -eq 0 ] || die "usage: ship-agent vps-update"
+      vps_update
+      ;;
+    reboot)
+      [ $# -eq 0 ] || die "usage: ship-agent reboot"
+      do_reboot
+      ;;
+    proxy-update)
+      [ $# -eq 1 ] || die "usage: ship-agent proxy-update <caddy-image>"
+      proxy_update "$1"
+      ;;
+    app-files)
+      [ $# -eq 1 ] || die "usage: ship-agent app-files <app>"
+      app_files "$1"
+      ;;
+    image-load)
+      [ $# -eq 2 ] || die "usage: ship-agent image-load <app> <version>"
+      image_load "$1" "$2"
+      ;;
+    deploy)
+      # The CLI passes two arguments. CI's forced command passes
+      # SSH_ORIGINAL_COMMAND as one quoted argument ("app version"); split it
+      # safely here and let the normal validation reject anything else.
+      [ $# -eq 1 ] || [ $# -eq 2 ] || die "usage: ship-agent deploy <app> <version|latest>"
+      if [ $# -eq 1 ]; then
+        [[ $1 =~ ^([^[:space:]]+)[[:space:]]+([^[:space:]]+)$ ]] \
+          || die "usage: ship-agent deploy <app> <version|latest>"
+        set -- "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+      fi
+      deploy_app "$1" "$2"
+      ;;
+    rollback)
+      [ $# -eq 1 ] || die "usage: ship-agent rollback <app>"
+      rollback_app "$1"
+      ;;
+    maintenance-check)
+      [ $# -eq 0 ] || die "usage: ship-agent maintenance-check"
+      maintenance_check
+      ;;
+    maintenance)
+      [ $# -eq 2 ] || die "usage: ship-agent maintenance <app> <on|off>"
+      maintenance_app "$1" "$2"
+      ;;
+    status)
+      local format=table
+      if [ $# -gt 0 ] && [ "$1" = --format=kv ]; then
+        format=kv
+        shift
+      fi
+      [ $# -le 1 ] || die "usage: ship-agent status [--format=kv] [app]"
+      status_cmd "$format" "${1:-}"
+      ;;
+    logs)
+      if [ $# -lt 1 ] || [ $# -gt 2 ]; then die "usage: ship-agent logs <app> [service]"; fi
+      logs_cmd "$@"
+      ;;
+    restart)
+      [ $# -eq 1 ] || die "usage: ship-agent restart <app>"
+      restart_app "$1"
+      ;;
+    backup)
+      [ $# -eq 2 ] || die "usage: ship-agent backup <app|all> <label>"
+      [[ $2 =~ $LABEL_RE ]] || die "invalid label '$2'"
+      if [ "$1" = all ]; then
+        backup_all "$2"
+      else
+        validate_app "$1"
+        backup_app "$1" "$2"
+      fi
+      ;;
+    backups)
+      [ $# -eq 1 ] || die "usage: ship-agent backups <app>"
+      backups_list "$1"
+      ;;
+    restore)
+      [ $# -eq 3 ] || die "usage: ship-agent restore <app> <archive> --yes"
+      restore_app "$1" "$2" "$3"
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
