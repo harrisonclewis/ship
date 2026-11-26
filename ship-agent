@@ -1010,7 +1010,7 @@ proxy_update() {
   note "pulling $image"
   docker pull "$image" >/dev/null
   note "validating the Caddyfile"
-  docker run --rm --network none -v "$new:/etc/caddy/Caddyfile:ro" "$image" \
+  docker run --rm --network none --entrypoint caddy -v "$new:/etc/caddy/Caddyfile:ro" "$image" \
     validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
   prev="$PROXY/Caddyfile.prev"
