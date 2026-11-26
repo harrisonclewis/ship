@@ -21,8 +21,12 @@ The scripts download the latest release from GitHub and check it against the rel
 | Install folder | `~/.local/bin` | `%LOCALAPPDATA%\Programs\ship` |
 | Change the folder | `SHIP_INSTALL_DIR=/path` | `$env:SHIP_INSTALL_DIR = 'C:\path'` |
 | A specific release | `SHIP_VERSION=0.1.0` | `$env:SHIP_VERSION = '0.1.0'` |
+| Don't edit shell files | `SHIP_NO_MODIFY_PATH=1` | — |
 
-On Linux and macOS the script warns if the install folder isn't on your `PATH`. On Windows it adds the folder to your user `PATH`; open a new terminal afterwards.
+If the install folder isn't on your `PATH`, the script adds it for you:
+
+- **Linux and macOS:** it appends one line to your shell's startup file (`~/.bashrc`, `~/.bash_profile` on macOS, `~/.zshrc`, fish's `config.fish`, or `~/.profile`) and prints the command that makes `ship` work in the current terminal. Running the installer again doesn't add the line twice. Set `SHIP_NO_MODIFY_PATH=1` to leave your files alone; the script then prints the line to add yourself.
+- **Windows:** it adds the folder to your user `PATH`; open a new terminal afterwards.
 
 ## Manual download
 
