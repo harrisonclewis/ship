@@ -2,6 +2,8 @@
 
 Every server keeps a record of the apps deployed on it. When you add a server that already runs apps, from another machine or after losing your local config, ship shows those apps and can import them into your `ship.yaml`.
 
+The new machine needs its own SSH key on the server first; see [Add another machine or person](ssh-access.md#add-another-machine-or-person).
+
 Your local `ship.yaml` stays the source of truth: deploys always use it, and builds still happen on your machine. The server's copy is the **last-deployed record** of each app.
 
 ## What's stored

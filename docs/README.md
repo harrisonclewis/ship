@@ -15,6 +15,7 @@ One task per page.
 
 | Guide | What it covers |
 |---|---|
+| [Set up SSH access](guides/ssh-access.md) | Create a key, add it to the server, add more machines or people |
 | [Add a server](guides/add-a-server.md) | Add a server, run setup, lock SSH, server layout |
 | [Add an app](guides/add-an-app.md) | Add an app to `ship.yaml`, write its compose file, Laravel example |
 | [Deploy an app](guides/deploy-an-app.md) | Deploy one app or all, what a deploy does, failure handling, release and image apps |

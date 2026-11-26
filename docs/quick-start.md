@@ -5,7 +5,7 @@ This takes you from nothing to a live app at `https://hello.<yourdomain>`.
 You need:
 
 - A fresh Ubuntu VPS. Setup uses `apt` and installs Docker from Docker's Ubuntu repository.
-- Root SSH key access to the server, its IPv4 address, and its IPv6 address if it has one.
+- Root SSH key access to the server ([set it up](guides/ssh-access.md)), its IPv4 address, and its IPv6 address if it has one.
 - A domain you control.
 - OpenSSH, Git and Docker with buildx on the machine where you run ship.
 

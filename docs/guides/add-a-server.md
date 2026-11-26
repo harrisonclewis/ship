@@ -1,6 +1,6 @@
 # Add a server
 
-Add the server under `servers:` in `ship.yaml`, then run setup. Use `prod` in the examples; replace it with your own server name.
+Add the server under `servers:` in `ship.yaml`, then run setup. You need SSH key access as root first; see [Set up SSH access](ssh-access.md). Use `prod` in the examples; replace it with your own server name.
 
 ## 1. Add the server
 
