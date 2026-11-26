@@ -24,6 +24,11 @@ func TestAgentRegeneratesCombinedFileAndExportsOnlyRecords(t *testing.T) {
 			t.Skipf("%s is not installed", tool)
 		}
 	}
+	// The agent targets Linux servers with bash 4+ (it uses associative
+	// arrays); macOS still ships bash 3.2.
+	if err := exec.Command("bash", "-c", "declare -A probe=()").Run(); err != nil {
+		t.Skip("the agent needs bash 4 or newer")
+	}
 	// The agent's tar invocation uses GNU options; skip other tar variants.
 	if err := exec.Command("sh", "-c", "tar --no-same-owner -cf /dev/null --files-from /dev/null").Run(); err != nil {
 		t.Skip("tar does not support the agent's GNU options")
