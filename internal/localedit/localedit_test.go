@@ -166,6 +166,31 @@ func TestSessionRefusesChangedFileAndKeepsTemp(t *testing.T) {
 	}
 }
 
+func TestBufferTracksChangesWithoutATargetFile(t *testing.T) {
+	buf, err := BeginBuffer("app.yaml", []byte("domains: [a.example.com]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer buf.Close()
+	if changed, err := buf.Changed(); err != nil || changed {
+		t.Fatalf("Changed = %v, %v; want false", changed, err)
+	}
+	if err := os.WriteFile(buf.TempPath(), []byte("domains: [b.example.com]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := buf.Changed(); err != nil || !changed {
+		t.Fatalf("Changed = %v, %v; want true", changed, err)
+	}
+	if err := buf.Validate(func(data []byte) error {
+		if string(data) != "domains: [b.example.com]\n" {
+			t.Fatalf("validator saw %q", data)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSessionCreatesMissingFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "apps", "app", "compose.yaml")
 	s, err := Begin(path)

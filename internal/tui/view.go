@@ -36,6 +36,8 @@ func (m *model) View() string {
 			content = m.viewServerActions()
 		case pageAppActions:
 			content = m.viewAppActions()
+		case pageAppEdit:
+			content = m.viewAppEdit()
 		case pageOutput:
 			content = m.viewOutput()
 		case pageRestorePick:
@@ -81,6 +83,12 @@ func (m *model) crumbs() []string {
 			return []string{"Servers", f.app.Server, "New app"}
 		case formEditApp:
 			return []string{"Servers", f.app.Server, f.app.OriginalName, "Edit"}
+		case formEditAppSource:
+			return []string{"Servers", f.serverName, f.appName, "Source"}
+		case formEditAppDomains:
+			return []string{"Servers", f.serverName, f.appName, "Domains"}
+		case formEditAppCommands:
+			return []string{"Servers", f.serverName, f.appName, "Commands"}
 		case formDeployVersion:
 			return []string{"Servers", f.serverName, f.appName, "Deploy"}
 		case formRestorePath:
@@ -96,6 +104,8 @@ func (m *model) crumbs() []string {
 		return []string{"Servers", m.serverName, "Actions"}
 	case m.page == pageAppActions:
 		return []string{"Servers", m.serverName, m.appName}
+	case m.page == pageAppEdit:
+		return []string{"Servers", m.serverName, m.appName, "Edit"}
 	case m.page == pageOutput:
 		if m.outputBack == pageActivity {
 			return []string{"Activity", label}
@@ -136,7 +146,7 @@ func (m *model) hints() []keyHint {
 			{"enter", "app"}, {"a", "add app"}, {"m", "actions"}, {"d", "deploy all"},
 			{"b", "backup all"}, {"r", "refresh"}, {"esc", "back"}, {"q", "quit"},
 		}
-	case pageServerActions, pageAppActions:
+	case pageServerActions, pageAppActions, pageAppEdit:
 		return []keyHint{{"enter", "run"}, {"esc", "back"}, {"q", "quit"}}
 	case pageOutput:
 		hints := []keyHint{{"esc", "back"}, {"↑/↓", "scroll"}}
@@ -621,6 +631,16 @@ func (m *model) viewAppActions() string {
 		body = append(body, styleError.Render("This app is no longer in ship.yaml or on the server."))
 	}
 	return panel("App actions · "+m.appName, strings.Join(body, "\n"), m.width, m.bodyHeight(), false)
+}
+
+func (m *model) viewAppEdit() string {
+	body := make([]string, 0, len(appEditActionDefs))
+	inner := m.width - 2
+	for i, def := range appEditActionDefs {
+		line := actionLine(def.key, def.label, def.desc, false, i == m.appEditCur, inner)
+		body = append(body, line)
+	}
+	return panel("Edit app · "+m.appName, strings.Join(body, "\n"), m.width, m.bodyHeight(), false)
 }
 
 func actionLine(key, label, desc string, danger, selected bool, width int) string {

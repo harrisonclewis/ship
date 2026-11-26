@@ -31,6 +31,7 @@ const (
 	pageServer
 	pageServerActions
 	pageAppActions
+	pageAppEdit
 	pageOutput
 	pageRestorePick
 	pageCompare
@@ -111,9 +112,34 @@ var appActionDefs = []appActionDef{
 	{"t", "Restore", "Restore a server archive or a local file", aaRestore, true},
 	{"g", "Logs", "Follow logs in the terminal", aaLogs, false},
 	{"e", "Edit env", "sudoedit the app's secret .env", aaEnvEdit, false},
-	{"i", "Edit app", "Change the app in ship.yaml", aaEdit, false},
+	{"i", "Edit…", "Source, domains, commands, YAML or all settings", aaEdit, false},
 	{"f", "Edit compose.yaml", "Open apps/<app>/compose.yaml in your editor", aaEditCompose, false},
 	{"x", "Delete app", "Remove it from ship.yaml only", aaDelete, true},
+}
+
+type appEditAction int
+
+const (
+	eaSource appEditAction = iota
+	eaRouting
+	eaCommands
+	eaYAML
+	eaAll
+)
+
+type appEditActionDef struct {
+	key    string
+	label  string
+	desc   string
+	action appEditAction
+}
+
+var appEditActionDefs = []appEditActionDef{
+	{"s", "Source", "Image source path, or release repo and asset", eaSource},
+	{"d", "Domains & redirects", "Change the app's public hostnames", eaRouting},
+	{"c", "Build & deploy commands", "Build script, deploy script and maintenance page", eaCommands},
+	{"y", "Edit app YAML", "Open only this app's mapping in your editor", eaYAML},
+	{"a", "All settings", "Open the full app form", eaAll},
 }
 
 var compareAppAction = appActionDef{"c", "Compare with server", "Show record and file differences; use the server version", aaCompare, false}
@@ -136,6 +162,7 @@ type editKind int
 const (
 	editShipConfig editKind = iota
 	editCompose
+	editAppYAML
 )
 
 type editTarget struct {
@@ -145,10 +172,19 @@ type editTarget struct {
 	kind      editKind
 }
 
+type editBuffer interface {
+	TempPath() string
+	Changed() (bool, error)
+	Validate(localedit.Validator) error
+	Read() ([]byte, error)
+	Close() error
+}
+
 type editSession struct {
 	target  editTarget
-	session *localedit.Session
+	session editBuffer
 	editor  localedit.Editor
+	commit  func([]byte) error
 }
 
 type model struct {
@@ -168,6 +204,7 @@ type model struct {
 	appCursor     int
 	serverActCur  int
 	appActCur     int
+	appEditCur    int
 	backupCursor  int
 	serverName    string
 	appName       string
@@ -516,6 +553,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleServerActionsKey(key)
 	case pageAppActions:
 		return m.handleAppActionsKey(key)
+	case pageAppEdit:
+		return m.handleAppEditKey(key)
 	case pageOutput:
 		return m.handleOutputKey(msg, key)
 	case pageRestorePick:
@@ -681,6 +720,42 @@ func (m *model) handleAppActionsKey(key string) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m *model) handleAppEditKey(key string) (tea.Model, tea.Cmd) {
+	switch key {
+	case "esc":
+		m.page = pageAppActions
+		return m, nil
+	case "up", "k":
+		m.appEditCur = clampIndex(m.appEditCur-1, len(appEditActionDefs))
+		return m, nil
+	case "down", "j":
+		m.appEditCur = clampIndex(m.appEditCur+1, len(appEditActionDefs))
+		return m, nil
+	case "enter":
+		m.appEditCur = clampIndex(m.appEditCur, len(appEditActionDefs))
+		return m, m.runAppEditAction(appEditActionDefs[m.appEditCur].action)
+	}
+	for i, def := range appEditActionDefs {
+		if key == def.key {
+			m.appEditCur = i
+			return m, m.runAppEditAction(def.action)
+		}
+	}
+	return m, nil
+}
+
+func (m *model) runAppEditAction(action appEditAction) tea.Cmd {
+	switch action {
+	case eaSource, eaRouting, eaCommands:
+		m.openAppQuickForm(action)
+	case eaYAML:
+		return m.beginAppYAMLEdit(m.serverName, m.appName)
+	case eaAll:
+		m.openAppForm(m.appName, false)
+	}
+	return nil
 }
 
 func (m *model) handleOutputKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) {
@@ -1409,7 +1484,8 @@ func (m *model) runAppAction(action appAction) tea.Cmd {
 	case aaEnvEdit:
 		return m.prepareTerminal(TerminalRequest{Kind: TerminalEnvEdit, Server: server, App: app})
 	case aaEdit:
-		m.openAppForm(app, false)
+		m.page = pageAppEdit
+		m.appEditCur = 0
 	case aaEditCompose:
 		srv, err := m.backend.Server(server)
 		if err != nil {
@@ -1503,7 +1579,61 @@ func (m *model) beginLocalEdit(target editTarget) tea.Cmd {
 		m.showToast(toastError, err.Error())
 		return nil
 	}
-	m.edit = &editSession{target: target, session: session, editor: editor}
+	m.edit = &editSession{target: target, session: session, editor: editor, commit: func([]byte) error {
+		return session.Save()
+	}}
+	return m.execEditor()
+}
+
+func (m *model) beginAppYAMLEdit(server, app string) tea.Cmd {
+	if m.edit != nil {
+		m.showToast(toastWarning, "Finish the open editor first.")
+		return nil
+	}
+	data, err := m.doc.AppYAML(server, app)
+	if err != nil {
+		m.showToast(toastError, err.Error())
+		return nil
+	}
+	editor, err := localedit.Resolve()
+	if err != nil {
+		m.showToast(toastError, err.Error())
+		return nil
+	}
+	buffer, err := localedit.BeginBuffer(app+".yaml", data)
+	if err != nil {
+		m.showToast(toastError, err.Error())
+		return nil
+	}
+	doc := m.doc
+	apply := func(data []byte) (*yamldoc.Doc, error) {
+		tmp := doc.Clone()
+		if err := tmp.ReplaceAppYAML(server, app, data); err != nil {
+			return nil, err
+		}
+		return tmp, nil
+	}
+	validate := func(data []byte) error {
+		tmp, err := apply(data)
+		if err != nil {
+			return err
+		}
+		return tmp.Validate()
+	}
+	commit := func(data []byte) error {
+		tmp, err := apply(data)
+		if err != nil {
+			return err
+		}
+		return tmp.Save()
+	}
+	label := "ship.yaml (app " + server + "/" + app + ")"
+	m.edit = &editSession{
+		target:  editTarget{label: label, validator: validate, kind: editAppYAML},
+		session: buffer,
+		editor:  editor,
+		commit:  commit,
+	}
 	return m.execEditor()
 }
 
@@ -1553,7 +1683,13 @@ func (m *model) finishLocalEdit(msg editDoneMsg) tea.Cmd {
 			})
 		return nil
 	}
-	if err := e.session.Save(); err != nil {
+	data, err := e.session.Read()
+	if err != nil {
+		m.edit = nil
+		m.openNotice("Edit failed", fmt.Sprintf("%v\n\nYour edits are in %s", err, e.session.TempPath()))
+		return nil
+	}
+	if err := e.commit(data); err != nil {
 		m.edit = nil
 		if errors.Is(err, localedit.ErrChanged) {
 			m.openNotice("Not saved", fmt.Sprintf("%s changed on disk while you were editing; not saved.\n\nYour edits are in %s", e.target.label, e.session.TempPath()))
@@ -1564,13 +1700,16 @@ func (m *model) finishLocalEdit(msg editDoneMsg) tea.Cmd {
 	}
 	_ = e.session.Close()
 	m.edit = nil
-	if e.target.kind == editShipConfig {
+	if e.target.kind == editShipConfig || e.target.kind == editAppYAML {
 		if err := m.reloadConfig(); err != nil {
 			m.showToast(toastError, err.Error())
 			return nil
 		}
 		m.showToast(toastSuccess, "Saved "+e.target.label+".")
-		return m.refreshAllStatuses()
+		if e.target.kind == editShipConfig {
+			return m.refreshAllStatuses()
+		}
+		return nil
 	}
 	m.recomputeAllDiffs()
 	m.showToast(toastSuccess, "Saved "+e.target.label+".")
@@ -1616,6 +1755,26 @@ func (m *model) openServerForm(name string, isNew bool) {
 	if !isNew {
 		f.purpose = formEditServer
 	}
+	f.form = m.buildForm(f)
+	m.form = f
+}
+
+func (m *model) openAppQuickForm(action appEditAction) {
+	if m.currentApp() == nil {
+		m.showToast(toastWarning, "This app is no longer in ship.yaml.")
+		return
+	}
+	v := m.newAppFormValues(m.serverName, m.appName, false)
+	var purpose formPurpose
+	switch action {
+	case eaSource:
+		purpose = formEditAppSource
+	case eaRouting:
+		purpose = formEditAppDomains
+	default:
+		purpose = formEditAppCommands
+	}
+	f := &formHost{purpose: purpose, app: v, serverName: m.serverName, appName: m.appName}
 	f.form = m.buildForm(f)
 	m.form = f
 }
@@ -1714,6 +1873,57 @@ func (m *model) submitForm() tea.Cmd {
 		}
 		m.showToast(toastSuccess, "Saved "+name+".")
 		return m.loadStatus(m.serverName)
+	case formEditAppSource, formEditAppDomains, formEditAppCommands:
+		tmp := m.doc.Clone()
+		var err error
+		switch f.purpose {
+		case formEditAppSource:
+			if f.app.SourceType == "image" {
+				err = tmp.SetAppSourcePath(f.app.Server, f.app.Name, f.app.SourcePath)
+			} else {
+				err = tmp.SetAppSourceRepo(f.app.Server, f.app.Name, f.app.SourceRepo)
+				if err == nil {
+					err = tmp.SetAppSourceAsset(f.app.Server, f.app.Name, f.app.SourceAsset)
+				}
+			}
+		case formEditAppDomains:
+			f.submitValues()
+			err = tmp.SetAppDomains(f.app.Server, f.app.Name, f.app.Domains)
+			if err == nil {
+				err = tmp.SetAppRedirects(f.app.Server, f.app.Name, f.app.Redirects)
+			}
+		case formEditAppCommands:
+			if f.app.SourceType == "image" {
+				err = tmp.SetAppBuildCommands(f.app.Server, f.app.Name, f.app.BuildCommands)
+			}
+			if err == nil {
+				err = tmp.SetAppDeployCommands(f.app.Server, f.app.Name, f.app.DeployCommands)
+			}
+			if err == nil {
+				err = tmp.SetAppDeployMaintenance(f.app.Server, f.app.Name, &f.app.DeployMaintenance)
+			}
+		}
+		if err != nil {
+			f.err = err.Error()
+			f.form = m.buildForm(f)
+			return nil
+		}
+		if err := tmp.Save(); err != nil {
+			f.err = err.Error()
+			f.form = m.buildForm(f)
+			return nil
+		}
+		m.doc = tmp
+		if err := m.reloadConfig(); err != nil {
+			f.err = err.Error()
+			f.form = m.buildForm(f)
+			return nil
+		}
+		name := f.app.Name
+		m.form = nil
+		m.page = pageAppEdit
+		m.showToast(toastSuccess, "Saved "+name+".")
+		return nil
 	case formDeployVersion:
 		version := formText(f.text)
 		if version != "" {

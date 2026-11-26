@@ -54,6 +54,171 @@ const twoServerDoc = `servers:
         backup: {}
 `
 
+const appSetDoc = `servers:
+  prod:
+    host: ops@203.0.113.10
+    apps:
+      app:
+        domains: [one.example.com, two.example.com]
+        redirects: [www.example.com]
+        upstream: app:8080
+        source:
+          type: github-release
+          repo: example/app
+        backup: {}
+`
+
+func appSetTestConfig(t *testing.T) (string, *config.Config) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ship.yaml")
+	if err := os.WriteFile(path, []byte(appSetDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path, cfg
+}
+
+func runAppCommand(t *testing.T, cfg *config.Config, in io.Reader, args ...string) (string, error) {
+	t.Helper()
+	var out bytes.Buffer
+	o := &options{in: in, out: &out, errOut: io.Discard}
+	err := cmdApp(o, cfg, "prod", args)
+	return out.String(), err
+}
+
+func TestAppSetAndListCommands(t *testing.T) {
+	path, cfg := appSetTestConfig(t)
+	out, err := runAppCommand(t, cfg, nil, "set", "app", "domains", "a.example.com", "b.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "domains = a.example.com, b.example.com") {
+		t.Fatalf("output = %q", out)
+	}
+	cfg, err = config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Servers["prod"].Apps["app"].Domains; len(got) != 2 || got[1] != "b.example.com" {
+		t.Fatalf("domains = %v", got)
+	}
+
+	out, err = runAppCommand(t, cfg, nil, "add", "app", "domains", "b.example.com", "c.example.com", "c.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Already present") || !strings.Contains(out, "c.example.com") {
+		t.Fatalf("add output = %q", out)
+	}
+	cfg, err = config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.Servers["prod"].Apps["app"].Domains, ","); got != "a.example.com,b.example.com,c.example.com" {
+		t.Fatalf("domains = %q", got)
+	}
+
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err = runAppCommand(t, cfg, nil, "add", "app", "domains", "c.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "no changes") {
+		t.Fatalf("no-op add output = %q", out)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("a no-op add wrote the file")
+	}
+
+	out, err = runAppCommand(t, cfg, nil, "remove", "app", "domains", "a.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Canonical domain is now b.example.com") {
+		t.Fatalf("remove output = %q", out)
+	}
+	cfg, err = config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Servers["prod"].Apps["app"].Domains[0]; got != "b.example.com" {
+		t.Fatalf("canonical domain = %q", got)
+	}
+}
+
+func TestAppListRemoveIsAtomicAndKeepsADomain(t *testing.T) {
+	path, cfg := appSetTestConfig(t)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runAppCommand(t, cfg, nil, "remove", "app", "domains", "one.example.com", "missing.example.com"); err == nil {
+		t.Fatal("removing a missing value succeeded")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("a partially invalid remove wrote the file")
+	}
+	if _, err := runAppCommand(t, cfg, nil, "remove", "app", "domains", "one.example.com", "two.example.com"); err == nil || !strings.Contains(err.Error(), "last domain") {
+		t.Fatalf("remove all error = %v", err)
+	}
+	if _, err := runAppCommand(t, cfg, nil, "remove", "app", "redirects", "www.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Servers["prod"].Apps["app"].Redirects) != 0 {
+		t.Fatal("redirects were not cleared")
+	}
+}
+
+func TestAppSetKeysAndErrors(t *testing.T) {
+	path, cfg := appSetTestConfig(t)
+	if _, err := runAppCommand(t, cfg, strings.NewReader("echo hi\n"), "set", "app", "deploy.commands", "-"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runAppCommand(t, cfg, nil, "set", "app", "deploy.maintenance", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runAppCommand(t, cfg, nil, "set", "app", "source.asset", ""); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	cfg, err = config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := cfg.Servers["prod"].Apps["app"]
+	if app.Deploy.Commands != "echo hi\n" || app.MaintenanceEnabled() {
+		t.Fatalf("deploy = %+v", app.Deploy)
+	}
+
+	if _, err := runAppCommand(t, cfg, nil, "set", "app", "nope", "x"); err == nil || !strings.Contains(err.Error(), "valid keys") {
+		t.Fatalf("unknown key error = %v", err)
+	}
+	if _, err := runAppCommand(t, cfg, nil, "add", "app", "source.repo", "x/y"); err == nil || !strings.Contains(err.Error(), "not a list") {
+		t.Fatalf("add non-list error = %v", err)
+	}
+	if _, err := runAppCommand(t, cfg, nil, "set", "app", "deploy.maintenance", "maybe"); err == nil || !strings.Contains(err.Error(), "true or false") {
+		t.Fatalf("bad bool error = %v", err)
+	}
+}
+
 func TestConfigEditTargets(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ship.yaml")

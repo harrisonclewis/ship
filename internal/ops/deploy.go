@@ -166,7 +166,7 @@ func buildImage(ctx context.Context, s *remote.Session, srv *config.Server, name
 		return "", fmt.Errorf("%s.source.path: %q is not a directory", name, dir)
 	}
 	if fi, err := os.Stat(filepath.Join(dir, "Dockerfile")); err != nil || fi.IsDir() {
-		return "", fmt.Errorf("image app %s has no Dockerfile in %s (see docs/deploying.md)", name, dir)
+		return "", fmt.Errorf("image app %s has no Dockerfile in %s (see docs/guides/deploy-an-app.md)", name, dir)
 	}
 
 	version := "dry-run"

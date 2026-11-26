@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/charmbracelet/huh"
@@ -20,6 +21,7 @@ import (
 	"github.com/harrisonclewis/ship/internal/tui"
 	"github.com/harrisonclewis/ship/internal/update"
 	"github.com/harrisonclewis/ship/internal/version"
+	"github.com/harrisonclewis/ship/internal/yamldoc"
 )
 
 // ErrUsage marks a command-line usage problem (exit status 2).
@@ -175,6 +177,8 @@ func dispatchCommand(o *options, cfg *config.Config, server string, args []strin
 		return cmdMaintenance(o, cfg, server, rest)
 	case "env":
 		return cmdEnv(o, cfg, server, rest)
+	case "app":
+		return cmdApp(o, cfg, server, rest)
 	case "backup":
 		return cmdBackup(o, cfg, server, rest)
 	case "backups":
@@ -279,6 +283,26 @@ func editConfigFile(o *options, target configEditTarget) error {
 	if err != nil {
 		return err
 	}
+	saved := func() string {
+		if session.BackupWritten() {
+			return fmt.Sprintf("Saved %s (previous kept as %s.bak).", target.label, target.path)
+		}
+		return "Saved " + target.label + "."
+	}
+	return runEditorLoop(o, editor, session, target.label, target.validator, func([]byte) error {
+		return session.Save()
+	}, saved)
+}
+
+type tempEditor interface {
+	TempPath() string
+	Changed() (bool, error)
+	Validate(localedit.Validator) error
+	Read() ([]byte, error)
+	Close() error
+}
+
+func runEditorLoop(o *options, editor localedit.Editor, session tempEditor, label string, validate localedit.Validator, commit func([]byte) error, saved func() string) error {
 	keepTemp := false
 	defer func() {
 		if !keepTemp {
@@ -307,31 +331,37 @@ func editConfigFile(o *options, target configEditTarget) error {
 			return err
 		}
 		if !changed {
-			fmt.Fprintf(o.out, "No changes to %s.\n", target.label)
+			fmt.Fprintf(o.out, "No changes to %s.\n", label)
 			return nil
 		}
 
-		if err := session.Validate(target.validator); err != nil {
-			fmt.Fprintf(o.errOut, "%s is not valid:\n%v\n\n", target.label, err)
+		if err := session.Validate(validate); err != nil {
+			fmt.Fprintf(o.errOut, "%s is not valid:\n%v\n\n", label, err)
 			if !askReopen(reader, o.out) {
-				return fmt.Errorf("discarded changes to %s; the file was not changed", target.label)
+				return fmt.Errorf("discarded changes to %s; the file was not changed", label)
 			}
 			continue
 		}
 
-		if err := session.Save(); err != nil {
+		data, err := session.Read()
+		if err != nil {
+			keepTemp = true
+			fmt.Fprintf(o.errOut, "Could not read your edits; they are in %s\n", session.TempPath())
+			return err
+		}
+		if err := commit(data); err != nil {
 			keepTemp = true
 			if errors.Is(err, localedit.ErrChanged) {
-				fmt.Fprintf(o.errOut, "%s changed on disk while you were editing; not saved.\nYour edits are in %s\n", target.label, session.TempPath())
+				fmt.Fprintf(o.errOut, "%s changed on disk while you were editing; not saved.\nYour edits are in %s\n", label, session.TempPath())
 			} else {
-				fmt.Fprintf(o.errOut, "Could not save %s; your edits are in %s\n", target.label, session.TempPath())
+				fmt.Fprintf(o.errOut, "Could not save %s; your edits are in %s\n", label, session.TempPath())
 			}
 			return err
 		}
-		if session.BackupWritten() {
-			fmt.Fprintf(o.out, "Saved %s (previous kept as %s.bak).\n", target.label, target.path)
+		if saved != nil {
+			fmt.Fprintln(o.out, saved())
 		} else {
-			fmt.Fprintf(o.out, "Saved %s.\n", target.label)
+			fmt.Fprintf(o.out, "Saved %s.\n", label)
 		}
 		return nil
 	}
@@ -542,6 +572,332 @@ func cmdEnv(o *options, cfg *config.Config, server string, args []string) error 
 	return o.ops(cfg).EnvEdit(context.Background(), server, args[1])
 }
 
+var appSetKeys = []string{
+	"source.path", "source.repo", "source.asset", "domains", "redirects",
+	"build.commands", "deploy.commands", "deploy.maintenance",
+}
+
+func appSetKeyHelp() string { return strings.Join(appSetKeys, ", ") }
+
+func isAppListKey(key string) bool { return key == "domains" || key == "redirects" }
+
+func validAppSetKey(key string) bool { return slices.Contains(appSetKeys, key) }
+
+func appUsage(server string) error {
+	return usageErr("usage: ship %s app set|add|remove <app> <key> <value...> | ship %s app edit <app>", server, server)
+}
+
+func cmdApp(o *options, cfg *config.Config, server string, args []string) error {
+	if len(args) < 2 {
+		return appUsage(server)
+	}
+	sub, app := args[0], args[1]
+	switch sub {
+	case "set", "add", "remove":
+		if len(args) < 4 {
+			return appUsage(server)
+		}
+		return cmdAppSet(o, cfg, server, sub, app, args[2], args[3:])
+	case "edit":
+		if len(args) != 2 {
+			return appUsage(server)
+		}
+		return cmdAppEdit(o, cfg, server, app)
+	default:
+		return appUsage(server)
+	}
+}
+
+func cmdAppSet(o *options, cfg *config.Config, server, sub, app, key string, values []string) error {
+	if !validAppSetKey(key) {
+		return usageErr("unknown app key %q; valid keys: %s", key, appSetKeyHelp())
+	}
+	srv, err := cfg.Server(server)
+	if err != nil {
+		return err
+	}
+	def, err := srv.App(app)
+	if err != nil {
+		return err
+	}
+	if sub != "set" && !isAppListKey(key) {
+		return usageErr("%s %s is not a list; use `ship %s app set %s %s <value...>`", sub, key, server, app, key)
+	}
+	if len(values) == 0 {
+		return usageErr("app %s needs at least one value", sub)
+	}
+
+	switch sub {
+	case "add":
+		return appListAdd(o, cfg, server, app, def, key, values)
+	case "remove":
+		return appListRemove(o, cfg, server, app, def, key, values)
+	}
+
+	if isAppListKey(key) {
+		var list []string
+		if !(len(values) == 1 && values[0] == "") {
+			list = values
+		}
+		return appSetList(o, cfg, server, app, key, list)
+	}
+
+	value := strings.Join(values, " ")
+	if (key == "build.commands" || key == "deploy.commands") && len(values) == 1 && values[0] == "-" {
+		in := o.in
+		if in == nil {
+			in = os.Stdin
+		}
+		data, err := io.ReadAll(in)
+		if err != nil {
+			return err
+		}
+		value = string(data)
+	}
+
+	if key == "deploy.maintenance" {
+		var maintenance *bool
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "":
+		case "true":
+			v := true
+			maintenance = &v
+		case "false":
+			v := false
+			maintenance = &v
+		default:
+			return usageErr("deploy.maintenance wants true or false, got %q", value)
+		}
+		doc, err := yamldoc.Load(cfg.Path)
+		if err != nil {
+			return err
+		}
+		if err := doc.SetAppDeployMaintenance(server, app, maintenance); err != nil {
+			return err
+		}
+		if err := doc.Save(); err != nil {
+			return err
+		}
+		if maintenance == nil {
+			fmt.Fprintln(o.out, "deploy.maintenance cleared (default true).")
+		} else {
+			fmt.Fprintf(o.out, "deploy.maintenance = %t.\n", *maintenance)
+		}
+		return nil
+	}
+
+	doc, err := yamldoc.Load(cfg.Path)
+	if err != nil {
+		return err
+	}
+	switch key {
+	case "source.path":
+		err = doc.SetAppSourcePath(server, app, value)
+	case "source.repo":
+		err = doc.SetAppSourceRepo(server, app, value)
+	case "source.asset":
+		err = doc.SetAppSourceAsset(server, app, value)
+	case "build.commands":
+		err = doc.SetAppBuildCommands(server, app, value)
+	case "deploy.commands":
+		err = doc.SetAppDeployCommands(server, app, value)
+	}
+	if err != nil {
+		return err
+	}
+	if err := doc.Save(); err != nil {
+		return err
+	}
+	printAppValue(o.out, key, value)
+	return nil
+}
+
+func appSetList(o *options, cfg *config.Config, server, app, key string, values []string) error {
+	doc, err := yamldoc.Load(cfg.Path)
+	if err != nil {
+		return err
+	}
+	if err := setAppList(doc, server, app, key, values); err != nil {
+		return err
+	}
+	if err := doc.Save(); err != nil {
+		return err
+	}
+	printAppList(o.out, key, values)
+	return nil
+}
+
+func setAppList(doc *yamldoc.Doc, server, app, key string, values []string) error {
+	if key == "domains" {
+		return doc.SetAppDomains(server, app, values)
+	}
+	return doc.SetAppRedirects(server, app, values)
+}
+
+func appListAdd(o *options, cfg *config.Config, server, app string, def *config.App, key string, values []string) error {
+	current := appListValues(def, key)
+	have := make(map[string]bool, len(current))
+	for _, v := range current {
+		have[v] = true
+	}
+	next := append([]string(nil), current...)
+	var already []string
+	for _, v := range dedupeValues(values) {
+		if have[v] {
+			already = append(already, v)
+			continue
+		}
+		have[v] = true
+		next = append(next, v)
+	}
+	if len(next) == len(current) {
+		fmt.Fprintf(o.out, "%s already contains %s; no changes.\n", key, strings.Join(already, ", "))
+		return nil
+	}
+	if err := appSetList(o, cfg, server, app, key, next); err != nil {
+		return err
+	}
+	if len(already) > 0 {
+		fmt.Fprintf(o.out, "Already present: %s.\n", strings.Join(already, ", "))
+	}
+	return nil
+}
+
+func appListRemove(o *options, cfg *config.Config, server, app string, def *config.App, key string, values []string) error {
+	current := appListValues(def, key)
+	have := make(map[string]bool, len(current))
+	for _, v := range current {
+		have[v] = true
+	}
+	values = dedupeValues(values)
+	var missing []string
+	for _, v := range values {
+		if !have[v] {
+			missing = append(missing, v)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%s does not contain %s; nothing was changed", key, strings.Join(missing, ", "))
+	}
+	remove := make(map[string]bool, len(values))
+	for _, v := range values {
+		remove[v] = true
+	}
+	var next []string
+	for _, v := range current {
+		if !remove[v] {
+			next = append(next, v)
+		}
+	}
+	if key == "domains" && len(next) == 0 {
+		return errors.New("cannot remove the last domain; domains are required")
+	}
+	canonical := ""
+	if len(current) > 0 {
+		canonical = current[0]
+	}
+	if err := appSetList(o, cfg, server, app, key, next); err != nil {
+		return err
+	}
+	if key == "domains" && canonical != next[0] {
+		fmt.Fprintf(o.out, "Canonical domain is now %s.\n", next[0])
+	}
+	return nil
+}
+
+func appListValues(def *config.App, key string) []string {
+	if key == "domains" {
+		return append([]string(nil), def.Domains...)
+	}
+	return append([]string(nil), def.Redirects...)
+}
+
+func dedupeValues(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
+func printAppList(out io.Writer, key string, values []string) {
+	if len(values) == 0 {
+		fmt.Fprintf(out, "%s cleared.\n", key)
+		return
+	}
+	fmt.Fprintf(out, "%s = %s.\n", key, strings.Join(values, ", "))
+}
+
+func printAppValue(out io.Writer, key, value string) {
+	if strings.TrimSpace(value) == "" {
+		fmt.Fprintf(out, "%s cleared.\n", key)
+		return
+	}
+	if key == "build.commands" || key == "deploy.commands" {
+		lines := strings.Count(strings.TrimRight(value, "\n"), "\n") + 1
+		noun := "lines"
+		if lines == 1 {
+			noun = "line"
+		}
+		fmt.Fprintf(out, "%s set (%d %s).\n", key, lines, noun)
+		return
+	}
+	fmt.Fprintf(out, "%s = %s.\n", key, value)
+}
+
+func cmdAppEdit(o *options, cfg *config.Config, server, app string) error {
+	srv, err := cfg.Server(server)
+	if err != nil {
+		return err
+	}
+	if _, err := srv.App(app); err != nil {
+		return err
+	}
+	doc, err := yamldoc.Load(cfg.Path)
+	if err != nil {
+		return err
+	}
+	data, err := doc.AppYAML(server, app)
+	if err != nil {
+		return err
+	}
+	editor, err := localedit.Resolve()
+	if err != nil {
+		return err
+	}
+	buffer, err := localedit.BeginBuffer(app+".yaml", data)
+	if err != nil {
+		return err
+	}
+	apply := func(data []byte) (*yamldoc.Doc, error) {
+		tmp := doc.Clone()
+		if err := tmp.ReplaceAppYAML(server, app, data); err != nil {
+			return nil, err
+		}
+		return tmp, nil
+	}
+	validate := func(data []byte) error {
+		tmp, err := apply(data)
+		if err != nil {
+			return err
+		}
+		return tmp.Validate()
+	}
+	commit := func(data []byte) error {
+		tmp, err := apply(data)
+		if err != nil {
+			return err
+		}
+		return tmp.Save()
+	}
+	return runEditorLoop(o, editor, buffer, "ship.yaml (app "+server+"/"+app+")", validate, commit, nil)
+}
+
 func cmdBackups(o *options, cfg *config.Config, server string, args []string) error {
 	if len(args) != 1 {
 		return usageErr("usage: ship <server> backups <app>")
@@ -746,6 +1102,9 @@ Commands:
   restart <app>                 recreate the app container
   maintenance <on|off> <app>    serve or stop serving the maintenance page
   env edit <app>                sudoedit the app's secret .env
+  app set|add|remove <app> <key> <value...>
+                                change an app in ship.yaml
+  app edit <app>                edit one app's YAML in $VISUAL/$EDITOR
   backup [app|all] [--no-pull]  back up now; pull archives locally
   backups <app>                 list server-side archives
   restore <app> <archive>       restore an archive (local path is uploaded)

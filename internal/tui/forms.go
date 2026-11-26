@@ -20,6 +20,9 @@ const (
 	formEditServer
 	formAddApp
 	formEditApp
+	formEditAppSource
+	formEditAppDomains
+	formEditAppCommands
 	formDeployVersion
 	formRestorePath
 	formLogsService
@@ -136,6 +139,45 @@ func (m *model) newAppFormValues(server, app string, isNew bool) *appFormValues 
 	return v
 }
 
+func appRoutingFields(v *appFormValues) []huh.Field {
+	return []huh.Field{
+		huh.NewInput().Title("Domains (comma separated)").Value(&v.DomainsText),
+		huh.NewInput().Title("Redirects (comma separated)").Value(&v.RedirectsText),
+	}
+}
+
+func appSourceReleaseFields(v *appFormValues) []huh.Field {
+	return []huh.Field{
+		huh.NewInput().Title("Repository (owner/repo)").Value(&v.SourceRepo),
+		huh.NewInput().Title("Release asset").Description("Default: {app}_linux_{arch}").Value(&v.SourceAsset),
+	}
+}
+
+func appSourceImageFields(v *appFormValues) []huh.Field {
+	return []huh.Field{
+		huh.NewInput().Title("Local image source path").Value(&v.SourcePath),
+	}
+}
+
+func appBuildFields(v *appFormValues) []huh.Field {
+	return []huh.Field{
+		huh.NewText().Title("Build commands").
+			Description("Run locally before docker build (image apps only).").
+			Lines(5).ShowLineNumbers(true).Value(&v.BuildCommands),
+	}
+}
+
+func appDeployFields(v *appFormValues) []huh.Field {
+	return []huh.Field{
+		huh.NewText().Title("Deploy commands").
+			Description("Run on the server in the new image just before it goes live, e.g. php artisan migrate --force").
+			Lines(5).ShowLineNumbers(true).Value(&v.DeployCommands),
+		huh.NewConfirm().Title("Maintenance page while deploying").
+			Description("Serve a maintenance page while the new image starts.").
+			Affirmative("Yes").Negative("No").Value(&v.DeployMaintenance),
+	}
+}
+
 func (m *model) buildForm(f *formHost) *huh.Form {
 	width := m.formWidth()
 	switch f.purpose {
@@ -165,12 +207,10 @@ func (m *model) buildForm(f *formHost) *huh.Form {
 		if !v.IsNew {
 			nameTitle = "Name (rename)"
 		}
-		basics := huh.NewGroup(
-			huh.NewInput().Title(nameTitle).Value(&v.Name),
-			huh.NewInput().Title("Domains (comma separated)").Value(&v.DomainsText),
-			huh.NewInput().Title("Redirects (comma separated)").Value(&v.RedirectsText),
-			huh.NewInput().Title("Upstream (service:port)").Value(&v.Upstream),
-		)
+		basicsFields := []huh.Field{huh.NewInput().Title(nameTitle).Value(&v.Name)}
+		basicsFields = append(basicsFields, appRoutingFields(v)...)
+		basicsFields = append(basicsFields, huh.NewInput().Title("Upstream (service:port)").Value(&v.Upstream))
+		basics := huh.NewGroup(basicsFields...)
 		storage := huh.NewGroup(
 			huh.NewInput().Title("UID (optional)").Value(&v.UID),
 			huh.NewInput().Title("Data directories (comma separated)").Value(&v.DataText),
@@ -182,16 +222,12 @@ func (m *model) buildForm(f *formHost) *huh.Form {
 				Options(huh.NewOption("GitHub release", "github-release"), huh.NewOption("Local image", "image")).
 				Value(&v.SourceType),
 		)
-		release := huh.NewGroup(
-			huh.NewInput().Title("Repository (owner/repo)").Value(&v.SourceRepo),
-			huh.NewInput().Title("Release asset").Description("Default: {app}_linux_{arch}").Value(&v.SourceAsset),
-		).WithHideFunc(func() bool { return v.SourceType != "github-release" })
-		image := huh.NewGroup(
-			huh.NewInput().Title("Local image source path").Value(&v.SourcePath),
-			huh.NewText().Title("Build commands").
-				Description("Run locally before docker build (image apps only).").
-				Lines(5).ShowLineNumbers(true).Value(&v.BuildCommands),
-		).WithHideFunc(func() bool { return v.SourceType != "image" })
+		release := huh.NewGroup(appSourceReleaseFields(v)...).
+			WithHideFunc(func() bool { return v.SourceType != "github-release" })
+		imageFields := appSourceImageFields(v)
+		imageFields = append(imageFields, appBuildFields(v)...)
+		image := huh.NewGroup(imageFields...).
+			WithHideFunc(func() bool { return v.SourceType != "image" })
 		backup := huh.NewGroup(
 			huh.NewInput().Title("SQLite backups (comma separated)").Value(&v.BackupSQLite),
 			huh.NewInput().Title("File backups (comma separated)").Value(&v.BackupFiles),
@@ -199,15 +235,30 @@ func (m *model) buildForm(f *formHost) *huh.Form {
 			huh.NewInput().Title("Postgres database").Value(&v.PostgresDB),
 			huh.NewInput().Title("Postgres user").Value(&v.PostgresUser),
 		)
-		deploy := huh.NewGroup(
-			huh.NewText().Title("Deploy commands").
-				Description("Run on the server in the new image just before it goes live, e.g. php artisan migrate --force").
-				Lines(5).ShowLineNumbers(true).Value(&v.DeployCommands),
-			huh.NewConfirm().Title("Maintenance page while deploying").
-				Description("Serve a maintenance page while the new image starts.").
-				Affirmative("Yes").Negative("No").Value(&v.DeployMaintenance),
-		)
+		deploy := huh.NewGroup(appDeployFields(v)...)
 		return huh.NewForm(basics, storage, source, release, image, backup, deploy).WithWidth(width)
+	case formEditAppSource, formEditAppDomains, formEditAppCommands:
+		v := f.app
+		f.title = "Edit " + v.Name
+		switch f.purpose {
+		case formEditAppSource:
+			f.title = "Source · " + v.Name
+			if v.SourceType == "image" {
+				return huh.NewForm(huh.NewGroup(appSourceImageFields(v)...)).WithWidth(width)
+			}
+			return huh.NewForm(huh.NewGroup(appSourceReleaseFields(v)...)).WithWidth(width)
+		case formEditAppDomains:
+			f.title = "Domains & redirects · " + v.Name
+			return huh.NewForm(huh.NewGroup(appRoutingFields(v)...)).WithWidth(width)
+		default:
+			f.title = "Build & deploy · " + v.Name
+			fields := []huh.Field{}
+			if v.SourceType == "image" {
+				fields = append(fields, appBuildFields(v)...)
+			}
+			fields = append(fields, appDeployFields(v)...)
+			return huh.NewForm(huh.NewGroup(fields...)).WithWidth(width)
+		}
 	case formImportApps:
 		f.title = "Import apps from " + f.serverName
 		opts := make([]huh.Option[string], 0, len(f.importNames))

@@ -215,6 +215,47 @@ func TestEditComposeFromAppActions(t *testing.T) {
 	m.edit = nil
 }
 
+func TestAppEditSubmenu(t *testing.T) {
+	m, _ := testModel(t, tuiTestDoc)
+	m, _ = press(t, m, "enter")
+	m, _ = press(t, m, "enter")
+	m, _ = press(t, m, "i")
+	if m.page != pageAppEdit {
+		t.Fatalf("page = %v, want app edit menu", m.page)
+	}
+	m, _ = press(t, m, "s")
+	if m.form == nil || m.form.purpose != formEditAppSource {
+		t.Fatalf("form = %#v, want source quick form", m.form)
+	}
+	m, _ = press(t, m, "esc")
+	if m.form != nil || m.page != pageAppEdit {
+		t.Fatalf("esc left form=%v page=%v", m.form, m.page)
+	}
+}
+
+func TestEditAppYAMLStartsBufferEdit(t *testing.T) {
+	m, _ := testModel(t, tuiTestDoc)
+	m, _ = press(t, m, "enter")
+	m, _ = press(t, m, "enter")
+	m, _ = press(t, m, "i")
+	m, cmd := press(t, m, "y")
+	if cmd == nil || m.edit == nil {
+		t.Fatal("y did not start an app YAML edit")
+	}
+	if m.edit.target.kind != editAppYAML || m.edit.target.label != "ship.yaml (app prod/app)" {
+		t.Fatalf("edit target = %#v", m.edit.target)
+	}
+	data, err := m.edit.session.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "server prod, app app") {
+		t.Fatalf("app YAML header missing:\n%s", data)
+	}
+	_ = m.edit.session.Close()
+	m.edit = nil
+}
+
 func TestInvalidShipEditOffersReopenOrDiscard(t *testing.T) {
 	m, _ := testModel(t, tuiTestDoc)
 	session, err := localedit.Begin(m.path)

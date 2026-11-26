@@ -203,7 +203,7 @@ func TestEmptyConfigAndServersWithoutApps(t *testing.T) {
 }
 
 func TestServerNamesAreReservedCommandWords(t *testing.T) {
-	for _, name := range []string{"setup", "deploy", "status", "version", "update", "help", "config", "all", "proxy"} {
+	for _, name := range []string{"setup", "deploy", "status", "version", "update", "help", "config", "app", "all", "proxy"} {
 		t.Run(name, func(t *testing.T) {
 			doc := strings.Replace(validYAML, "  prod:", "  "+name+":", 1)
 			_, err := decode(t, doc)

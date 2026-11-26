@@ -87,17 +87,42 @@ func Begin(path string) (*Session, error) {
 		return nil, readErr
 	}
 
-	dir, err := os.MkdirTemp("", "ship-edit-")
+	dir, temp, err := writeTemp(filepath.Base(abs), s.original)
 	if err != nil {
 		return nil, err
 	}
-	s.dir = dir
-	s.temp = filepath.Join(dir, filepath.Base(abs))
-	if err := os.WriteFile(s.temp, s.original, 0o600); err != nil {
-		_ = os.RemoveAll(dir)
+	s.dir, s.temp = dir, temp
+	return s, nil
+}
+
+// Buffer is an editable temporary copy of text with no target file. The caller
+// validates the edited bytes and decides what to do with them.
+type Buffer struct {
+	original []byte
+	dir      string
+	temp     string
+}
+
+// BeginBuffer writes data to a private temporary file for the editor.
+func BeginBuffer(name string, data []byte) (*Buffer, error) {
+	dir, temp, err := writeTemp(name, data)
+	if err != nil {
 		return nil, err
 	}
-	return s, nil
+	return &Buffer{original: append([]byte(nil), data...), dir: dir, temp: temp}, nil
+}
+
+func writeTemp(name string, data []byte) (dir, temp string, err error) {
+	dir, err = os.MkdirTemp("", "ship-edit-")
+	if err != nil {
+		return "", "", err
+	}
+	temp = filepath.Join(dir, filepath.Base(name))
+	if err := os.WriteFile(temp, data, 0o600); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", "", err
+	}
+	return dir, temp, nil
 }
 
 // Path is the real file this session edits.
@@ -113,9 +138,14 @@ func (s *Session) Existed() bool { return s.exists }
 // BackupWritten reports whether the successful save kept a .bak copy.
 func (s *Session) BackupWritten() bool { return s.wroteBackup }
 
+// Read returns the temporary copy.
+func (s *Session) Read() ([]byte, error) {
+	return os.ReadFile(s.temp)
+}
+
 // Changed reports whether the editor changed the temporary copy.
 func (s *Session) Changed() (bool, error) {
-	data, err := os.ReadFile(s.temp)
+	data, err := s.Read()
 	if err != nil {
 		return false, err
 	}
@@ -155,6 +185,42 @@ func (s *Session) Close() error {
 	}
 	err := os.RemoveAll(s.dir)
 	s.dir, s.temp = "", ""
+	return err
+}
+
+// TempPath is the copy handed to the editor.
+func (b *Buffer) TempPath() string { return b.temp }
+
+// Read returns the temporary copy.
+func (b *Buffer) Read() ([]byte, error) {
+	return os.ReadFile(b.temp)
+}
+
+// Changed reports whether the editor changed the temporary copy.
+func (b *Buffer) Changed() (bool, error) {
+	data, err := b.Read()
+	if err != nil {
+		return false, err
+	}
+	return !bytes.Equal(data, b.original), nil
+}
+
+// Validate reads the temporary copy and runs the caller's validator.
+func (b *Buffer) Validate(validate Validator) error {
+	data, err := b.Read()
+	if err != nil {
+		return err
+	}
+	return validate(data)
+}
+
+// Close removes the temporary copy.
+func (b *Buffer) Close() error {
+	if b.dir == "" {
+		return nil
+	}
+	err := os.RemoveAll(b.dir)
+	b.dir, b.temp = "", ""
 	return err
 }
 

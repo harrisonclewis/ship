@@ -65,6 +65,7 @@ var reservedServerNames = map[string]bool{
 	"restart":     true,
 	"maintenance": true,
 	"env":         true,
+	"app":         true,
 	"backup":      true,
 	"backups":     true,
 	"restore":     true,
