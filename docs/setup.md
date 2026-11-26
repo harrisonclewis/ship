@@ -53,6 +53,7 @@ It is safe to re-run and does not overwrite existing swap, ufw rules or users.
 | `/usr/local/sbin/ship-agent` | the agent, installed and updated by the CLI ([details](updates.md#the-server-agent)) |
 | `/opt/proxy/` | Caddy compose file, generated Caddyfile and pinned image |
 | `/opt/apps/<name>/` | the app's compose file and state, see below |
+| `/opt/apps/ship.yaml` | generated, read-only list of every app's last-deployed config |
 | `/var/backups/ship/<name>/` | archives, root 0600 in 0700 directories |
 | `web` network | external Docker network `172.30.0.0/24`; only Caddy publishes ports |
 
@@ -61,6 +62,7 @@ Each `/opt/apps/<name>/` holds:
 | File | What |
 |---|---|
 | `compose.yaml` | uploaded from `apps/<name>/compose.yaml` |
+| `ship-app.yaml` | the app's last-deployed config ([server records](server-records.md)) |
 | `Dockerfile` | release apps only |
 | `.ship-meta` | app metadata |
 | `.ship-env` | uploaded non-secret values from `ship.yaml` |

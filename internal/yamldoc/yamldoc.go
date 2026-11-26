@@ -1,4 +1,4 @@
-package tui
+package yamldoc
 
 import (
 	"bytes"
@@ -15,10 +15,58 @@ import (
 	"github.com/harrisonclewis/ship/internal/config"
 )
 
-// ErrConfigChanged means ship.yaml no longer matches what the TUI loaded.
-var ErrConfigChanged = errors.New("ship.yaml changed on disk since it was loaded; reopen the TUI to reload it")
+// ErrConfigChanged means ship.yaml no longer matches what this document
+// loaded.
+var ErrConfigChanged = errors.New("ship.yaml changed on disk since it was loaded; reload it and try again")
 
-type yamlDoc struct {
+// ServerValues are the fields the server form edits.
+type ServerValues struct {
+	Name         string
+	Host         string
+	IdentityFile string
+	AdminUser    string
+	Arch         string
+	CaddyImage   string
+	OriginalName string
+	IsNew        bool
+}
+
+// AppValues are the fields the app form edits. The raw text fields are kept
+// alongside the parsed slices so the TUI can show what the user typed.
+type AppValues struct {
+	Server            string
+	Name              string
+	OriginalName      string
+	IsNew             bool
+	DomainsText       string
+	RedirectsText     string
+	Upstream          string
+	SourceType        string
+	SourceRepo        string
+	SourceAsset       string
+	SourcePath        string
+	UID               string
+	DataText          string
+	HealthPath        string
+	BackupSQLite      string
+	BackupFiles       string
+	PostgresService   string
+	PostgresDB        string
+	PostgresUser      string
+	Env               string
+	BuildCommands     string
+	DeployCommands    string
+	DeployMaintenance bool
+
+	Domains       []string
+	Redirects     []string
+	Data          []string
+	BackupSQLiteV []string
+	BackupFilesV  []string
+}
+
+// Doc is one ship.yaml document being edited in place.
+type Doc struct {
 	path     string
 	original []byte
 	exists   bool
@@ -26,8 +74,8 @@ type yamlDoc struct {
 	root     yaml.Node
 }
 
-func loadYAMLDoc(path string) (*yamlDoc, error) {
-	d := &yamlDoc{path: path, mode: 0o600}
+func Load(path string) (*Doc, error) {
+	d := &Doc{path: path, mode: 0o600}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -50,11 +98,11 @@ func loadYAMLDoc(path string) (*yamlDoc, error) {
 	return d, nil
 }
 
-func newEmptyYAMLDoc(path string) *yamlDoc {
-	return &yamlDoc{path: path, mode: 0o600}
+func New(path string) *Doc {
+	return &Doc{path: path, mode: 0o600}
 }
 
-func (d *yamlDoc) mapping() *yaml.Node {
+func (d *Doc) mapping() *yaml.Node {
 	if d.root.Kind == 0 {
 		d.root = yaml.Node{Kind: yaml.DocumentNode}
 	}
@@ -71,8 +119,8 @@ func (d *yamlDoc) mapping() *yaml.Node {
 	return node
 }
 
-func (d *yamlDoc) clone() *yamlDoc {
-	out := &yamlDoc{
+func (d *Doc) Clone() *Doc {
+	out := &Doc{
 		path:     d.path,
 		original: append([]byte(nil), d.original...),
 		exists:   d.exists,
@@ -96,7 +144,7 @@ func cloneNode(n *yaml.Node) *yaml.Node {
 	return &out
 }
 
-func (d *yamlDoc) bytes() ([]byte, error) {
+func (d *Doc) bytes() ([]byte, error) {
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
@@ -144,9 +192,21 @@ func restoreBlankLines(original, rendered []byte) []byte {
 	return restored
 }
 
-// save validates the whole document, checks that the file on disk is still the
-// version this TUI loaded, then replaces it atomically and keeps a .bak copy.
-func (d *yamlDoc) save() error {
+// Validate renders the document and checks it with the config package without
+// writing anything.
+func (d *Doc) Validate() error {
+	rendered, err := d.bytes()
+	if err != nil {
+		return err
+	}
+	_, err = config.Decode(bytes.NewReader(rendered))
+	return err
+}
+
+// Save validates the whole document, checks that the file on disk is still the
+// version this document loaded, then replaces it atomically and keeps a .bak
+// copy.
+func (d *Doc) Save() error {
 	rendered, err := d.bytes()
 	if err != nil {
 		return err
@@ -351,16 +411,16 @@ func isEmptyMapping(n *yaml.Node) bool {
 	return n != nil && n.Kind == yaml.MappingNode && len(n.Content) == 0
 }
 
-func (d *yamlDoc) serversMap() *yaml.Node {
+func (d *Doc) serversMap() *yaml.Node {
 	return ensureMap(d.mapping(), "servers")
 }
 
-func (d *yamlDoc) serverNode(name string) *yaml.Node {
+func (d *Doc) serverNode(name string) *yaml.Node {
 	v, _ := lookupKey(d.serversMap(), name)
 	return v
 }
 
-func (d *yamlDoc) applyServer(v serverFormValues) error {
+func (d *Doc) ApplyServer(v ServerValues) error {
 	servers := d.serversMap()
 	oldName := v.OriginalName
 	if oldName == "" {
@@ -421,7 +481,7 @@ func (d *yamlDoc) applyServer(v serverFormValues) error {
 	return nil
 }
 
-func (d *yamlDoc) deleteServer(name string) error {
+func (d *Doc) DeleteServer(name string) error {
 	servers := d.serversMap()
 	_, index := lookupKey(servers, name)
 	if index < 0 {
@@ -431,7 +491,7 @@ func (d *yamlDoc) deleteServer(name string) error {
 	return nil
 }
 
-func (d *yamlDoc) appsMap(server string) (*yaml.Node, error) {
+func (d *Doc) appsMap(server string) (*yaml.Node, error) {
 	srv := d.serverNode(server)
 	if srv == nil {
 		return nil, fmt.Errorf("server %q is no longer in ship.yaml", server)
@@ -439,7 +499,7 @@ func (d *yamlDoc) appsMap(server string) (*yaml.Node, error) {
 	return ensureMap(srv, "apps"), nil
 }
 
-func (d *yamlDoc) applyApp(v appFormValues) error {
+func (d *Doc) ApplyApp(v AppValues) error {
 	apps, err := d.appsMap(v.Server)
 	if err != nil {
 		return err
@@ -533,7 +593,7 @@ func (d *yamlDoc) applyApp(v appFormValues) error {
 	return nil
 }
 
-func applyBackup(app *yaml.Node, v appFormValues) {
+func applyBackup(app *yaml.Node, v AppValues) {
 	existing, _ := lookupKey(app, "backup")
 	existed := existing != nil
 	needs := len(v.BackupSQLiteV) > 0 || len(v.BackupFilesV) > 0 ||
@@ -609,7 +669,7 @@ func applyEnv(app *yaml.Node, text string) error {
 	return nil
 }
 
-func applyDeploy(app *yaml.Node, v appFormValues) {
+func applyDeploy(app *yaml.Node, v AppValues) {
 	commands := strings.TrimSpace(v.DeployCommands) != ""
 	maintenance := v.DeployMaintenance
 	// Keep a maintenance key the user wrote, even when it says the default.
@@ -636,7 +696,151 @@ func applyDeploy(app *yaml.Node, v appFormValues) {
 	}
 }
 
-func (d *yamlDoc) deleteApp(server, app string) error {
+// PutApp adds or replaces an app from a YAML record, which must already have
+// been validated by the config package. On replace it merges the record into
+// the existing app node, so local comments and styles survive where values are
+// unchanged. Keys the record does not have are removed. When keepPath is set
+// and the old app has a source.path, that value is carried over (imports must
+// not lose the local build directory).
+func (d *Doc) PutApp(server, name string, record []byte, keepPath bool) error {
+	apps, err := d.appsMap(server)
+	if err != nil {
+		return err
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(record, &doc); err != nil {
+		return fmt.Errorf("app %q record: %w", name, err)
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
+		return fmt.Errorf("app %q record is not a YAML mapping", name)
+	}
+	rec := doc.Content[0]
+
+	oldPath := ""
+	_, oldIndex := lookupKey(apps, name)
+	if oldIndex >= 0 {
+		old := apps.Content[oldIndex+1]
+		if source, _ := lookupKey(old, "source"); source != nil {
+			if p, _ := lookupKey(source, "path"); p != nil {
+				oldPath = p.Value
+			}
+		}
+		if keepPath && oldPath != "" {
+			// Put the local path into the record before merging, so the
+			// existing path node (and its comment and style) is kept.
+			if source, _ := lookupKey(rec, "source"); source != nil {
+				if typ, _ := lookupKey(source, "type"); typ != nil && typ.Value == "image" {
+					setString(source, "path", oldPath)
+				}
+			}
+		}
+		mergeNode(old, rec)
+	} else {
+		appendKey(apps, name, rec)
+	}
+	return nil
+}
+
+// mergeNode updates dst from src while keeping dst's comments and style. A
+// value that is already equal is left completely untouched. Mappings are
+// merged key by key; every other differing value is replaced in place.
+func mergeNode(dst, src *yaml.Node) {
+	if dst == nil || src == nil || nodeEqual(dst, src) {
+		return
+	}
+	if dst.Kind == yaml.MappingNode && src.Kind == yaml.MappingNode {
+		mergeMapping(dst, src)
+		return
+	}
+	replaceNodeValue(dst, src)
+}
+
+func mergeMapping(dst, src *yaml.Node) {
+	srcByKey := make(map[string]*yaml.Node, len(src.Content)/2)
+	for i := 0; i+1 < len(src.Content); i += 2 {
+		srcByKey[src.Content[i].Value] = src.Content[i+1]
+	}
+	used := make(map[string]bool, len(srcByKey))
+	out := make([]*yaml.Node, 0, len(src.Content))
+	for i := 0; i+1 < len(dst.Content); i += 2 {
+		key, value := dst.Content[i], dst.Content[i+1]
+		srcValue, ok := srcByKey[key.Value]
+		if !ok || used[key.Value] {
+			continue
+		}
+		mergeNode(value, srcValue)
+		out = append(out, key, value)
+		used[key.Value] = true
+	}
+	for i := 0; i+1 < len(src.Content); i += 2 {
+		key, value := src.Content[i], src.Content[i+1]
+		if used[key.Value] {
+			continue
+		}
+		out = append(out, key, value)
+		used[key.Value] = true
+	}
+	dst.Content = out
+}
+
+func replaceNodeValue(dst, src *yaml.Node) {
+	style := dst.Style
+	head, line, foot := dst.HeadComment, dst.LineComment, dst.FootComment
+	*dst = *src
+	if style != 0 {
+		dst.Style = style
+	}
+	if head != "" {
+		dst.HeadComment = head
+	}
+	if line != "" {
+		dst.LineComment = line
+	}
+	if foot != "" {
+		dst.FootComment = foot
+	}
+}
+
+// nodeEqual compares YAML data, ignoring comments, styles and mapping order.
+func nodeEqual(a, b *yaml.Node) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.Kind != b.Kind || a.Tag != b.Tag {
+		return false
+	}
+	switch a.Kind {
+	case yaml.DocumentNode, yaml.SequenceNode:
+		if len(a.Content) != len(b.Content) {
+			return false
+		}
+		for i := range a.Content {
+			if !nodeEqual(a.Content[i], b.Content[i]) {
+				return false
+			}
+		}
+		return true
+	case yaml.MappingNode:
+		if len(a.Content) != len(b.Content) {
+			return false
+		}
+		values := make(map[string]*yaml.Node, len(b.Content)/2)
+		for i := 0; i+1 < len(b.Content); i += 2 {
+			values[b.Content[i].Value] = b.Content[i+1]
+		}
+		for i := 0; i+1 < len(a.Content); i += 2 {
+			value, ok := values[a.Content[i].Value]
+			if !ok || !nodeEqual(a.Content[i+1], value) {
+				return false
+			}
+		}
+		return true
+	default:
+		return a.Value == b.Value
+	}
+}
+
+func (d *Doc) DeleteApp(server, app string) error {
 	apps, err := d.appsMap(server)
 	if err != nil {
 		return err
@@ -652,7 +856,7 @@ func (d *yamlDoc) deleteApp(server, app string) error {
 // appSourceRaw returns the source asset and path exactly as written. Config
 // defaults and ~ expansion must not be baked back into the file just because
 // the app was edited.
-func (d *yamlDoc) appSourceRaw(server, app string) (asset, sourcePath string) {
+func (d *Doc) AppSourceRaw(server, app string) (asset, sourcePath string) {
 	srv := d.serverNode(server)
 	if srv == nil {
 		return "", ""
@@ -680,7 +884,7 @@ func (d *yamlDoc) appSourceRaw(server, app string) (asset, sourcePath string) {
 
 // appExtras reads the fields added by the build/deploy contract straight from
 // the YAML tree so the TUI form does not depend on their Go types.
-func (d *yamlDoc) appExtras(server, app string) (buildCommands, deployCommands string, maintenance bool) {
+func (d *Doc) AppExtras(server, app string) (buildCommands, deployCommands string, maintenance bool) {
 	maintenance = true
 	srv := d.serverNode(server)
 	if srv == nil {

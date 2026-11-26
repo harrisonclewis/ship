@@ -30,7 +30,9 @@ The server page shows each app with its current and previous version, health and
 | `r` | refresh |
 | `Esc` | back |
 
-**App actions:** deploy latest or build, deploy a version, roll back, restart, maintenance on/off, back up, list backups, restore, logs, edit env, edit, delete.
+**App actions:** deploy latest or build, deploy a version, roll back, restart, maintenance on/off, back up, list backups, restore, logs, edit env, edit, delete, compare with server.
+
+Apps marked **on server** exist only on the server and can be imported; **DIFF** means your config differs from what was last deployed. See [Server records](server-records.md).
 
 **Server actions:** deploy all, back up all, proxy update, setup, lock SSH, VPS update, reboot, add app, edit, delete.
 

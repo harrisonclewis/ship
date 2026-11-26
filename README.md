@@ -9,7 +9,7 @@
 `ship` is one Go binary that drives your servers over your system `ssh`. On the server it installs a single root-run script, `ship-agent`, and every action is `sudo ship-agent <action>`.
 
 - **Caddy in front.** Apps sit on a private Docker network; only Caddy publishes ports, and it gets certificates for you.
-- **Several servers.** One `ship.yaml` describes all your servers and the apps on each.
+- **Several servers.** One `ship.yaml` describes all your servers and the apps on each. Each server also keeps a record of its apps, so you can import them on another machine.
 - **Safe switches.** Every deploy shows a maintenance page, takes a backup, runs your deploy commands, waits for the healthcheck and rolls back on failure.
 - **Two app types.** Build an image from a GitHub release binary on the server, or build one from a local repo and send it over SSH. No registry.
 - **Backups.** Nightly and on demand, for SQLite, files and Postgres, with checksum-verified downloads and restore.
@@ -50,6 +50,7 @@ Add `--dry-run` to see what would run without touching a server.
 - [Install](docs/install.md)
 - [Updates](docs/updates.md)
 - [TUI](docs/tui.md)
+- [Server records](docs/server-records.md)
 - [Server setup](docs/setup.md)
 - [Configuration](docs/configuration.md)
 - [Deploying](docs/deploying.md)

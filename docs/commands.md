@@ -26,6 +26,8 @@ ship <server> env edit <app>                     sudoedit /opt/apps/<app>/.env
 ship <server> backup [app|all] [--no-pull]       archive now; download and verify locally
 ship <server> backups <app>                      list server archives
 ship <server> restore <app> <archive> [--yes]    pre-restore backup, stop, restore, health-check
+ship <server> diff [app]                         compare local config with the server's records
+ship <server> import <app…>|--all [--overwrite]  import apps from the server's records
 ship version                                     print the ship version
 ship update [--check]                            update ship to the latest release
 ```

@@ -23,7 +23,7 @@ import (
 
 // AgentProtocol is the ship-agent protocol version embedded in this ship. The
 // CLI refuses to replace a newer agent on a VPS.
-const AgentProtocol = 3
+const AgentProtocol = 4
 
 const agentPath = "/usr/local/sbin/ship-agent"
 
@@ -209,6 +209,17 @@ func (s *Session) RunAgentTTY(args ...string) error {
 func (s *Session) OutputAgent(args ...string) ([]byte, error) {
 	argv := s.AgentArgv(false, args...)
 	return s.Runner.Output(Cmd{Path: "ssh", Args: argv, Stderr: s.Err})
+}
+
+// StreamAgent runs an agent action and copies stdout to w without buffering
+// it first. Callers cap the writer when the output comes from the server.
+func (s *Session) StreamAgent(w io.Writer, args ...string) error {
+	return s.Runner.Run(Cmd{
+		Path:   "ssh",
+		Args:   s.AgentArgv(false, args...),
+		Stdout: w,
+		Stderr: s.Err,
+	})
 }
 
 // InputAgent runs an agent action with bytes on stdin (never on the command

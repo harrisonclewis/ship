@@ -84,8 +84,10 @@ type Backend interface {
 	Servers() []string
 	Server(name string) (*config.Server, error)
 	Status(ctx context.Context, server, app string) (ops.StatusReport, error)
+	ServerApps(ctx context.Context, server string) ([]ops.ServerApp, error)
 	ListBackups(ctx context.Context, server, app string) ([]BackupEntry, error)
 	Run(ctx context.Context, req Request, out io.Writer) (Result, error)
+	Import(ctx context.Context, req ops.ImportRequest) (ops.ImportSummary, error)
 	TerminalCommand(ctx context.Context, req TerminalRequest) (cmd *exec.Cmd, display string, err error)
 }
 
@@ -120,6 +122,14 @@ func (b *realBackend) ops(out io.Writer) *ops.Ops {
 
 func (b *realBackend) Status(ctx context.Context, server, app string) (ops.StatusReport, error) {
 	return b.ops(io.Discard).Status(ctx, server, app)
+}
+
+func (b *realBackend) ServerApps(ctx context.Context, server string) ([]ops.ServerApp, error) {
+	return b.ops(io.Discard).ServerApps(ctx, server)
+}
+
+func (b *realBackend) Import(ctx context.Context, req ops.ImportRequest) (ops.ImportSummary, error) {
+	return b.ops(io.Discard).Import(ctx, req)
 }
 
 func (b *realBackend) ListBackups(ctx context.Context, server, app string) ([]BackupEntry, error) {

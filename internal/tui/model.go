@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 
 	"github.com/harrisonclewis/ship/internal/config"
 	"github.com/harrisonclewis/ship/internal/ops"
+	"github.com/harrisonclewis/ship/internal/yamldoc"
 )
 
 type pageKind int
@@ -29,6 +32,7 @@ const (
 	pageAppActions
 	pageOutput
 	pageRestorePick
+	pageCompare
 )
 
 type serverAction int
@@ -82,6 +86,8 @@ const (
 	aaEnvEdit
 	aaEdit
 	aaDelete
+	aaCompare
+	aaImport
 )
 
 type appActionDef struct {
@@ -107,6 +113,11 @@ var appActionDefs = []appActionDef{
 	{"x", "Delete app", "Remove it from ship.yaml only", aaDelete, true},
 }
 
+var compareAppAction = appActionDef{"c", "Compare with server", "Show record and file differences; use the server version", aaCompare, false}
+var importAppAction = appActionDef{"i", "Import app", "Copy this app's record and files from the server", aaImport, false}
+var importComposeAction = appActionDef{"i", "Import compose file", "No record (older ship); copy only its compose files", aaImport, false}
+var importUnreadableAction = appActionDef{"i", "Import compose file", "Record unreadable (newer ship?); copy only its compose files", aaImport, false}
+
 type confirmDialog struct {
 	title string
 	body  string
@@ -120,7 +131,7 @@ type model struct {
 
 	backend Backend
 	cfg     *config.Config
-	doc     *yamlDoc
+	doc     *yamldoc.Doc
 	path    string
 
 	page          pageKind
@@ -145,6 +156,14 @@ type model struct {
 	statuses      map[string]ops.StatusReport
 	statusErr     map[string]string
 	statusLoading map[string]bool
+
+	serverApps        map[string][]ops.ServerApp
+	serverAppsErr     map[string]string
+	serverAppsLoading map[string]bool
+	appDiffs          map[string]map[string]ops.AppDiff
+
+	compare     ops.AppDiff
+	compareText string
 
 	backups        []BackupEntry
 	backupsLoading bool
@@ -176,6 +195,27 @@ type backupsMsg struct {
 	err    error
 }
 
+type serverAppsMsg struct {
+	server    string
+	apps      []ops.ServerApp
+	err       error
+	forImport bool
+}
+
+type importDoneMsg struct {
+	server  string
+	summary ops.ImportSummary
+	err     error
+}
+
+// appEntry is one row on the server page: a local app, a server-only app, or
+// both.
+type appEntry struct {
+	Name   string
+	Local  bool
+	Server bool
+}
+
 type terminalReadyMsg struct {
 	req     TerminalRequest
 	cmd     *exec.Cmd
@@ -183,22 +223,26 @@ type terminalReadyMsg struct {
 	err     error
 }
 
-func newModel(cfg *config.Config, backend Backend, doc *yamlDoc, path string, dryRun bool) *model {
+func newModel(cfg *config.Config, backend Backend, doc *yamldoc.Doc, path string, dryRun bool) *model {
 	m := &model{
-		width:         80,
-		height:        24,
-		dryRun:        dryRun,
-		backend:       backend,
-		cfg:           cfg,
-		doc:           doc,
-		path:          path,
-		page:          pageServers,
-		activityCur:   0,
-		byID:          map[int]*activity{},
-		runs:          map[string]int{},
-		statuses:      map[string]ops.StatusReport{},
-		statusErr:     map[string]string{},
-		statusLoading: map[string]bool{},
+		width:             80,
+		height:            24,
+		dryRun:            dryRun,
+		backend:           backend,
+		cfg:               cfg,
+		doc:               doc,
+		path:              path,
+		page:              pageServers,
+		activityCur:       0,
+		byID:              map[int]*activity{},
+		runs:              map[string]int{},
+		statuses:          map[string]ops.StatusReport{},
+		statusErr:         map[string]string{},
+		statusLoading:     map[string]bool{},
+		serverApps:        map[string][]ops.ServerApp{},
+		serverAppsErr:     map[string]string{},
+		serverAppsLoading: map[string]bool{},
+		appDiffs:          map[string]map[string]ops.AppDiff{},
 	}
 	m.vp = viewport.New(76, 16)
 	m.resizeViewport()
@@ -228,6 +272,13 @@ func (m *model) resizeViewport() {
 			if atBottom {
 				m.vp.GotoBottom()
 			}
+		}
+	}
+	if m.page == pageCompare {
+		atTop := m.vp.YOffset == 0
+		m.vp.SetContent(ansi.Wrap(m.compareText, w, " /,'"))
+		if atTop {
+			m.vp.GotoTop()
 		}
 	}
 }
@@ -283,6 +334,26 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		delete(m.statusErr, msg.server)
 		m.statuses[msg.server] = msg.report
 		return m, nil
+	case serverAppsMsg:
+		delete(m.serverAppsLoading, msg.server)
+		if msg.err != nil {
+			m.serverAppsErr[msg.server] = msg.err.Error()
+			delete(m.serverApps, msg.server)
+			delete(m.appDiffs, msg.server)
+			if msg.forImport {
+				m.showToast(toastWarning, msg.err.Error())
+			}
+			return m, nil
+		}
+		delete(m.serverAppsErr, msg.server)
+		m.serverApps[msg.server] = msg.apps
+		m.recomputeDiffs(msg.server)
+		if msg.forImport {
+			return m, m.offerImport(msg.server)
+		}
+		return m, nil
+	case importDoneMsg:
+		return m, m.finishImport(msg)
 	case backupsMsg:
 		if m.page != pageRestorePick || msg.server != m.backupsServer || msg.app != m.backupsApp {
 			return m, nil
@@ -401,6 +472,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleOutputKey(msg, key)
 	case pageRestorePick:
 		return m.handleRestoreKey(key)
+	case pageCompare:
+		return m.handleCompareKey(msg, key)
 	}
 	return m, nil
 }
@@ -463,15 +536,14 @@ func (m *model) handleServerKey(key string) (tea.Model, tea.Cmd) {
 		m.page = pageServers
 		return m, nil
 	case "up", "k":
-		m.appCursor = clampIndex(m.appCursor-1, len(m.appNames()))
+		m.appCursor = clampIndex(m.appCursor-1, len(m.appEntries()))
 	case "down", "j":
-		m.appCursor = clampIndex(m.appCursor+1, len(m.appNames()))
+		m.appCursor = clampIndex(m.appCursor+1, len(m.appEntries()))
 	case "enter":
-		if len(m.appNames()) > 0 {
-			if m.appCursor >= len(m.appNames()) {
-				m.appCursor = len(m.appNames()) - 1
-			}
-			m.appName = m.appNames()[m.appCursor]
+		entries := m.appEntries()
+		if len(entries) > 0 {
+			m.appCursor = clampIndex(m.appCursor, len(entries))
+			m.appName = entries[m.appCursor].Name
 			m.page = pageAppActions
 			m.appActCur = 0
 		}
@@ -499,7 +571,7 @@ func (m *model) handleServerKey(key string) (tea.Model, tea.Cmd) {
 	case "x":
 		return m, m.runServerAction(saDeleteServer)
 	case "r":
-		return m, m.loadStatus(m.serverName)
+		return m, tea.Batch(m.loadStatus(m.serverName), m.loadServerApps(m.serverName, false))
 	}
 	return m, nil
 }
@@ -528,20 +600,24 @@ func (m *model) handleServerActionsKey(key string) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) handleAppActionsKey(key string) (tea.Model, tea.Cmd) {
+	defs := m.appActions()
 	switch key {
 	case "esc":
 		m.page = pageServer
 		return m, nil
 	case "up", "k":
-		m.appActCur = clampIndex(m.appActCur-1, len(appActionDefs))
+		m.appActCur = clampIndex(m.appActCur-1, len(defs))
 		return m, nil
 	case "down", "j":
-		m.appActCur = clampIndex(m.appActCur+1, len(appActionDefs))
+		m.appActCur = clampIndex(m.appActCur+1, len(defs))
 		return m, nil
 	case "enter":
-		return m, m.runAppAction(appActionDefs[m.appActCur].action)
+		if len(defs) > 0 {
+			m.appActCur = clampIndex(m.appActCur, len(defs))
+			return m, m.runAppAction(defs[m.appActCur].action)
+		}
 	}
-	for i, def := range appActionDefs {
+	for i, def := range defs {
 		if key == def.key {
 			m.appActCur = i
 			return m, m.runAppAction(def.action)
@@ -597,6 +673,38 @@ func (m *model) handleRestoreKey(key string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *model) handleCompareKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) {
+	switch key {
+	case "esc", "k":
+		m.keepMine()
+		return m, nil
+	case "u":
+		server, app := m.compareServer(), m.compare.App
+		filesOnly := !m.compare.HasRecord
+		body := "Replace " + app + " in ship.yaml and its files with the server copy? Your local source.path is kept and each overwritten file gets a .bak."
+		if filesOnly {
+			body = "No record exists on the server (older ship), so ship.yaml is kept. Replace " + app + "'s compose file and Dockerfile with the server copies? Each overwritten file gets a .bak."
+		}
+		m.openConfirm("Use server version", body, func() tea.Cmd {
+			m.page = pageServer
+			return m.startImport(server, []string{app}, true, filesOnly)
+		})
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.vp, cmd = m.vp.Update(msg)
+	return m, cmd
+}
+
+func (m *model) compareServer() string {
+	return m.serverName
+}
+
+func (m *model) keepMine() {
+	m.page = pageServer
+	m.showToast(toastInfo, "Keeping your local version of "+m.compare.App+"; the next deploy uploads it.")
+}
+
 func clampIndex(i, n int) int {
 	if n <= 0 {
 		return 0
@@ -647,12 +755,250 @@ func (m *model) currentApp() *config.App {
 	return app
 }
 
+func (m *model) serverApp(name string) *ops.ServerApp {
+	apps := m.serverApps[m.serverName]
+	for i := range apps {
+		if apps[i].Name == name {
+			return &apps[i]
+		}
+	}
+	return nil
+}
+
+func (m *model) currentServerApp() *ops.ServerApp {
+	return m.serverApp(m.appName)
+}
+
+// appEntries is the union of local apps and apps the server reports, sorted by
+// name. Server-only apps are listed so they can be imported.
+func (m *model) appEntries() []appEntry {
+	srv := m.currentServer()
+	if srv == nil {
+		return nil
+	}
+	entries := map[string]appEntry{}
+	for _, name := range srv.AppNames() {
+		entries[name] = appEntry{Name: name, Local: true}
+	}
+	for _, sa := range m.serverApps[m.serverName] {
+		e := entries[sa.Name]
+		e.Name = sa.Name
+		e.Server = true
+		entries[sa.Name] = e
+	}
+	names := make([]string, 0, len(entries))
+	for name := range entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]appEntry, 0, len(names))
+	for _, name := range names {
+		out = append(out, entries[name])
+	}
+	return out
+}
+
+func (m *model) diffFor(server, app string) (ops.AppDiff, bool) {
+	byApp, ok := m.appDiffs[server]
+	if !ok {
+		return ops.AppDiff{}, false
+	}
+	d, ok := byApp[app]
+	return d, ok
+}
+
+func (m *model) recomputeDiffs(server string) {
+	srv, err := m.backend.Server(server)
+	if err != nil {
+		delete(m.appDiffs, server)
+		return
+	}
+	diffs, err := ops.CompareServerApps(srv, m.serverApps[server])
+	if err != nil {
+		delete(m.appDiffs, server)
+		return
+	}
+	byApp := make(map[string]ops.AppDiff, len(diffs))
+	for _, d := range diffs {
+		byApp[d.App] = d
+	}
+	m.appDiffs[server] = byApp
+}
+
+func (m *model) recomputeAllDiffs() {
+	for server := range m.serverApps {
+		m.recomputeDiffs(server)
+	}
+}
+
+func (m *model) loadServerApps(server string, forImport bool) tea.Cmd {
+	if server == "" || m.serverAppsLoading[server] {
+		return nil
+	}
+	m.serverAppsLoading[server] = true
+	backend := m.backend
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		apps, err := backend.ServerApps(ctx, server)
+		return serverAppsMsg{server: server, apps: apps, err: err, forImport: forImport}
+	}
+}
+
+// offerImport opens a multi-select dialog for server apps that are not local.
+// It is triggered after a server is added, so the common case (adding a
+// machine that already runs apps) needs one more keypress, not a hunt.
+func (m *model) offerImport(server string) tea.Cmd {
+	if m.form != nil || m.confirm != nil || m.page == pageCompare {
+		return nil
+	}
+	srv, err := m.backend.Server(server)
+	if err != nil || srv == nil {
+		return nil
+	}
+	var names []string
+	for _, sa := range m.serverApps[server] {
+		if sa.Record == nil {
+			continue
+		}
+		if srv.Apps[sa.Name] == nil {
+			names = append(names, sa.Name)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	m.serverName = server
+	m.page = pageServers
+	f := &formHost{purpose: formImportApps, serverName: server, importNames: names}
+	f.importSelected = append([]string(nil), names...)
+	f.form = m.buildForm(f)
+	m.form = f
+	return nil
+}
+
+// beginImport imports apps, first asking about any local files whose contents
+// differ. Identical files are not conflicts and are skipped by ops.Import.
+func (m *model) beginImport(server string, apps []string, overwrite, filesOnly bool) tea.Cmd {
+	if !overwrite {
+		if files := m.differingImportFiles(server, apps); len(files) > 0 {
+			body := files[0] + " differs from the server's; overwrite? A .bak is kept."
+			if len(files) > 1 {
+				body = "These files differ from the server's: " + strings.Join(files, ", ") + ". Overwrite them? A .bak is kept."
+			}
+			m.openConfirm("Overwrite local files?", body, func() tea.Cmd {
+				return m.startImport(server, apps, true, filesOnly)
+			})
+			return nil
+		}
+	}
+	return m.startImport(server, apps, overwrite, filesOnly)
+}
+
+func (m *model) differingImportFiles(server string, apps []string) []string {
+	srv, err := m.backend.Server(server)
+	if err != nil {
+		return nil
+	}
+	byName := make(map[string]ops.ServerApp, len(m.serverApps[server]))
+	for _, sa := range m.serverApps[server] {
+		byName[sa.Name] = sa
+	}
+	var out []string
+	for _, name := range apps {
+		sa, ok := byName[name]
+		if !ok {
+			continue
+		}
+		if len(sa.Compose) > 0 && fileDiffers(srv.ComposePath(name), sa.Compose) {
+			out = append(out, "apps/"+name+"/compose.yaml")
+		}
+		if sa.HasDockerfile && fileDiffers(srv.DockerfilePath(name), sa.Dockerfile) {
+			out = append(out, "apps/"+name+"/Dockerfile")
+		}
+	}
+	return out
+}
+
+func fileDiffers(path string, server []byte) bool {
+	local, err := os.ReadFile(path)
+	return err == nil && !bytes.Equal(local, server)
+}
+
+func (m *model) startImport(server string, apps []string, overwrite, filesOnly bool) tea.Cmd {
+	backend := m.backend
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		summary, err := backend.Import(ctx, ops.ImportRequest{
+			Server:    server,
+			Apps:      apps,
+			Overwrite: overwrite,
+			FilesOnly: filesOnly,
+		})
+		return importDoneMsg{server: server, summary: summary, err: err}
+	}
+}
+
+func (m *model) finishImport(msg importDoneMsg) tea.Cmd {
+	if msg.err != nil {
+		m.showToast(toastError, msg.err.Error())
+		return nil
+	}
+	if err := m.reloadConfig(); err != nil {
+		m.showToast(toastError, err.Error())
+		return nil
+	}
+	m.form = nil
+	m.page = pageServer
+	m.serverName = msg.server
+	m.compare = ops.AppDiff{}
+	m.appCursor = 0
+	for i, e := range m.appEntries() {
+		if e.Name == m.appName {
+			m.appCursor = i
+			break
+		}
+	}
+	if len(msg.summary.Imported) == 0 {
+		m.showToast(toastInfo, "Nothing imported.")
+		return nil
+	}
+	m.showToast(toastSuccess, "Imported "+strings.Join(msg.summary.Imported, ", ")+".")
+	return tea.Batch(m.loadStatus(msg.server), m.loadServerApps(msg.server, false))
+}
+
+func (m *model) openCompare() {
+	d, ok := m.diffFor(m.serverName, m.appName)
+	if !ok {
+		m.showToast(toastWarning, "No server record for "+m.appName+" yet; deploy it once.")
+		return
+	}
+	m.compare = d
+	m.page = pageCompare
+	m.compareText = d.Diff
+	if d.RecordErr != "" {
+		m.compareText = "The server record is unreadable (newer ship?): " + d.RecordErr + "\n\n" + m.compareText
+	} else if !d.HasRecord {
+		m.compareText = "No record on the server (deployed by an older ship).\n\n" + m.compareText
+	}
+	if strings.TrimSpace(d.Diff) == "" {
+		m.compareText = strings.TrimRight(m.compareText, "\n") + "\nNo differences in the files."
+	}
+	m.showCompare()
+}
+
+func (m *model) showCompare() {
+	m.vp.SetContent(ansi.Wrap(m.compareText, m.vp.Width, " /,'"))
+	m.vp.GotoTop()
+}
+
 func (m *model) openServer(name string) tea.Cmd {
 	m.page = pageServer
 	m.serverName = name
 	m.appCursor = 0
 	m.toast = nil
-	return m.loadStatus(name)
+	return tea.Batch(m.loadStatus(name), m.loadServerApps(name, false))
 }
 
 func (m *model) openSelectedActivity() tea.Cmd {
@@ -816,6 +1162,11 @@ func (m *model) finishRun(msg runDoneMsg) tea.Cmd {
 	if cmd := m.loadStatus(entry.req.Server); cmd != nil {
 		cmds = append(cmds, cmd)
 	}
+	if entry.req.Action == ActDeploy || entry.req.Action == ActDeployAll {
+		if cmd := m.loadServerApps(entry.req.Server, false); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
 	if m.runningCount() > 0 {
 		cmds = append(cmds, m.ensureTick())
 	}
@@ -933,6 +1284,27 @@ func (m *model) runServerAction(action serverAction) tea.Cmd {
 	return nil
 }
 
+func (m *model) appActions() []appActionDef {
+	if m.currentApp() == nil {
+		sa := m.currentServerApp()
+		if sa == nil {
+			return nil
+		}
+		if sa.Record != nil {
+			return []appActionDef{importAppAction}
+		}
+		if sa.RecordErr != "" {
+			return []appActionDef{importUnreadableAction}
+		}
+		return []appActionDef{importComposeAction}
+	}
+	defs := append([]appActionDef(nil), appActionDefs...)
+	if m.currentServerApp() != nil {
+		defs = append(defs, compareAppAction)
+	}
+	return defs
+}
+
 func (m *model) runAppAction(action appAction) tea.Cmd {
 	server, app := m.serverName, m.appName
 	switch action {
@@ -977,6 +1349,15 @@ func (m *model) runAppAction(action appAction) tea.Cmd {
 		m.openConfirm("Delete app", "Remove "+app+" from ship.yaml? This only edits the file; the app's compose files, data and deployed containers are not changed.", func() tea.Cmd {
 			return m.deleteApp(server, app)
 		})
+	case aaCompare:
+		m.openCompare()
+	case aaImport:
+		sa := m.currentServerApp()
+		if sa == nil {
+			m.showToast(toastWarning, "No server record for "+app+" yet.")
+			return nil
+		}
+		return m.beginImport(server, []string{app}, false, sa.Record == nil)
 	}
 	return nil
 }
@@ -1105,13 +1486,13 @@ func (m *model) submitForm() tea.Cmd {
 	}
 	switch f.purpose {
 	case formAddServer, formEditServer:
-		tmp := m.doc.clone()
-		if err := tmp.applyServer(*f.server); err != nil {
+		tmp := m.doc.Clone()
+		if err := tmp.ApplyServer(*f.server); err != nil {
 			f.err = err.Error()
 			f.form = m.buildForm(f)
 			return nil
 		}
-		if err := tmp.save(); err != nil {
+		if err := tmp.Save(); err != nil {
 			f.err = err.Error()
 			f.form = m.buildForm(f)
 			return nil
@@ -1132,16 +1513,19 @@ func (m *model) submitForm() tea.Cmd {
 			}
 		}
 		m.showToast(toastSuccess, "Saved "+name+".")
+		if f.purpose == formAddServer {
+			return tea.Batch(m.refreshAllStatuses(), m.loadServerApps(name, true))
+		}
 		return m.refreshAllStatuses()
 	case formAddApp, formEditApp:
 		f.submitValues()
-		tmp := m.doc.clone()
-		if err := tmp.applyApp(*f.app); err != nil {
+		tmp := m.doc.Clone()
+		if err := tmp.ApplyApp(*f.app); err != nil {
 			f.err = err.Error()
 			f.form = m.buildForm(f)
 			return nil
 		}
-		if err := tmp.save(); err != nil {
+		if err := tmp.Save(); err != nil {
 			f.err = err.Error()
 			f.form = m.buildForm(f)
 			return nil
@@ -1156,8 +1540,8 @@ func (m *model) submitForm() tea.Cmd {
 		m.form = nil
 		m.page = pageServer
 		m.serverName = f.app.Server
-		for i, n := range m.appNames() {
-			if n == name {
+		for i, e := range m.appEntries() {
+			if e.Name == name {
 				m.appCursor = i
 				break
 			}
@@ -1207,6 +1591,14 @@ func (m *model) submitForm() tea.Cmd {
 			return m.startRun(Request{Action: ActRestore, Server: server, App: app, Archive: archive})
 		})
 		return nil
+	case formImportApps:
+		selected := append([]string(nil), f.importSelected...)
+		server := f.serverName
+		m.form = nil
+		if len(selected) == 0 {
+			return nil
+		}
+		return m.beginImport(server, selected, false, false)
 	case formLogsService:
 		service := formText(f.text)
 		if service != "" {
@@ -1225,12 +1617,12 @@ func (m *model) submitForm() tea.Cmd {
 }
 
 func (m *model) deleteServer(name string) tea.Cmd {
-	tmp := m.doc.clone()
-	if err := tmp.deleteServer(name); err != nil {
+	tmp := m.doc.Clone()
+	if err := tmp.DeleteServer(name); err != nil {
 		m.showToast(toastError, err.Error())
 		return nil
 	}
-	if err := tmp.save(); err != nil {
+	if err := tmp.Save(); err != nil {
 		m.showToast(toastError, err.Error())
 		return nil
 	}
@@ -1246,12 +1638,12 @@ func (m *model) deleteServer(name string) tea.Cmd {
 }
 
 func (m *model) deleteApp(server, app string) tea.Cmd {
-	tmp := m.doc.clone()
-	if err := tmp.deleteApp(server, app); err != nil {
+	tmp := m.doc.Clone()
+	if err := tmp.DeleteApp(server, app); err != nil {
 		m.showToast(toastError, err.Error())
 		return nil
 	}
-	if err := tmp.save(); err != nil {
+	if err := tmp.Save(); err != nil {
 		m.showToast(toastError, err.Error())
 		return nil
 	}
@@ -1262,7 +1654,7 @@ func (m *model) deleteApp(server, app string) tea.Cmd {
 	}
 	m.page = pageServer
 	m.serverName = server
-	m.appCursor = clampIndex(m.appCursor, len(m.appNames()))
+	m.appCursor = clampIndex(m.appCursor, len(m.appEntries()))
 	m.showToast(toastSuccess, "Removed "+app+" from ship.yaml.")
 	return m.loadStatus(server)
 }
@@ -1272,9 +1664,15 @@ func (m *model) reloadConfig() error {
 	if err != nil {
 		return err
 	}
+	doc, err := yamldoc.Load(m.path)
+	if err != nil {
+		return err
+	}
 	m.cfg = cfg
+	m.doc = doc
 	m.backend.SetConfig(cfg)
 	m.serverCursor = clampIndex(m.serverCursor, len(cfg.ServerNames()))
+	m.recomputeAllDiffs()
 	return nil
 }
 

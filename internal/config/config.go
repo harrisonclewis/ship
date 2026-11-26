@@ -6,6 +6,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -89,6 +90,9 @@ type Config struct {
 	// Dir is the absolute directory containing ship.yaml. App files are read
 	// relative to it, not to the current directory. It is not part of the file.
 	Dir string `yaml:"-"`
+	// Path is the absolute path of the loaded ship.yaml. It is empty for a
+	// document decoded in memory.
+	Path string `yaml:"-"`
 }
 
 // Server is one VPS and the apps deployed on it.
@@ -109,28 +113,28 @@ type Server struct {
 // App is one deployed application.
 type App struct {
 	Domains   []string          `yaml:"domains"`
-	Redirects []string          `yaml:"redirects"`
+	Redirects []string          `yaml:"redirects,omitempty"`
 	Upstream  string            `yaml:"upstream"`
 	Source    Source            `yaml:"source"`
-	UID       *int              `yaml:"uid"`
-	Data      []string          `yaml:"data"`
-	Health    Health            `yaml:"health"`
-	Backup    BackupSpec        `yaml:"backup"`
-	Env       map[string]string `yaml:"env"`
-	Build     BuildSpec         `yaml:"build"`
-	Deploy    DeploySpec        `yaml:"deploy"`
+	UID       *int              `yaml:"uid,omitempty"`
+	Data      []string          `yaml:"data,omitempty"`
+	Health    Health            `yaml:"health,omitempty"`
+	Backup    BackupSpec        `yaml:"backup,omitempty"`
+	Env       map[string]string `yaml:"env,omitempty"`
+	Build     BuildSpec         `yaml:"build,omitempty"`
+	Deploy    DeploySpec        `yaml:"deploy,omitempty"`
 }
 
 // BuildSpec is a local script run before an image app is built.
 type BuildSpec struct {
-	Commands string `yaml:"commands"`
+	Commands string `yaml:"commands,omitempty"`
 }
 
 // DeploySpec is a server-side script run in the new image before a switch,
 // and the maintenance-page setting used during the deploy.
 type DeploySpec struct {
-	Commands    string `yaml:"commands"`
-	Maintenance *bool  `yaml:"maintenance"`
+	Commands    string `yaml:"commands,omitempty"`
+	Maintenance *bool  `yaml:"maintenance,omitempty"`
 }
 
 // MaintenanceEnabled reports whether deploys should show the maintenance page
@@ -142,22 +146,22 @@ func (a *App) MaintenanceEnabled() bool {
 // Source describes where an app's image comes from.
 type Source struct {
 	Type  string `yaml:"type"`
-	Repo  string `yaml:"repo"`
-	Asset string `yaml:"asset"`
-	Path  string `yaml:"path"`
+	Repo  string `yaml:"repo,omitempty"`
+	Asset string `yaml:"asset,omitempty"`
+	Path  string `yaml:"path,omitempty"`
 }
 
 // Health is an optional extra health check performed from inside the web
 // network, in addition to the compose healthcheck.
 type Health struct {
-	HTTPPath string `yaml:"http_path"`
+	HTTPPath string `yaml:"http_path,omitempty"`
 }
 
 // BackupSpec says what to archive for an app.
 type BackupSpec struct {
-	SQLite   []string      `yaml:"sqlite"`
-	Files    []string      `yaml:"files"`
-	Postgres *PostgresSpec `yaml:"postgres"`
+	SQLite   []string      `yaml:"sqlite,omitempty"`
+	Files    []string      `yaml:"files,omitempty"`
+	Postgres *PostgresSpec `yaml:"postgres,omitempty"`
 }
 
 // PostgresSpec dumps a database with pg_dump inside a compose service.
@@ -182,6 +186,7 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	c.Path = abs
 	c.setDir(filepath.Dir(abs))
 	return c, nil
 }
@@ -273,6 +278,60 @@ func Decode(r io.Reader) (*Config, error) {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// RecordYAML renders an app's canonical server-side record. It is what the
+// agent stores as ship-app.yaml and what Compare uses, so it deliberately
+// omits machine-specific fields (source.path) and carries no comments.
+func (a *App) RecordYAML() ([]byte, error) {
+	record := *a
+	record.Source.Path = ""
+	// Write defaults the same way however the user spelled them, so an
+	// explicit `maintenance: true` doesn't look like a change.
+	if record.MaintenanceEnabled() {
+		record.Deploy.Maintenance = nil
+	}
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(&record); err != nil {
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// DecodeAppRecord parses and validates one ship-app.yaml record. Unknown
+// fields, a second document and invalid values are rejected.
+func DecodeAppRecord(r io.Reader) (*App, error) {
+	dec := yaml.NewDecoder(r)
+	dec.KnownFields(true)
+	var app App
+	if err := dec.Decode(&app); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, errors.New("app record is empty")
+		}
+		return nil, err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, errors.New("app record must contain exactly one YAML document")
+		}
+		return nil, err
+	}
+	if err := app.Validate(); err != nil {
+		return nil, err
+	}
+	return &app, nil
+}
+
+// Validate checks one app record in isolation and applies defaults. It does
+// not check domains against other apps; the whole config does that.
+func (a *App) Validate() error {
+	return (&Server{Name: "record"}).validateApp("app", a, map[string]string{})
 }
 
 // Validate checks every field and applies defaults.
@@ -426,19 +485,21 @@ func (s *Server) validateApp(p string, app *App, seenHost map[string]string) err
 			return fmt.Errorf("%s.source.path: only valid for source.type image", p)
 		}
 	case "image":
-		if app.Source.Path == "" {
-			return fmt.Errorf("%s.source.path: required for source.type image", p)
-		}
-		local, err := expandHome(app.Source.Path)
-		if err != nil {
-			return fmt.Errorf("%s.source.path: %w", p, err)
-		}
-		if !filepath.IsAbs(local) || filepath.Clean(local) != local {
-			return fmt.Errorf("%s.source.path: want a clean absolute path or ~/path, got %q", p, app.Source.Path)
-		}
-		app.Source.Path = local
-		if strings.ContainsAny(app.Source.Path, "\n\r\x00") {
-			return fmt.Errorf("%s.source.path: control characters are not allowed", p)
+		// An imported image app may not have a local build directory yet. It
+		// can be deployed, rolled back, backed up and compared; only building
+		// needs source.path (internal/ops checks that before a build).
+		if app.Source.Path != "" {
+			local, err := expandHome(app.Source.Path)
+			if err != nil {
+				return fmt.Errorf("%s.source.path: %w", p, err)
+			}
+			if !filepath.IsAbs(local) || filepath.Clean(local) != local {
+				return fmt.Errorf("%s.source.path: want a clean absolute path or ~/path, got %q", p, app.Source.Path)
+			}
+			app.Source.Path = local
+			if strings.ContainsAny(app.Source.Path, "\n\r\x00") {
+				return fmt.Errorf("%s.source.path: control characters are not allowed", p)
+			}
 		}
 		if app.Source.Repo != "" || app.Source.Asset != "" {
 			return fmt.Errorf("%s.source: repo/asset are only valid for source.type github-release", p)

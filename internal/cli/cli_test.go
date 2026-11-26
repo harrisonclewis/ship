@@ -1,14 +1,20 @@
 package cli
 
 import (
+	"archive/tar"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/harrisonclewis/ship/internal/config"
+	"github.com/harrisonclewis/ship/internal/remote"
 )
 
 const oneServerDoc = `servers:
@@ -211,5 +217,132 @@ func TestDeployImageDryRunWithServer(t *testing.T) {
 	}
 	if n := strings.Count(got, "app-files"); n != 1 {
 		t.Errorf("app files were transferred %d times, want 1:\n%s", n, got)
+	}
+}
+
+type cliExportRunner struct {
+	export []byte
+}
+
+func (r *cliExportRunner) Run(c remote.Cmd) error {
+	if strings.Contains(strings.Join(c.Args, " "), "app-export") && c.Stdout != nil {
+		_, err := c.Stdout.Write(r.export)
+		return err
+	}
+	if c.Stdin != nil {
+		_, _ = io.Copy(io.Discard, c.Stdin)
+	}
+	return nil
+}
+
+func (r *cliExportRunner) Output(c remote.Cmd) ([]byte, error) {
+	sum := sha256.Sum256(nil)
+	return []byte("version=" + strconv.Itoa(remote.AgentProtocol) + "\nsha256=" + hex.EncodeToString(sum[:]) + "\n"), nil
+}
+
+func exportTar(t *testing.T, record, compose string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for name, data := range map[string]string{
+		"web/ship-app.yaml": record,
+		"web/compose.yaml":  compose,
+	} {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(data))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(data)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestImportCommandRefusesAndBacksUp(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ship.yaml")
+	doc := `servers:
+  prod:
+    host: ops@203.0.113.10
+    apps: {}
+`
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := `domains: [web.example.com]
+upstream: web:3000
+source:
+  type: image
+`
+	runner := &cliExportRunner{export: exportTar(t, record, "name: web\n")}
+	var out bytes.Buffer
+	o := &options{out: &out, errOut: io.Discard, in: strings.NewReader(""), runner: runner}
+
+	if err := cmdImport(o, cfg, "prod", []string{"web"}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Servers["prod"].Apps["web"] == nil {
+		t.Fatal("import did not write the app into ship.yaml")
+	}
+	compose := filepath.Join(dir, "apps", "web", "compose.yaml")
+	if _, err := os.Stat(compose); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second import without --overwrite must refuse.
+	cfg, err = config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.out = io.Discard
+	if err := cmdImport(o, cfg, "prod", []string{"web"}); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("err = %v, want an already-exists error", err)
+	} else if !strings.Contains(err.Error(), "--overwrite") {
+		t.Fatalf("CLI error does not mention --overwrite: %v", err)
+	}
+	if _, err := os.Stat(compose + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("a refused import wrote a .bak")
+	}
+
+	// With --overwrite it replaces the file and keeps a .bak.
+	runner.export = exportTar(t, strings.Replace(record, "web.example.com", "new.example.com", 1), "name: changed\n")
+	cfg, err = config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdImport(o, cfg, "prod", []string{"web", "--overwrite"}); err != nil {
+		t.Fatal(err)
+	}
+	bak, err := os.ReadFile(compose + ".bak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(bak) != "name: web\n" {
+		t.Fatalf("compose .bak = %q", bak)
+	}
+	changed, err := os.ReadFile(compose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(changed) != "name: changed\n" {
+		t.Fatalf("compose = %q", changed)
+	}
+	result, err = config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Servers["prod"].Apps["web"].Domains[0]; got != "new.example.com" {
+		t.Fatalf("domain = %q", got)
 	}
 }

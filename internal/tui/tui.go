@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/harrisonclewis/ship/internal/config"
+	"github.com/harrisonclewis/ship/internal/yamldoc"
 )
 
 // Options configures the interface.
@@ -49,14 +50,14 @@ func Run(opts Options) error {
 	return err
 }
 
-func loadForTUI(errOut io.Writer) (*config.Config, string, *yamlDoc, error) {
+func loadForTUI(errOut io.Writer) (*config.Config, string, *yamldoc.Doc, error) {
 	path, err := config.Find()
 	if err == nil {
 		cfg, loadErr := config.Load(path)
 		if loadErr != nil {
 			return nil, "", nil, loadErr
 		}
-		doc, docErr := loadYAMLDoc(path)
+		doc, docErr := yamldoc.Load(path)
 		if docErr != nil {
 			return nil, "", nil, docErr
 		}
@@ -82,5 +83,5 @@ func loadForTUI(errOut io.Writer) (*config.Config, string, *yamlDoc, error) {
 	if errOut != nil {
 		fmt.Fprintf(errOut, "ship: %s not found; starting with an empty configuration\n", path)
 	}
-	return cfg, abs, newEmptyYAMLDoc(abs), nil
+	return cfg, abs, yamldoc.New(abs), nil
 }

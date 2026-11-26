@@ -51,7 +51,7 @@ Server names follow the app name rules and can't be a command name (`setup`, `de
 | `domains` | one or more FQDNs, all served; the first is canonical |
 | `redirects` | optional FQDNs that permanently redirect to the canonical domain |
 | `upstream` | `service:port` on the `web` network, e.g. `hello:8080` |
-| `source` | `github-release` (`repo`, optional `asset` with `{arch}`/`{app}`) or `image` (`path` to a local git repo; `~/` works) |
+| `source` | `github-release` (`repo`, optional `asset` with `{arch}`/`{app}`) or `image` (`path` to a local git repo; `~/` works; may be empty until you need to build) |
 | `uid` | optional system user/group and data owner (required for SQLite backups) |
 | `data` | server directories the app owns |
 | `health.http_path` | optional extra path checked from inside `web` after a switch |

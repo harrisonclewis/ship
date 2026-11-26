@@ -7,7 +7,11 @@ import (
 	"github.com/charmbracelet/huh"
 
 	"github.com/harrisonclewis/ship/internal/config"
+	"github.com/harrisonclewis/ship/internal/yamldoc"
 )
+
+type serverFormValues = yamldoc.ServerValues
+type appFormValues = yamldoc.AppValues
 
 type formPurpose int
 
@@ -19,50 +23,8 @@ const (
 	formDeployVersion
 	formRestorePath
 	formLogsService
+	formImportApps
 )
-
-type serverFormValues struct {
-	Name         string
-	Host         string
-	IdentityFile string
-	AdminUser    string
-	Arch         string
-	CaddyImage   string
-	OriginalName string
-	IsNew        bool
-}
-
-type appFormValues struct {
-	Server            string
-	Name              string
-	OriginalName      string
-	IsNew             bool
-	DomainsText       string
-	RedirectsText     string
-	Upstream          string
-	SourceType        string
-	SourceRepo        string
-	SourceAsset       string
-	SourcePath        string
-	UID               string
-	DataText          string
-	HealthPath        string
-	BackupSQLite      string
-	BackupFiles       string
-	PostgresService   string
-	PostgresDB        string
-	PostgresUser      string
-	Env               string
-	BuildCommands     string
-	DeployCommands    string
-	DeployMaintenance bool
-
-	Domains       []string
-	Redirects     []string
-	Data          []string
-	BackupSQLiteV []string
-	BackupFilesV  []string
-}
 
 type formHost struct {
 	purpose formPurpose
@@ -76,8 +38,10 @@ type formHost struct {
 	app    *appFormValues
 	text   string
 
-	serverName string
-	appName    string
+	serverName     string
+	appName        string
+	importNames    []string
+	importSelected []string
 }
 
 func formText(s string) string {
@@ -148,7 +112,7 @@ func (m *model) newAppFormValues(server, app string, isNew bool) *appFormValues 
 	v.Upstream = def.Upstream
 	v.SourceType = def.Source.Type
 	v.SourceRepo = def.Source.Repo
-	asset, sourcePath := m.doc.appSourceRaw(server, app)
+	asset, sourcePath := m.doc.AppSourceRaw(server, app)
 	v.SourceAsset = asset
 	if sourcePath != "" {
 		v.SourcePath = sourcePath
@@ -168,7 +132,7 @@ func (m *model) newAppFormValues(server, app string, isNew bool) *appFormValues 
 		v.PostgresUser = def.Backup.Postgres.User
 	}
 	v.Env = envLines(def.Env)
-	v.BuildCommands, v.DeployCommands, v.DeployMaintenance = m.doc.appExtras(server, app)
+	v.BuildCommands, v.DeployCommands, v.DeployMaintenance = m.doc.AppExtras(server, app)
 	return v
 }
 
@@ -244,6 +208,19 @@ func (m *model) buildForm(f *formHost) *huh.Form {
 				Affirmative("Yes").Negative("No").Value(&v.DeployMaintenance),
 		)
 		return huh.NewForm(basics, storage, source, release, image, backup, deploy).WithWidth(width)
+	case formImportApps:
+		f.title = "Import apps from " + f.serverName
+		opts := make([]huh.Option[string], 0, len(f.importNames))
+		for _, name := range f.importNames {
+			opts = append(opts, huh.NewOption(name, name))
+		}
+		return huh.NewForm(huh.NewGroup(
+			huh.NewMultiSelect[string]().
+				Title("Apps to import").
+				Description("Selected apps are copied into ship.yaml and apps/<name>.").
+				Options(opts...).
+				Value(&f.importSelected),
+		)).WithWidth(width)
 	case formDeployVersion, formRestorePath, formLogsService:
 		input := huh.NewInput().Value(&f.text)
 		switch f.purpose {

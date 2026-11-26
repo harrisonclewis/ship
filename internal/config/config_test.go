@@ -494,3 +494,92 @@ func TestIdentityFile(t *testing.T) {
 		t.Fatalf("relative identity_file: want an identity_file error, got %v", err)
 	}
 }
+
+func TestImageAppMayHaveNoSourcePath(t *testing.T) {
+	doc := `servers:
+  prod:
+    host: ops@203.0.113.10
+    apps:
+      web:
+        domains: [web.example.com]
+        upstream: web:3000
+        source:
+          type: image
+        backup: {}
+`
+	c, err := decode(t, doc)
+	if err != nil {
+		t.Fatalf("image app without source.path should load: %v", err)
+	}
+	if got := c.Servers["prod"].Apps["web"].Source.Path; got != "" {
+		t.Fatalf("source.path = %q, want empty", got)
+	}
+}
+
+func TestRecordYAMLIsCanonicalAndOmitsSourcePath(t *testing.T) {
+	doc := `# a comment that must not leak to the server
+servers:
+  prod:
+    host: ops@203.0.113.10
+    apps:
+      app:
+        # keep this locally
+        domains: [app.example.com]
+        upstream: app:8080
+        source:
+          type: image
+          path: ~/src/app
+        build:
+          commands: |
+            npm ci
+            npm run build
+        deploy:
+          maintenance: false
+          commands: ./migrate
+        env:
+          B: two
+          A: one
+`
+	c, err := decode(t, doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := c.Servers["prod"].Apps["app"]
+	record, err := app.RecordYAML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(record)
+	if strings.Contains(text, "#") {
+		t.Fatalf("record contains a comment:\n%s", text)
+	}
+	if strings.Contains(text, "path:") {
+		t.Fatalf("record contains source.path:\n%s", text)
+	}
+	for _, want := range []string{"domains:", "app.example.com", "build:", "npm ci", "deploy:", "maintenance: false", "./migrate", "env:", "A: one", "B: two"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("record missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Index(text, "A: one") > strings.Index(text, "B: two") {
+		t.Errorf("env keys are not canonical:\n%s", text)
+	}
+	parsed, err := DecodeAppRecord(strings.NewReader(text))
+	if err != nil {
+		t.Fatalf("record does not round-trip: %v", err)
+	}
+	if parsed.Source.Path != "" {
+		t.Fatalf("parsed source.path = %q", parsed.Source.Path)
+	}
+}
+
+func TestDecodeAppRecordRejectsUnknownFields(t *testing.T) {
+	doc := `domains: [app.example.com]
+upstream: app:8080
+source: {type: github-release, repo: example/app}
+mystery: value
+`
+	if _, err := DecodeAppRecord(strings.NewReader(doc)); err == nil {
+		t.Fatal("record with an unknown field was accepted")
+	}
+}

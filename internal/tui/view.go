@@ -6,6 +6,8 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+
+	"github.com/harrisonclewis/ship/internal/config"
 )
 
 func (m *model) View() string {
@@ -38,6 +40,8 @@ func (m *model) View() string {
 			content = m.viewOutput()
 		case pageRestorePick:
 			content = m.viewRestorePick()
+		case pageCompare:
+			content = m.viewCompare()
 		}
 	}
 
@@ -83,6 +87,8 @@ func (m *model) crumbs() []string {
 			return []string{"Servers", f.serverName, f.appName, "Restore"}
 		case formLogsService:
 			return []string{"Servers", f.serverName, f.appName, "Logs"}
+		case formImportApps:
+			return []string{"Servers", f.serverName, "Import"}
 		}
 	case m.page == pageServer:
 		return []string{"Servers", m.serverName}
@@ -97,6 +103,8 @@ func (m *model) crumbs() []string {
 		return []string{"Servers", m.serverName, label}
 	case m.page == pageRestorePick:
 		return []string{"Servers", m.serverName, m.appName, "Restore"}
+	case m.page == pageCompare:
+		return []string{"Servers", m.serverName, m.appName, "Compare"}
 	case m.page == pageActivity:
 		return []string{"Activity"}
 	}
@@ -130,6 +138,8 @@ func (m *model) hints() []keyHint {
 		return hints
 	case pageRestorePick:
 		return []keyHint{{"enter", "restore"}, {"p", "local path"}, {"r", "refresh"}, {"esc", "back"}}
+	case pageCompare:
+		return []keyHint{{"u", "use server version"}, {"k/esc", "keep mine"}, {"↑/↓", "scroll"}}
 	default:
 		return []keyHint{{"enter", "open"}, {"a", "add server"}, {"r", "refresh"}, {"tab", "switch"}, {"q", "quit"}}
 	}
@@ -378,7 +388,7 @@ func (m *model) viewServer() string {
 func (m *model) viewApps(height int) string {
 	inner := m.width - 2
 	rows := max(1, height-4)
-	names := m.appNames()
+	entries := m.appEntries()
 	body := []string{}
 
 	showDomains := inner >= 76
@@ -390,7 +400,7 @@ func (m *model) viewApps(height int) string {
 	typeW := 8
 	currentW := 14
 	previousW := 14
-	healthW := 10
+	healthW := 11
 	if !showBadge {
 		badgeW = 0
 	}
@@ -432,32 +442,69 @@ func (m *model) viewApps(height int) string {
 	}
 	body = append(body, header)
 
-	if len(names) == 0 {
+	if len(entries) == 0 {
 		body = append(body, styleMuted.Render("No apps on this server. Press a to add one."))
 	} else {
-		start := windowStart(m.appCursor, len(names), rows)
+		start := windowStart(m.appCursor, len(entries), rows)
 		loading := m.statusLoading[m.serverName]
 		_, haveStatus := m.statuses[m.serverName]
-		for i := start; i < len(names) && i < start+rows; i++ {
-			name := names[i]
+		for i := start; i < len(entries) && i < start+rows; i++ {
+			entry := entries[i]
+			name := entry.Name
 			st, deployed := m.appStatus(m.serverName, name)
 			current, previous, health := "", "", ""
+			typ, domains := "", ""
 			maintenance := false
-			if deployed {
-				current = displayAppValue(st.Current)
-				previous = displayAppValue(st.Previous)
-				health = displayAppValue(st.Health)
-				maintenance = st.Maintenance
-			} else if loading && !haveStatus {
-				current, previous, health = "…", "…", "…"
-			} else if haveStatus {
-				current, health = "not deployed", "—"
+			badge := ""
+
+			if entry.Local {
+				if deployed {
+					current = displayAppValue(st.Current)
+					previous = displayAppValue(st.Previous)
+					health = displayAppValue(st.Health)
+					maintenance = st.Maintenance
+				} else if loading && !haveStatus {
+					current, previous, health = "…", "…", "…"
+				} else if haveStatus {
+					current, health = "not deployed", "—"
+				} else {
+					current, previous, health = "?", "?", "?"
+				}
+				typ = m.appType(name)
+				domains = m.appDomains(name)
 			} else {
-				current, previous, health = "?", "?", "?"
+				sa := m.serverApp(name)
+				switch {
+				case sa != nil && sa.RecordErr != "":
+					current, health = "unreadable", "newer ship?"
+				case sa != nil && sa.Record == nil:
+					current, health = "no record", "older ship"
+				case loading && !haveStatus:
+					current, previous, health = "on server", "…", "…"
+				default:
+					current = "on server"
+					if deployed {
+						previous = displayAppValue(st.Previous)
+						health = displayAppValue(st.Health)
+					} else {
+						health = "—"
+					}
+				}
+				if sa != nil && sa.Record != nil {
+					typ = appRecordType(sa.Record)
+					domains = strings.Join(sa.Record.Domains, ", ")
+				}
+			}
+
+			if diff, ok := m.diffFor(m.serverName, name); ok && diff.Changed() {
+				badge = "DIFF"
+			} else if maintenance {
+				badge = "MAINT"
 			}
 
 			displayName := name
-			if m.composeMissing(name) {
+			missingCompose := entry.Local && m.composeMissing(name)
+			if missingCompose {
 				displayName = name + "!"
 			}
 			cursor := " "
@@ -466,10 +513,10 @@ func (m *model) viewApps(height int) string {
 			}
 			plain := cursor + " " + padRight(clip(displayName, nameW-1), nameW)
 			if showBadge {
-				plain += padRight(maintText(maintenance), badgeW)
+				plain += padRight(badge, badgeW)
 			}
 			if showType {
-				plain += padRight(m.appType(name), typeW)
+				plain += padRight(typ, typeW)
 			}
 			plain += padRight(clip(current, currentW-1), currentW)
 			if showPrevious {
@@ -477,25 +524,25 @@ func (m *model) viewApps(height int) string {
 			}
 			plain += padRight(clip(health, healthW-1), healthW)
 			if showDomains {
-				plain += clip(m.appDomains(name), domainsW)
+				plain += clip(domains, domainsW)
 			}
 			if i == m.appCursor {
 				body = append(body, styleSelection.Render(fit(plain, inner)))
 				continue
 			}
 			line := styleAccent.Render(cursor+" ") + styleText.Render(padRight(clip(displayName, nameW-1), nameW))
-			if m.composeMissing(name) {
+			if missingCompose {
 				line = styleAccent.Render(cursor+" ") + styleWarning.Render(padRight(clip(displayName, nameW-1), nameW))
 			}
 			if showBadge {
-				if maintenance {
-					line += badgeStyle(tintWarning, colWarning).Render(padRight("MAINT", badgeW))
+				if badge != "" {
+					line += badgeStyle(tintWarning, colWarning).Render(padRight(badge, badgeW))
 				} else {
 					line += strings.Repeat(" ", badgeW)
 				}
 			}
 			if showType {
-				line += styleMuted.Render(padRight(m.appType(name), typeW))
+				line += styleMuted.Render(padRight(typ, typeW))
 			}
 			line += styleText.Render(padRight(clip(current, currentW-1), currentW))
 			if showPrevious {
@@ -503,19 +550,22 @@ func (m *model) viewApps(height int) string {
 			}
 			line += colourFor(healthKind(health)).Render(padRight(clip(health, healthW-1), healthW))
 			if showDomains {
-				line += styleMuted.Render(clip(m.appDomains(name), domainsW))
+				line += styleMuted.Render(clip(domains, domainsW))
 			}
 			body = append(body, line)
 		}
 	}
-	return panel(fmt.Sprintf("Applications (%d)", len(names)), strings.Join(body, "\n"), m.width, height, false)
+	return panel(fmt.Sprintf("Applications (%d)", len(entries)), strings.Join(body, "\n"), m.width, height, false)
 }
 
-func maintText(on bool) string {
-	if on {
-		return "MAINT"
+func appRecordType(record *config.App) string {
+	if record == nil {
+		return ""
 	}
-	return ""
+	if record.Source.Type == "image" {
+		return "image"
+	}
+	return "release"
 }
 
 func displayAppValue(v string) string {
@@ -550,14 +600,15 @@ func (m *model) viewServerActions() string {
 }
 
 func (m *model) viewAppActions() string {
-	body := make([]string, 0, len(appActionDefs))
+	defs := m.appActions()
+	body := make([]string, 0, len(defs))
 	inner := m.width - 2
-	for i, def := range appActionDefs {
+	for i, def := range defs {
 		line := actionLine(def.key, def.label, def.desc, def.danger, i == m.appActCur, inner)
 		body = append(body, line)
 	}
-	if m.currentApp() == nil {
-		body = append([]string{styleError.Render("This app is no longer in ship.yaml."), ""}, body...)
+	if len(defs) == 0 {
+		body = append(body, styleError.Render("This app is no longer in ship.yaml or on the server."))
 	}
 	return panel("App actions · "+m.appName, strings.Join(body, "\n"), m.width, m.bodyHeight(), false)
 }
@@ -620,6 +671,14 @@ func (m *model) viewOutput() string {
 		content = styleMuted.Render("No run selected.")
 	}
 	return panel(title, content, m.width, m.bodyHeight(), true)
+}
+
+func (m *model) viewCompare() string {
+	content := m.vp.View()
+	if strings.TrimSpace(content) == "" {
+		content = styleMuted.Render("No differences.")
+	}
+	return panel("Compare · "+m.appName+" · server "+m.serverName, content, m.width, m.bodyHeight(), true)
 }
 
 func (m *model) viewRestorePick() string {

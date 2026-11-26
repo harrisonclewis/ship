@@ -159,6 +159,9 @@ func checkMaintenanceSupport(s *remote.Session, srv *config.Server) error {
 func buildImage(ctx context.Context, s *remote.Session, srv *config.Server, name string, allowDirty bool) (string, error) {
 	app := srv.Apps[name]
 	dir := app.Source.Path
+	if strings.TrimSpace(dir) == "" {
+		return "", fmt.Errorf("set source.path for %s to build it", name)
+	}
 	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
 		return "", fmt.Errorf("%s.source.path: %q is not a directory", name, dir)
 	}
@@ -230,6 +233,7 @@ type appFile struct {
 var appFileNames = map[string]bool{
 	"compose.yaml":    true,
 	"Dockerfile":      true,
+	"ship-app.yaml":   true,
 	".ship-meta":      true,
 	".ship-env":       true,
 	".ship-deploy.sh": true,
@@ -285,7 +289,14 @@ func uploadAppFiles(s *remote.Session, srv *config.Server, name string) error {
 	if err != nil {
 		return fmt.Errorf("read %s: %w", composePath, err)
 	}
-	files := []appFile{{Name: "compose.yaml", Mode: 0o644, Data: compose}}
+	record, err := app.RecordYAML()
+	if err != nil {
+		return fmt.Errorf("render ship-app.yaml for %s: %w", name, err)
+	}
+	files := []appFile{
+		{Name: "compose.yaml", Mode: 0o644, Data: compose},
+		{Name: "ship-app.yaml", Mode: 0o644, Data: record},
+	}
 	if app.Source.Type == "github-release" {
 		dockerfilePath := srv.DockerfilePath(name)
 		dockerfile, err := os.ReadFile(dockerfilePath)

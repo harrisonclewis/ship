@@ -14,6 +14,7 @@ import (
 
 	"github.com/harrisonclewis/ship/internal/config"
 	"github.com/harrisonclewis/ship/internal/ops"
+	"github.com/harrisonclewis/ship/internal/remote"
 	"github.com/harrisonclewis/ship/internal/tui"
 	"github.com/harrisonclewis/ship/internal/update"
 	"github.com/harrisonclewis/ship/internal/version"
@@ -36,6 +37,8 @@ type options struct {
 	out    io.Writer
 	errOut io.Writer
 	agent  []byte
+	// runner is a test seam for commands that need ssh.
+	runner remote.Runner
 }
 
 func (o *options) ops(cfg *config.Config) *ops.Ops {
@@ -45,6 +48,7 @@ func (o *options) ops(cfg *config.Config) *ops.Ops {
 		ErrOut: o.errOut,
 		In:     o.in,
 		Agent:  o.agent,
+		Runner: o.runner,
 	})
 }
 
@@ -173,6 +177,10 @@ func dispatchCommand(o *options, cfg *config.Config, server string, args []strin
 		return cmdBackups(o, cfg, server, rest)
 	case "restore":
 		return cmdRestore(o, cfg, server, rest)
+	case "diff":
+		return cmdDiff(o, cfg, server, rest)
+	case "import":
+		return cmdImport(o, cfg, server, rest)
 	case "version":
 		return requireNoArgs(cmd, rest, func() error {
 			fmt.Fprintln(o.out, "ship "+version.Version)
@@ -443,6 +451,115 @@ func cmdRestore(o *options, cfg *config.Config, server string, args []string) er
 	return o.ops(cfg).Restore(context.Background(), server, app, archive)
 }
 
+func cmdDiff(o *options, cfg *config.Config, server string, args []string) error {
+	if len(args) > 1 {
+		return usageErr("usage: ship <server> diff [app]")
+	}
+	filter := ""
+	if len(args) == 1 {
+		if strings.HasPrefix(args[0], "-") {
+			return usageErr("unknown diff flag %q", args[0])
+		}
+		filter = args[0]
+		if err := config.ValidateAppName(filter); err != nil {
+			return err
+		}
+	}
+	diffs, err := o.ops(cfg).Compare(context.Background(), server)
+	if err != nil {
+		return err
+	}
+	found, printed := false, false
+	for _, d := range diffs {
+		if filter != "" && d.App != filter {
+			continue
+		}
+		found = true
+		switch {
+		case d.Local && d.Server && !d.HasRecord:
+			if d.RecordErr != "" {
+				fmt.Fprintf(o.out, "%s: record unreadable (newer ship?)\n", d.App)
+			} else {
+				fmt.Fprintf(o.out, "%s: no record (older ship)\n", d.App)
+			}
+			printed = true
+			if d.Diff != "" {
+				fmt.Fprint(o.out, d.Diff)
+			}
+		case d.Local && d.Server && d.Changed():
+			fmt.Fprintf(o.out, "%s: differs\n", d.App)
+			fmt.Fprint(o.out, d.Diff)
+			printed = true
+		case d.Local && d.Server:
+			if filter != "" {
+				fmt.Fprintf(o.out, "%s: up to date\n", d.App)
+				printed = true
+			}
+		case d.Local:
+			fmt.Fprintf(o.out, "%s: only local\n", d.App)
+			printed = true
+		case d.Server:
+			if d.RecordErr != "" {
+				fmt.Fprintf(o.out, "%s: record unreadable (newer ship?), only on server\n", d.App)
+			} else if !d.HasRecord {
+				fmt.Fprintf(o.out, "%s: no record (older ship), only on server\n", d.App)
+			} else {
+				fmt.Fprintf(o.out, "%s: only on server (run ship %s import %s)\n", d.App, server, d.App)
+			}
+			printed = true
+		}
+	}
+	if filter != "" && !found {
+		return fmt.Errorf("app %q is neither in ship.yaml nor on server %s", filter, server)
+	}
+	if !printed && filter == "" {
+		fmt.Fprintln(o.out, "No differences.")
+	}
+	return nil
+}
+
+func cmdImport(o *options, cfg *config.Config, server string, args []string) error {
+	all, overwrite := false, false
+	var apps []string
+	for _, a := range args {
+		switch {
+		case a == "--all":
+			all = true
+		case a == "--overwrite":
+			overwrite = true
+		case strings.HasPrefix(a, "-"):
+			return usageErr("unknown import flag %q", a)
+		default:
+			apps = append(apps, a)
+		}
+	}
+	if all == (len(apps) > 0) {
+		return usageErr("usage: ship <server> import <app...>|--all [--overwrite]")
+	}
+	summary, err := o.ops(cfg).Import(context.Background(), ops.ImportRequest{
+		Server:    server,
+		Apps:      apps,
+		All:       all,
+		Overwrite: overwrite,
+	})
+	if err != nil {
+		var conflict *ops.ConflictError
+		if errors.As(err, &conflict) {
+			return fmt.Errorf("%w; pass --overwrite to replace it", err)
+		}
+		return err
+	}
+	for _, skip := range summary.Skipped {
+		fmt.Fprintf(o.out, "skipped %s: %s\n", skip.App, skip.Reason)
+	}
+	if len(summary.Imported) == 0 {
+		fmt.Fprintln(o.out, "Nothing to import.")
+		return nil
+	}
+	fmt.Fprintf(o.out, "Imported %s.\n", strings.Join(summary.Imported, ", "))
+	return nil
+}
+
 func runMenu(o *options) error {
 	return tui.Run(tui.Options{
 		DryRun: o.dryRun,
@@ -482,6 +599,9 @@ Commands:
   backup [app|all] [--no-pull]  back up now; pull archives locally
   backups <app>                 list server-side archives
   restore <app> <archive>       restore an archive (local path is uploaded)
+  diff [app]                    compare local apps with the server's records
+  import <app...>|--all         copy server apps into ship.yaml and apps/
+                                (--overwrite replaces existing apps/files)
   version                       print the ship version
   update [--check]              update ship to the latest release
 

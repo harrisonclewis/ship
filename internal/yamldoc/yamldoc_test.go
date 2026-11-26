@@ -1,4 +1,4 @@
-package tui
+package yamldoc
 
 import (
 	"bytes"
@@ -19,7 +19,7 @@ func TestYAMLEditKeepsCommentsAndWritesBuildDeployFields(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	v := appFormValues{
+	v := AppValues{
 		Server:            "prod",
 		Name:              "app",
 		OriginalName:      "app",
@@ -32,11 +32,11 @@ func TestYAMLEditKeepsCommentsAndWritesBuildDeployFields(t *testing.T) {
 		DeployCommands:    "php artisan migrate --force",
 		DeployMaintenance: false,
 	}
-	tmp := doc.clone()
-	if err := tmp.applyApp(v); err != nil {
+	tmp := doc.Clone()
+	if err := tmp.ApplyApp(v); err != nil {
 		t.Fatalf("applyApp: %v", err)
 	}
-	if err := tmp.save(); err != nil {
+	if err := tmp.Save(); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -100,7 +100,7 @@ func TestYAMLRejectsInvalidConfigWithoutWriting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	v := appFormValues{
+	v := AppValues{
 		Server:       "prod",
 		Name:         "app",
 		OriginalName: "app",
@@ -109,11 +109,11 @@ func TestYAMLRejectsInvalidConfigWithoutWriting(t *testing.T) {
 		SourceType: "github-release",
 		SourceRepo: "example/app",
 	}
-	tmp := doc.clone()
-	if err := tmp.applyApp(v); err != nil {
+	tmp := doc.Clone()
+	if err := tmp.ApplyApp(v); err != nil {
 		t.Fatalf("applyApp: %v", err)
 	}
-	err = tmp.save()
+	err = tmp.Save()
 	if err == nil {
 		t.Fatal("invalid config was saved")
 	}
@@ -138,7 +138,7 @@ func TestYAMLRefusesWhenFileChangedOnDisk(t *testing.T) {
 	if err := os.WriteFile(path, []byte(external), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	v := appFormValues{
+	v := AppValues{
 		Server:       "prod",
 		Name:         "app",
 		OriginalName: "app",
@@ -147,11 +147,11 @@ func TestYAMLRefusesWhenFileChangedOnDisk(t *testing.T) {
 		SourceType:   "github-release",
 		SourceRepo:   "example/app",
 	}
-	tmp := doc.clone()
-	if err := tmp.applyApp(v); err != nil {
+	tmp := doc.Clone()
+	if err := tmp.ApplyApp(v); err != nil {
 		t.Fatalf("applyApp: %v", err)
 	}
-	err := tmp.save()
+	err := tmp.Save()
 	if !errors.Is(err, ErrConfigChanged) {
 		t.Fatalf("save error = %v, want ErrConfigChanged", err)
 	}
@@ -167,8 +167,8 @@ func TestYAMLRefusesWhenFileChangedOnDisk(t *testing.T) {
 func TestYAMLSaveCreatesPrivateConfigAndEmptyServer(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "ship")
 	path := filepath.Join(dir, "ship.yaml")
-	doc := newEmptyYAMLDoc(path)
-	v := serverFormValues{
+	doc := New(path)
+	v := ServerValues{
 		Name:       "prod",
 		Host:       "ops@203.0.113.10",
 		AdminUser:  "ops",
@@ -176,10 +176,10 @@ func TestYAMLSaveCreatesPrivateConfigAndEmptyServer(t *testing.T) {
 		CaddyImage: "caddy:2.10-alpine",
 		IsNew:      true,
 	}
-	if err := doc.applyServer(v); err != nil {
+	if err := doc.ApplyServer(v); err != nil {
 		t.Fatalf("applyServer: %v", err)
 	}
-	if err := doc.save(); err != nil {
+	if err := doc.Save(); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -217,7 +217,7 @@ func TestYAMLSaveCreatesPrivateConfigAndEmptyServer(t *testing.T) {
 
 func TestYAMLServerRenameKeepsAppsAndComments(t *testing.T) {
 	path, _, doc := writeTestConfig(t)
-	v := serverFormValues{
+	v := ServerValues{
 		Name:         "production",
 		OriginalName: "prod",
 		Host:         "ops@203.0.113.10",
@@ -225,11 +225,11 @@ func TestYAMLServerRenameKeepsAppsAndComments(t *testing.T) {
 		Arch:         "linux/amd64",
 		CaddyImage:   "caddy:2.10-alpine",
 	}
-	tmp := doc.clone()
-	if err := tmp.applyServer(v); err != nil {
+	tmp := doc.Clone()
+	if err := tmp.ApplyServer(v); err != nil {
 		t.Fatalf("applyServer: %v", err)
 	}
-	if err := tmp.save(); err != nil {
+	if err := tmp.Save(); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	cfg, err := config.Load(path)
@@ -271,5 +271,176 @@ func TestRestoreBlankLinesNeverChangesBlockScalars(t *testing.T) {
 	rendered := []byte("cmd: |\n  one\n  two\n")
 	if got := string(restoreBlankLines(original, rendered)); got != string(rendered) {
 		t.Fatalf("block scalar changed:\n%s", got)
+	}
+}
+
+const testConfig = `# keep this comment
+servers:
+  prod:
+    # prod is the primary server
+    host: ops@203.0.113.10
+    apps:
+      app:
+        domains: [app.example.com]
+        upstream: app:8080
+        source:
+          type: github-release
+          repo: example/app
+        backup: {}
+`
+
+func writeTestConfig(t *testing.T) (string, *config.Config, *Doc) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ship.yaml")
+	if err := os.WriteFile(path, []byte(testConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path, cfg, doc
+}
+
+func TestPutAppKeepsCommentsAndLocalSourcePath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ship.yaml")
+	docText := `servers:
+  prod:
+    host: ops@203.0.113.10
+    apps:
+      # keep this comment
+      web:
+        domains: [web.example.com]
+        upstream: web:3000
+        source:
+          type: image
+          path: ~/src/web
+`
+	if err := os.WriteFile(path, []byte(docText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := []byte(`domains: [new.example.com]
+upstream: web:3000
+source:
+  type: image
+`)
+	if err := doc.PutApp("prod", "web", record, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := doc.PutApp("prod", "api", []byte("domains: [api.example.com]\nupstream: api:8080\nsource: {type: github-release, repo: example/api}\n"), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := doc.Save(); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(saved)
+	for _, want := range []string{"# keep this comment", "new.example.com", "path: ~/src/web", "api:"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("saved YAML missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "web.example.com") {
+		t.Errorf("old app definition survived:\n%s", text)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got := cfg.Servers["prod"].Apps["web"].Source.Path; got == "" {
+		t.Fatal("source.path was not kept")
+	}
+}
+
+func TestPutAppMergesAndKeepsCommentsAndFlowStyle(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ship.yaml")
+	docText := `servers:
+  prod:
+    host: ops@203.0.113.10
+    apps:
+      web:
+        # domains comment
+        domains: [old.example.com, www.old.example.com] # inline domains
+        upstream: web:3000
+        source:
+          type: image
+          path: ~/src/web # local path
+        uid: 1000
+        data: [/srv/web] # data comment
+        health:
+          http_path: /old
+        backup: {}
+        env:
+          KEEP: one # keep env
+`
+	if err := os.WriteFile(path, []byte(docText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := []byte(`domains: [new.example.com, www.new.example.com]
+upstream: web:3000
+source:
+  type: image
+env:
+  KEEP: one
+  ADDED: two
+`)
+	if err := doc.PutApp("prod", "web", record, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := doc.Save(); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(saved)
+	for _, want := range []string{
+		"# domains comment",
+		"domains: [new.example.com, www.new.example.com]",
+		"# inline domains",
+		"upstream: web:3000",
+		"path: ~/src/web",
+		"# local path",
+		"# keep env",
+		"ADDED: two",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("saved YAML missing %q:\n%s", want, text)
+		}
+	}
+	for _, gone := range []string{"old.example.com", "uid:", "data:", "health:", "backup:"} {
+		if strings.Contains(text, gone) {
+			t.Errorf("saved YAML still contains %q:\n%s", gone, text)
+		}
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	app := cfg.Servers["prod"].Apps["web"]
+	if got := app.Source.Path; got == "" {
+		t.Fatal("source.path was not kept")
+	}
+	if app.Env["KEEP"] != "one" || app.Env["ADDED"] != "two" {
+		t.Fatalf("env = %v", app.Env)
 	}
 }

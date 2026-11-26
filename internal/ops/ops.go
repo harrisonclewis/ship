@@ -99,6 +99,28 @@ func (o *Ops) session(ctx context.Context, server string) (*remote.Session, *con
 	return s, srv, nil
 }
 
+// readSession is a real (non-dry-run) ssh session for read-only operations
+// such as fetching app records. --dry-run still reads the server; it only
+// fakes commands that would change something.
+func (o *Ops) readSession(ctx context.Context, server string) (*remote.Session, *config.Server, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	srv, err := o.Server(server)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := remote.CheckIdentityFile(srv.IdentityFile); err != nil {
+		return nil, nil, fmt.Errorf("servers.%s.%w", srv.Name, err)
+	}
+	s := remote.NewSessionContext(srv.Host, false, o.opts.Out, o.opts.ErrOut, ctx)
+	s.IdentityFile = srv.IdentityFile
+	if o.opts.Runner != nil {
+		s.Runner = o.opts.Runner
+	}
+	return s, srv, nil
+}
+
 func (o *Ops) ensureAgent(s *remote.Session) error {
 	return s.EnsureAgent(o.opts.Agent)
 }
