@@ -19,11 +19,16 @@ make dist     # all six release binaries in dist/
 | `internal/render` | renders the Caddyfile |
 | `internal/ops` | every server operation, shared by the CLI and the TUI |
 | `internal/tui` | the interactive TUI (Bubble Tea) |
+| `internal/yamldoc` | comment-preserving `ship.yaml` edits |
+| `internal/localedit` | temporary-copy editing and validated saves |
 | `internal/update`, `internal/version` | self-update and the stamped version |
 | `ship-agent` | the server script, embedded in the binary |
 | `examples/` | a sample `ship.yaml` and app folders |
+| `docs/` | this documentation |
 | `install.sh`, `install.ps1` | one-line installers |
 | `scripts/release-keygen.sh` | creates the release signing key |
 | `.github/workflows/` | CI on Linux, macOS and Windows, and the release build |
 
 Your own `ship.yaml` and `apps/` belong in `~/.config/ship`, not in this repo; both are git-ignored here.
+
+See [Releasing](releasing.md) for the release process.

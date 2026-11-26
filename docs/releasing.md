@@ -14,7 +14,7 @@ Run `scripts/release-keygen.sh`. It writes the public key into `internal/update/
    git push origin vX.Y.Z
    ```
 
-3. The release workflow builds all six binaries, smoke-tests them on Linux, macOS and Windows, signs `SHA256SUMS` and uploads everything to a **draft** release.
+3. The release workflow builds all six binaries, smoke-tests the builds on Linux, macOS and Windows, signs `SHA256SUMS` and uploads everything to a **draft** release.
 4. Download the draft and check it: eight files (six binaries, `SHA256SUMS`, `SHA256SUMS.sig`), and `sha256sum -c SHA256SUMS` passes.
 5. Publish it with the written notes:
 

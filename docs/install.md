@@ -1,4 +1,4 @@
-# Install
+# Install ship
 
 ## One-line install
 
@@ -59,7 +59,7 @@ The binary embeds `ship-agent`, so there is nothing else to copy to the server. 
 | Tool | Why |
 |---|---|
 | OpenSSH client | every server action runs over `ssh`. On Windows, install the [OpenSSH Client](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse) and use Windows Terminal |
-| Docker with buildx | only for [image apps](deploying.md#image-apps), which are built on your machine |
+| Docker with buildx | only for [image apps](guides/deploy-an-app.md#image-apps), which are built on your machine |
 | git | only for image apps, to name the version |
 
-Then [set up your config](configuration.md).
+Then [add a server](guides/add-a-server.md) or follow the [quick start](quick-start.md).
