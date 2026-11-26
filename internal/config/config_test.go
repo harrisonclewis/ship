@@ -139,7 +139,7 @@ func TestDefaults(t *testing.T) {
 	if srv.Apps["lewbox"].Source.Asset != "{app}_linux_{arch}" {
 		t.Fatalf("default asset = %q", srv.Apps["lewbox"].Source.Asset)
 	}
-	if !strings.HasSuffix(c.BackupDirLocal, "/backups/vps") {
+	if !strings.HasSuffix(c.BackupDirLocal, filepath.Join("backups", "vps")) {
 		t.Fatalf("default local backup dir = %q", c.BackupDirLocal)
 	}
 }

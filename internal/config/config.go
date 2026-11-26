@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -580,7 +581,8 @@ func validateServerPath(p string) error {
 	if p == "" || !serverPathRE.MatchString(p) {
 		return fmt.Errorf("path must be absolute and use only letters, digits and ._/-: %q", p)
 	}
-	if !filepath.IsAbs(p) || filepath.Clean(p) != p || p == "/" {
+	// Server paths are POSIX paths, whatever OS ship runs on.
+	if !path.IsAbs(p) || path.Clean(p) != p || p == "/" {
 		return fmt.Errorf("path must be a clean absolute path other than /: %q", p)
 	}
 	return nil
