@@ -1,6 +1,9 @@
-<p align="center"><img src="docs/assets/logo.svg" alt="ship logo" width="128" height="128"></p>
-
-<h1 align="center">ship</h1>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+    <img src="docs/assets/logo-light.svg" alt="Ship" width="256" height="96">
+  </picture>
+</p>
 
 <p align="center">Deploy and run your apps on your own servers from your terminal.</p>
 
@@ -24,14 +27,17 @@ Binaries for Linux, macOS and Windows (x64 and arm64) are on the [releases page]
 
 ```sh
 git clone https://github.com/docker/welcome-to-docker ~/src/welcome-to-docker
-ship                                    # add prod (root@<ip>) and welcome
+# create ~/.config/ship/ship.yaml with prod: host: root@<ip>
 ship prod setup
 ship prod lock-ssh                      # after changing host to ops@<ip>
-ship prod proxy update
+ship prod app create welcome
+ship prod app set welcome source.path ~/src/welcome-to-docker
+ship prod config edit welcome compose
 ship prod deploy welcome
+ship prod proxy sync
 ```
 
-The full walkthrough, including DNS and the compose file, is in [Quick start](docs/quick-start.md).
+App records, compose files and Dockerfiles live on the server. Create them with `ship <server> app create` and `ship <server> config edit`, or migrate an old local file with `ship <server> config push`. The full walkthrough, including DNS and the compose file, is in [Quick start](docs/quick-start.md).
 
 ### Documentation
 
