@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -304,6 +306,44 @@ func press(t *testing.T, m *model, key string) (*model, tea.Cmd) {
 		t.Fatalf("Update returned %T", next)
 	}
 	return got, cmd
+}
+
+func hasHint(hints []keyHint, key, label string) bool {
+	for _, h := range hints {
+		if h.key == key && h.label == label {
+			return true
+		}
+	}
+	return false
+}
+
+// runFormCmd drives form navigation messages but stops at cursor-blink and
+// timer commands, which would otherwise block a test until they fire.
+func runFormCmd(t *testing.T, m *model, cmd tea.Cmd) {
+	t.Helper()
+	var run func(tea.Cmd, int)
+	run = func(c tea.Cmd, depth int) {
+		if c == nil || depth > 100 {
+			return
+		}
+		name := runtime.FuncForPC(reflect.ValueOf(c).Pointer()).Name()
+		if strings.Contains(name, "BlinkCmd") || strings.Contains(name, ".Tick") || strings.Contains(name, ".Every") {
+			return
+		}
+		switch msg := c().(type) {
+		case tea.BatchMsg:
+			for _, inner := range msg {
+				run(inner, depth+1)
+			}
+		default:
+			next, nextCmd := m.Update(msg)
+			if mm, ok := next.(*model); ok {
+				*m = *mm
+			}
+			run(nextCmd, depth+1)
+		}
+	}
+	run(cmd, 0)
 }
 
 // runCmd runs a command and feeds any messages it produces back into the model.
@@ -772,6 +812,235 @@ func TestGitSourceBuildDirClearsWhenSwitchingToDirectory(t *testing.T) {
 	home, _ := os.UserHomeDir()
 	if got := srv.Sources["web"]; got != filepath.Join(home, "code", "web") {
 		t.Fatalf("sources.web = %q", got)
+	}
+}
+
+func initForm(t *testing.T, m *model) {
+	t.Helper()
+	if m.form == nil || m.form.form == nil {
+		t.Fatal("no form is open")
+	}
+	// Init normally runs from Update when a form is opened; direct model tests
+	// open forms themselves, so do it here and mark it done.
+	m.form.initialised = m.form.form
+	_ = m.form.form.Init()
+	// Init's commands build and focus the first group; a size update forces the
+	// same rendering work without a live Bubble Tea program.
+	m.form.form.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
+}
+
+func TestSourceFormShowsSavedSourceBeforeDetails(t *testing.T) {
+	doc := strings.Replace(tuiTestDoc, "web: ~/web", "web: https://github.com/acme/web.git\n    build_dirs:\n      web: docs", 1)
+	m, fake := testModel(t, doc)
+	state := testState("staging", map[string]*config.App{
+		"web": decodedRecord(t, "domains: [web.example.com]\nupstream: web:8080\nsource: {type: image}\n"),
+	})
+	setVariances(m, fake, "staging", ops.VarianceReport{
+		Server: "staging",
+		State:  state,
+		Apps:   []ops.AppVariance{{App: "web", State: ops.VarianceApplied}},
+	})
+	m.serverName = "staging"
+	m.appName = "web"
+	m.page = pageAppEdit
+	m.openAppQuickForm(eaSource)
+	if m.form == nil || m.form.purpose != formEditAppSource {
+		t.Fatalf("form = %#v", m.form)
+	}
+	if m.form.app.SourceKind != "git" || m.form.app.SourceURL != "https://github.com/acme/web.git" || m.form.app.SourceBuildDir != "docs" {
+		t.Fatalf("source values = %+v", m.form.app)
+	}
+	m.width, m.height = 64, 24
+	m.resizeViewport()
+	initForm(t, m)
+	if m.sourceFormInDetails() {
+		t.Fatal("source form opened on the details step")
+	}
+	view := m.View()
+	for _, want := range []string{"Saved source", "Kind: Git repository URL", "Git URL:", "https://github.com/acme/web.git", "Build directory:", "docs"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("source view missing %q:\n%s", want, view)
+		}
+	}
+	for i, line := range strings.Split(view, "\n") {
+		if ansi.StringWidth(line) > 64 {
+			t.Errorf("source view line %d is %d cells wide, want <= 64:\n%s", i, ansi.StringWidth(line), view)
+		}
+	}
+}
+
+func TestSourceSummaryShowsKindsAndDefaults(t *testing.T) {
+	cases := []struct {
+		name string
+		v    appFormValues
+		want []string
+	}{
+		{
+			name: "directory",
+			v:    appFormValues{SourceKind: "dir", SourcePath: "/srv/web"},
+			want: []string{"Kind: Source directory", "Directory: /srv/web"},
+		},
+		{
+			name: "missing directory",
+			v:    appFormValues{SourceKind: "dir"},
+			want: []string{"Kind: Source directory", "not set (no local source directory)"},
+		},
+		{
+			name: "git",
+			v:    appFormValues{SourceKind: "git", SourceURL: "https://github.com/acme/web.git", SourceBuildDir: "docs"},
+			want: []string{"Kind: Git repository URL", "Git URL: https://github.com/acme/web.git", "Build directory: docs"},
+		},
+		{
+			name: "git default build directory",
+			v:    appFormValues{SourceKind: "git", SourceURL: "git@github.com:acme/web.git"},
+			want: []string{"Git URL: git@github.com:acme/web.git", "Build directory: repository root (default)"},
+		},
+		{
+			name: "release",
+			v:    appFormValues{SourceKind: "release", SourceRepo: "acme/web", SourceAsset: "web_linux_amd64"},
+			want: []string{"Kind: GitHub release asset", "Repository: acme/web", "Release asset: web_linux_amd64"},
+		},
+		{
+			name: "release default asset",
+			v:    appFormValues{SourceKind: "release", Name: "web", SourceRepo: "acme/web"},
+			want: []string{"Repository: acme/web", "Release asset: web_linux_{arch} (default)"},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sourceSummary(&tt.v)
+			for _, want := range tt.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("summary missing %q:\n%s", want, got)
+				}
+			}
+		})
+	}
+}
+
+func TestSourceEscStepsBackAndDiscardsOnCancel(t *testing.T) {
+	doc := strings.Replace(tuiTestDoc, "web: ~/web", "web: https://github.com/acme/web.git\n    build_dirs:\n      web: docs", 1)
+	m, fake := testModel(t, doc)
+	state := testState("staging", map[string]*config.App{
+		"web": decodedRecord(t, "domains: [web.example.com]\nupstream: web:8080\nsource: {type: image}\n"),
+	})
+	setVariances(m, fake, "staging", ops.VarianceReport{
+		Server: "staging",
+		State:  state,
+		Apps:   []ops.AppVariance{{App: "web", State: ops.VarianceApplied}},
+	})
+	m.serverName = "staging"
+	m.appName = "web"
+	m.page = pageAppEdit
+	m.openAppQuickForm(eaSource)
+	initForm(t, m)
+	if got := m.form.form.GetFocusedField().GetKey(); got != sourceKindKey {
+		t.Fatalf("focused field = %q, want the source kind selector", got)
+	}
+	if !hasHint(m.hints(), "esc", "back to Edit") {
+		t.Fatalf("kind step hints = %#v", m.hints())
+	}
+
+	// Enter moves from the kind selector to the editable details.
+	m, cmd := press(t, m, "enter")
+	runFormCmd(t, m, cmd)
+	if !m.sourceFormInDetails() {
+		t.Fatal("enter did not move to the source details")
+	}
+	if got := m.form.form.GetFocusedField().GetKey(); got != sourceGitURLKey {
+		t.Fatalf("focused field = %q, want the Git URL field", got)
+	}
+	if !hasHint(m.hints(), "esc", "back to source") || !hasHint(m.hints(), "shift+tab", "previous") {
+		t.Fatalf("details step hints = %#v", m.hints())
+	}
+
+	// Edits belong to the draft and survive stepping back.
+	m.form.app.SourceURL = "ssh://git@example.com/acme/new.git"
+	m.form.app.SourceBuildDir = "app"
+	m, cmd = press(t, m, "esc")
+	runFormCmd(t, m, cmd)
+	if m.form == nil {
+		t.Fatal("esc on the details step closed the form")
+	}
+	if m.sourceFormInDetails() {
+		t.Fatal("esc did not return to the source kind step")
+	}
+	if m.form.app.SourceURL != "ssh://git@example.com/acme/new.git" || m.form.app.SourceBuildDir != "app" {
+		t.Fatalf("draft values were not preserved: %+v", m.form.app)
+	}
+
+	// Esc on the first step returns to the Edit menu and saves nothing.
+	m, cmd = press(t, m, "esc")
+	runFormCmd(t, m, cmd)
+	if m.form != nil {
+		t.Fatal("esc on the source kind step left the form open")
+	}
+	if m.page != pageAppEdit {
+		t.Fatalf("page = %v, want the Edit menu", m.page)
+	}
+	if len(fake.putCalls) != 0 {
+		t.Fatalf("cancel saved to the server: %+v", fake.putCalls)
+	}
+	data, err := os.ReadFile(m.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "acme/new.git") || strings.Contains(string(data), "web: ssh:") {
+		t.Fatalf("cancel wrote draft source values:\n%s", data)
+	}
+}
+
+func TestSourceFormReloadsLocalConfig(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	state := testState("staging", map[string]*config.App{
+		"web": decodedRecord(t, "domains: [web.example.com]\nupstream: web:8080\nsource: {type: image}\n"),
+	})
+	setVariances(m, fake, "staging", ops.VarianceReport{
+		Server: "staging",
+		State:  state,
+		Apps:   []ops.AppVariance{{App: "web", State: ops.VarianceApplied}},
+	})
+	m.serverName = "staging"
+	m.appName = "web"
+	m.page = pageAppEdit
+
+	updated := strings.Replace(tuiTestDoc, "web: ~/web", "web: https://github.com/acme/new.git\n    build_dirs:\n      web: app", 1)
+	if err := os.WriteFile(m.path, []byte(updated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m.openAppQuickForm(eaSource)
+	if m.form == nil {
+		t.Fatal("source form did not open")
+	}
+	if m.form.app.SourceKind != "git" || m.form.app.SourceURL != "https://github.com/acme/new.git" || m.form.app.SourceBuildDir != "app" {
+		t.Fatalf("form kept stale source values: %+v", m.form.app)
+	}
+}
+
+func TestSourceFormShowsLoadErrorInsteadOfStaleFields(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	state := testState("staging", map[string]*config.App{
+		"web": decodedRecord(t, "domains: [web.example.com]\nupstream: web:8080\nsource: {type: image}\n"),
+	})
+	setVariances(m, fake, "staging", ops.VarianceReport{
+		Server: "staging",
+		State:  state,
+		Apps:   []ops.AppVariance{{App: "web", State: ops.VarianceApplied}},
+	})
+	m.serverName = "staging"
+	m.appName = "web"
+	m.page = pageAppEdit
+
+	if err := os.WriteFile(m.path, []byte("servers: [\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m.openAppQuickForm(eaSource)
+	if m.form != nil {
+		t.Fatal("source form opened from stale values after a read error")
+	}
+	if m.toast == nil || m.toast.kind != toastError || !strings.Contains(m.toast.msg, "Could not read") {
+		t.Fatalf("load error toast = %#v", m.toast)
 	}
 }
 

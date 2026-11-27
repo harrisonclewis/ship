@@ -14,6 +14,15 @@ import (
 type serverFormValues = yamldoc.ServerValues
 type appFormValues = yamldoc.AppValues
 
+const (
+	sourceKindKey     = "source-kind"
+	sourceDirKey      = "source-dir"
+	sourceGitURLKey   = "source-git-url"
+	sourceBuildDirKey = "source-build-dir"
+	sourceRepoKey     = "source-repo"
+	sourceAssetKey    = "source-asset"
+)
+
 type formPurpose int
 
 const (
@@ -299,6 +308,44 @@ func appRoutingFields(v *appFormValues) []huh.Field {
 	}
 }
 
+// sourceSummary describes the source values loaded when the form opened. Blank
+// optional values are called out as defaults so the first step is not a bare
+// selector with no context.
+func sourceSummary(v *appFormValues) string {
+	switch v.SourceKind {
+	case "git":
+		url := strings.TrimSpace(v.SourceURL)
+		if url == "" {
+			url = "not set"
+		}
+		buildDir := strings.TrimSpace(v.SourceBuildDir)
+		if buildDir == "" {
+			buildDir = "repository root (default)"
+		}
+		return "Kind: Git repository URL\nGit URL: " + url + "\nBuild directory: " + buildDir
+	case "release":
+		repo := strings.TrimSpace(v.SourceRepo)
+		if repo == "" {
+			repo = "not set"
+		}
+		asset := strings.TrimSpace(v.SourceAsset)
+		if asset == "" {
+			if v.Name != "" {
+				asset = v.Name + "_linux_{arch} (default)"
+			} else {
+				asset = "{app}_linux_{arch} (default)"
+			}
+		}
+		return "Kind: GitHub release asset\nRepository: " + repo + "\nRelease asset: " + asset
+	default:
+		path := strings.TrimSpace(v.SourcePath)
+		if path == "" {
+			path = "not set (no local source directory)"
+		}
+		return "Kind: Source directory\nDirectory: " + path
+	}
+}
+
 func appSourceKindField(v *appFormValues) huh.Field {
 	return huh.NewSelect[string]().Title("Source").
 		Options(
@@ -306,13 +353,14 @@ func appSourceKindField(v *appFormValues) huh.Field {
 			huh.NewOption("Git repository URL", "git"),
 			huh.NewOption("GitHub release asset", "release"),
 		).
+		Key(sourceKindKey).
 		Value(&v.SourceKind)
 }
 
 func appSourceReleaseFields(v *appFormValues) []huh.Field {
 	return []huh.Field{
-		huh.NewInput().Title("Repository (owner/repo)").Value(&v.SourceRepo),
-		huh.NewInput().Title("Release asset").Description("Default: {app}_linux_{arch}").Value(&v.SourceAsset),
+		huh.NewInput().Title("Repository (owner/repo)").Key(sourceRepoKey).Value(&v.SourceRepo),
+		huh.NewInput().Title("Release asset").Description("Default: {app}_linux_{arch}").Key(sourceAssetKey).Value(&v.SourceAsset),
 	}
 }
 
@@ -320,6 +368,7 @@ func appSourceImageFields(v *appFormValues) []huh.Field {
 	return []huh.Field{
 		huh.NewInput().Title("Source directory").
 			Description("An absolute or ~/ path, stored only in this machine's ship.yaml, never on the server.").
+			Key(sourceDirKey).
 			Value(&v.SourcePath),
 	}
 }
@@ -328,9 +377,11 @@ func appSourceGitFields(v *appFormValues) []huh.Field {
 	return []huh.Field{
 		huh.NewInput().Title("Git repository URL").
 			Description("https://, ssh:// or git@host:path. Stored only in this machine's ship.yaml, never on the server.").
+			Key(sourceGitURLKey).
 			Value(&v.SourceURL),
 		huh.NewInput().Title("Build directory (optional)").
 			Description("A relative directory inside the checkout, e.g. docs. Blank uses the repository root.").
+			Key(sourceBuildDirKey).
 			Value(&v.SourceBuildDir),
 	}
 }
@@ -435,7 +486,10 @@ func (m *model) buildForm(f *formHost) *huh.Form {
 		switch f.purpose {
 		case formEditAppSource:
 			f.title = "Source · " + v.Name
-			kind := huh.NewGroup(appSourceKindField(v))
+			kind := huh.NewGroup(
+				huh.NewNote().Title("Saved source").Description(sourceSummary(v)),
+				appSourceKindField(v),
+			)
 			release := huh.NewGroup(appSourceReleaseFields(v)...).
 				WithHideFunc(func() bool { return v.SourceKind != "release" })
 			dir := huh.NewGroup(appSourceImageFields(v)...).

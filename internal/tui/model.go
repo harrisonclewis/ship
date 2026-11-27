@@ -579,6 +579,17 @@ func (m *model) updateForm(msg tea.Msg) tea.Cmd {
 	return cmd
 }
 
+// sourceFormInDetails reports whether the open Source form is past the
+// source-kind step. The kind selector carries sourceKindKey, so a focused
+// detail field means Esc should step back to the selector instead of closing
+// the form.
+func (m *model) sourceFormInDetails() bool {
+	if m.form == nil || m.form.form == nil || m.form.initialised != m.form.form {
+		return false
+	}
+	return m.form.form.GetFocusedField().GetKey() != sourceKindKey
+}
+
 type terminalDoneMsg struct {
 	err error
 }
@@ -591,6 +602,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if key == "esc" {
+			if m.form.purpose == formEditAppSource && m.sourceFormInDetails() {
+				return m, m.form.form.PrevGroup()
+			}
 			m.cancelForm()
 			return m, nil
 		}
@@ -1981,6 +1995,16 @@ func (m *model) openServerForm(name string, isNew bool) {
 }
 
 func (m *model) openAppQuickForm(action appEditAction) {
+	if action == eaSource {
+		if err := m.reloadConfig(); err != nil {
+			name := m.configPathLabel()
+			if name == "" {
+				name = "ship.yaml"
+			}
+			m.showToast(toastError, "Could not read "+name+": "+err.Error())
+			return
+		}
+	}
 	if m.currentApp() == nil {
 		m.showToast(toastWarning, "This app's configuration is not loaded yet.")
 		return

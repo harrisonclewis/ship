@@ -9,6 +9,18 @@
 
 The TUI offers three source choices: **Source directory**, **Git repository URL** and **GitHub release asset**. The first two are both `source.type: image`; only the local `sources.<app>` value differs. The same choice is available when editing an existing image app's source.
 
+## Change the source in the TUI
+
+Open the app, choose **Edit…** (`i`) and **Source** (`s`). The first step shows the saved source kind and its current values: the directory, the Git URL with its build directory, or the release repository with its asset. The selector defaults to the saved kind. Press `Enter` to edit the details, which are already populated.
+
+- `Esc` in the details step returns to the kind step and keeps your draft.
+- `Esc` on the kind step returns to the Edit menu without saving.
+- Nothing is saved until you submit the details step.
+
+The screen re-reads the local `ship.yaml` when it opens, so edits made outside the TUI are reflected. If the file cannot be read, Ship shows the error instead of opening fields from stale values.
+
+A missing directory or source is labelled as not set, and optional values that use a default — the Git build directory or release asset pattern — say so explicitly.
+
 ## GitHub release app
 
 ```yaml

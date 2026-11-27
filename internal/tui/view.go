@@ -127,6 +127,12 @@ func (m *model) crumbs() []string {
 
 func (m *model) hints() []keyHint {
 	if m.form != nil {
+		if m.form.purpose == formEditAppSource {
+			if m.sourceFormInDetails() {
+				return []keyHint{{"enter", "finish"}, {"tab", "next field"}, {"shift+tab", "previous"}, {"esc", "back to source"}}
+			}
+			return []keyHint{{"enter", "continue"}, {"↑/↓", "change source"}, {"esc", "back to Edit"}}
+		}
 		return []keyHint{{"enter", "next/finish"}, {"tab", "next field"}, {"esc", "cancel"}}
 	}
 	if m.confirm != nil {
