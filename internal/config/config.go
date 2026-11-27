@@ -28,6 +28,11 @@ const (
 	DefaultAdminUser  = "ops"
 	DefaultBackupDir  = "~/backups/vps"
 
+	// ConnectionRemote reaches the server over ssh. ConnectionLocal runs ship
+	// on the server itself and executes the agent directly.
+	ConnectionRemote = "remote"
+	ConnectionLocal  = "local"
+
 	// ConfigName is the file ship looks for.
 	ConfigName = "ship.yaml"
 )
@@ -73,43 +78,71 @@ var reservedServerNames = map[string]bool{
 	"update":      true,
 	"help":        true,
 	"config":      true,
+	"server":      true,
+	"diff":        true,
 	"all":         true,
 }
 
 // Config is the contents of ship.yaml.
+//
+// The file only holds machine-specific details. Everything about an app other
+// than where its checkout lives is read from and written to the server.
 type Config struct {
 	BackupDirLocal string             `yaml:"backup_dir_local"`
 	Servers        map[string]*Server `yaml:"servers"`
 
-	// The flat pre-servers format is only decoded so Validate can point at
-	// the migration instead of failing with an unknown-field error.
+	// Old-format fields are decoded only so Validate can point at the
+	// migration instead of failing with an unknown-field error.
 	Host       string          `yaml:"host"`
 	AdminUser  string          `yaml:"admin_user"`
 	Arch       string          `yaml:"arch"`
 	CaddyImage string          `yaml:"caddy_image"`
 	Apps       map[string]*App `yaml:"apps"`
 
-	// Dir is the absolute directory containing ship.yaml. App files are read
-	// relative to it, not to the current directory. It is not part of the file.
+	// Dir is the absolute directory containing ship.yaml. It is not part of
+	// the file.
 	Dir string `yaml:"-"`
 	// Path is the absolute path of the loaded ship.yaml. It is empty for a
 	// document decoded in memory.
 	Path string `yaml:"-"`
 }
 
-// Server is one VPS and the apps deployed on it.
+// Server is one VPS. The local file only records how to reach it and where
+// each app's checkout is on this machine.
 type Server struct {
 	Name string `yaml:"-"`
-	Host string `yaml:"host"`
+	// Connection is remote (ssh, the default) or local (ship runs on the
+	// server itself).
+	Connection string `yaml:"connection,omitempty"`
+	Host       string `yaml:"host"`
 	// IdentityFile is an optional SSH private key for this server. ~/ is
 	// expanded; Validate stores the expanded path.
-	IdentityFile string          `yaml:"identity_file"`
-	AdminUser    string          `yaml:"admin_user"`
-	Arch         string          `yaml:"arch"`
-	CaddyImage   string          `yaml:"caddy_image"`
-	Apps         map[string]*App `yaml:"apps"`
+	IdentityFile string `yaml:"identity_file"`
+	// User is the local admin user to act as for connection: local. Empty
+	// means the current user.
+	User string `yaml:"user,omitempty"`
+	// Sources maps an app name to its local checkout for image apps.
+	Sources map[string]string `yaml:"sources,omitempty"`
+
+	// Old-format fields are decoded only so Validate can point at the
+	// migration. Server-side data (AdminUser, CaddyImage, Apps) is loaded from
+	// the server at runtime and never written back to the local file.
+	AdminUser  string          `yaml:"admin_user,omitempty"`
+	Arch       string          `yaml:"arch,omitempty"`
+	CaddyImage string          `yaml:"caddy_image,omitempty"`
+	Apps       map[string]*App `yaml:"apps,omitempty"`
 
 	Dir string `yaml:"-"`
+}
+
+// IsLocal reports whether ship runs its agent commands on this machine
+// instead of over ssh.
+func (s *Server) IsLocal() bool { return s.Connection == ConnectionLocal }
+
+// IsOldFormat reports whether the server block still uses the old full
+// configuration format.
+func (s *Server) IsOldFormat() bool {
+	return s.AdminUser != "" || s.Arch != "" || s.CaddyImage != "" || len(s.Apps) > 0
 }
 
 // App is one deployed application.
@@ -256,7 +289,17 @@ func LoadDefault() (*Config, error) {
 
 // Decode parses and validates a ship.yaml document.
 func Decode(r io.Reader) (*Config, error) {
-	dec := yaml.NewDecoder(r)
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	// Empty-valued old keys (notably `apps: {}` or `admin_user: ""`) cannot be
+	// distinguished from missing fields on the typed struct, so reject them
+	// from the raw document.
+	if server, old := oldFieldsPresent(data); old {
+		return nil, oldFormatError(server)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	var c Config
 	if err := dec.Decode(&c); err != nil {
@@ -280,6 +323,58 @@ func Decode(r io.Reader) (*Config, error) {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// oldFieldsPresent reports whether a raw document still contains a key from
+// the old full-format schema, even when the value is empty.
+func oldFieldsPresent(data []byte) (server string, ok bool) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return "", false
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 {
+		return "", false
+	}
+	topLevelOld := map[string]bool{"host": true, "admin_user": true, "arch": true, "caddy_image": true, "apps": true}
+	if keyPresent(doc.Content[0], topLevelOld) {
+		return "", true
+	}
+	serverOld := map[string]bool{"admin_user": true, "arch": true, "caddy_image": true, "apps": true}
+	servers := mapValue(doc.Content[0], "servers")
+	if servers == nil || servers.Kind != yaml.MappingNode {
+		return "", false
+	}
+	for i := 0; i+1 < len(servers.Content); i += 2 {
+		name := servers.Content[i].Value
+		if keyPresent(servers.Content[i+1], serverOld) {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+func keyPresent(node *yaml.Node, keys map[string]bool) bool {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if keys[node.Content[i].Value] {
+			return true
+		}
+	}
+	return false
+}
+
+func mapValue(node *yaml.Node, key string) *yaml.Node {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	return nil
 }
 
 // RecordYAML renders an app's canonical server-side record. It is what the
@@ -337,9 +432,12 @@ func (a *App) Validate() error {
 }
 
 // Validate checks every field and applies defaults.
+//
+// The local file is deliberately small: only connection details and app
+// checkout paths. Anything that affects the server lives on the server.
 func (c *Config) Validate() error {
 	if c.Host != "" || c.AdminUser != "" || c.Arch != "" || c.CaddyImage != "" || len(c.Apps) > 0 {
-		return errors.New("the flat host/apps format is no longer supported; move host, admin_user, arch, caddy_image and apps under servers.<name>")
+		return oldFormatError("")
 	}
 
 	if c.BackupDirLocal == "" {
@@ -357,7 +455,6 @@ func (c *Config) Validate() error {
 	}
 	c.BackupDirLocal = dir
 
-	seenHost := map[string]string{}
 	for _, name := range c.ServerNames() {
 		srv := c.Servers[name]
 		if err := validateServerName(name); err != nil {
@@ -368,17 +465,27 @@ func (c *Config) Validate() error {
 		}
 		srv.Name = name
 		srv.Dir = c.Dir
-		if err := srv.validate(seenHost); err != nil {
+		if srv.IsOldFormat() {
+			return oldFormatError(name)
+		}
+		if err := srv.validate(); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+func oldFormatError(server string) error {
+	if server == "" {
+		return errors.New(`this ship.yaml uses the old full-configuration format; run "ship config push" (or "ship <server> config push" when several servers are configured) to move app configuration to the server and rewrite this file`)
+	}
+	return fmt.Errorf(`servers.%s uses the old full-configuration format; run "ship %s config push" to move its app configuration to the server and rewrite this file`, server, server)
+}
+
 func validateServerName(name string) error {
 	if reservedServerNames[name] {
 		if name == "config" {
-			return errors.New(`servers.config: "config" is reserved for "ship config edit"; rename the server`)
+			return errors.New(`servers.config: "config" is reserved for "ship config edit" and "ship config push"; rename the server`)
 		}
 		return fmt.Errorf("servers.%s: %q is reserved", name, name)
 	}
@@ -388,56 +495,108 @@ func validateServerName(name string) error {
 	return nil
 }
 
-func (s *Server) validate(seenHost map[string]string) error {
+func (s *Server) validate() error {
 	p := "servers." + s.Name
-	if !userHostRE.MatchString(s.Host) {
-		return fmt.Errorf("%s.host: want user@host (for example ops@203.0.113.10), got %q", p, s.Host)
-	}
-	if s.AdminUser == "" {
-		s.AdminUser = DefaultAdminUser
-	}
-	if s.IdentityFile != "" {
-		key, err := expandHome(s.IdentityFile)
-		if err != nil {
-			return fmt.Errorf("%s.identity_file: %w", p, err)
-		}
-		if !filepath.IsAbs(key) || filepath.Clean(key) != key || strings.ContainsAny(key, "\n\r\x00") {
-			return fmt.Errorf("%s.identity_file: want an absolute path or ~/path, got %q", p, s.IdentityFile)
-		}
-		s.IdentityFile = key
-	}
-	if !adminUserRE.MatchString(s.AdminUser) || s.AdminUser == "deploy" || s.AdminUser == "root" {
-		return fmt.Errorf("%s.admin_user: invalid user %q (root and deploy are reserved)", p, s.AdminUser)
-	}
-	if s.Arch == "" {
-		s.Arch = DefaultArch
-	}
-	switch s.Arch {
-	case "linux/amd64", "amd64":
-		s.Arch = "linux/amd64"
-	case "linux/arm64", "arm64":
-		s.Arch = "linux/arm64"
+	switch s.Connection {
+	case "":
+		s.Connection = ConnectionRemote
+	case ConnectionRemote, ConnectionLocal:
 	default:
-		return fmt.Errorf("%s.arch: want linux/amd64 or linux/arm64, got %q", p, s.Arch)
+		return fmt.Errorf("%s.connection: want remote or local, got %q", p, s.Connection)
 	}
-	if s.CaddyImage == "" {
-		s.CaddyImage = DefaultCaddyImage
+	if s.IsLocal() {
+		if s.Host != "" {
+			return fmt.Errorf("%s.host: not allowed with connection: local", p)
+		}
+		if s.IdentityFile != "" {
+			return fmt.Errorf("%s.identity_file: not allowed with connection: local", p)
+		}
+		if s.User != "" && (!adminUserRE.MatchString(s.User) || s.User == "root" || s.User == "deploy") {
+			return fmt.Errorf("%s.user: invalid local admin user %q (want a name like ops)", p, s.User)
+		}
+	} else {
+		if s.User != "" {
+			return fmt.Errorf("%s.user: only valid with connection: local", p)
+		}
+		if !userHostRE.MatchString(s.Host) {
+			return fmt.Errorf("%s.host: want user@host (for example ops@203.0.113.10), got %q", p, s.Host)
+		}
+		if s.IdentityFile != "" {
+			key, err := expandHome(s.IdentityFile)
+			if err != nil {
+				return fmt.Errorf("%s.identity_file: %w", p, err)
+			}
+			if !filepath.IsAbs(key) || filepath.Clean(key) != key || strings.ContainsAny(key, "\n\r\x00") {
+				return fmt.Errorf("%s.identity_file: want an absolute path or ~/path, got %q", p, s.IdentityFile)
+			}
+			s.IdentityFile = key
+		}
 	}
-	if err := ValidateImageRef(s.CaddyImage); err != nil {
-		return fmt.Errorf("%s.caddy_image: %w", p, err)
+	names := make([]string, 0, len(s.Sources))
+	for name := range s.Sources {
+		names = append(names, name)
 	}
+	sort.Strings(names)
+	for _, name := range names {
+		if err := checkAppName(p+".sources", name); err != nil {
+			return err
+		}
+		local, err := expandHome(s.Sources[name])
+		if err != nil {
+			return fmt.Errorf("%s.sources.%s: %w", p, name, err)
+		}
+		if !filepath.IsAbs(local) || filepath.Clean(local) != local {
+			return fmt.Errorf("%s.sources.%s: want a clean absolute path or ~/path, got %q", p, name, s.Sources[name])
+		}
+		if strings.ContainsAny(local, "\n\r\x00") {
+			return fmt.Errorf("%s.sources.%s: control characters are not allowed", p, name)
+		}
+		s.Sources[name] = local
+	}
+	return nil
+}
 
-	for _, name := range s.AppNames() {
-		if err := checkAppName(p+".apps", name); err != nil {
+// ValidateRecords validates a whole set of desired app records for one server
+// and applies defaults. Domains and redirects must be unique across every app
+// in the set.
+func ValidateRecords(apps map[string]*App) error {
+	seenHost := map[string]string{}
+	names := make([]string, 0, len(apps))
+	for name := range apps {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if err := checkAppName("apps", name); err != nil {
 			return err
 		}
-		app := s.Apps[name]
+		app := apps[name]
 		if app == nil {
-			return fmt.Errorf("%s.apps.%s: app definition is empty", p, name)
+			return fmt.Errorf("apps.%s: app definition is empty", name)
 		}
-		if err := s.validateApp(p+".apps."+name, app, seenHost); err != nil {
+		if app.Source.Path != "" {
+			return fmt.Errorf("apps.%s.source.path: local checkout paths are not part of the server configuration", name)
+		}
+		if err := (&Server{Name: "records"}).validateApp("apps."+name, app, seenHost); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// ValidateServerSettings checks the desired server-wide settings.
+func ValidateServerSettings(adminUser, caddyImage string) error {
+	if adminUser == "" {
+		adminUser = DefaultAdminUser
+	}
+	if !adminUserRE.MatchString(adminUser) || adminUser == "deploy" || adminUser == "root" {
+		return fmt.Errorf("admin_user: invalid user %q (root and deploy are reserved)", adminUser)
+	}
+	if caddyImage == "" {
+		caddyImage = DefaultCaddyImage
+	}
+	if err := ValidateImageRef(caddyImage); err != nil {
+		return fmt.Errorf("caddy_image: %w", err)
 	}
 	return nil
 }

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -27,7 +26,8 @@ const (
 	ActBackup
 	ActBackups
 	ActRestore
-	ActProxyUpdate
+	ActProxySync
+	ActProxyRestart
 	ActSetup
 	ActLockSSH
 	ActVPSUpdate
@@ -84,10 +84,13 @@ type Backend interface {
 	Servers() []string
 	Server(name string) (*config.Server, error)
 	Status(ctx context.Context, server, app string) (ops.StatusReport, error)
-	ServerApps(ctx context.Context, server string) ([]ops.ServerApp, error)
+	Variances(ctx context.Context, server string) (ops.VarianceReport, error)
 	ListBackups(ctx context.Context, server, app string) ([]BackupEntry, error)
 	Run(ctx context.Context, req Request, out io.Writer) (Result, error)
-	Import(ctx context.Context, req ops.ImportRequest) (ops.ImportSummary, error)
+	PutDesiredApp(ctx context.Context, server, app string, record *config.App, compose, dockerfile []byte, arch, expectedHash string) (string, error)
+	PutServerSettings(ctx context.Context, server, adminUser, caddyImage, expectedHash string) (string, error)
+	RemoveDesiredApp(ctx context.Context, server, app, expectedHash string) error
+	RecordBuildApproval(ctx context.Context, server, app, script string) error
 	TerminalCommand(ctx context.Context, req TerminalRequest) (cmd *exec.Cmd, display string, err error)
 }
 
@@ -124,12 +127,24 @@ func (b *realBackend) Status(ctx context.Context, server, app string) (ops.Statu
 	return b.ops(io.Discard).Status(ctx, server, app)
 }
 
-func (b *realBackend) ServerApps(ctx context.Context, server string) ([]ops.ServerApp, error) {
-	return b.ops(io.Discard).ServerApps(ctx, server)
+func (b *realBackend) Variances(ctx context.Context, server string) (ops.VarianceReport, error) {
+	return b.ops(io.Discard).Variances(ctx, server)
 }
 
-func (b *realBackend) Import(ctx context.Context, req ops.ImportRequest) (ops.ImportSummary, error) {
-	return b.ops(io.Discard).Import(ctx, req)
+func (b *realBackend) PutDesiredApp(ctx context.Context, server, app string, record *config.App, compose, dockerfile []byte, arch, expectedHash string) (string, error) {
+	return b.ops(io.Discard).PutDesiredApp(ctx, server, app, record, compose, dockerfile, arch, expectedHash)
+}
+
+func (b *realBackend) PutServerSettings(ctx context.Context, server, adminUser, caddyImage, expectedHash string) (string, error) {
+	return b.ops(io.Discard).PutServerSettings(ctx, server, adminUser, caddyImage, expectedHash)
+}
+
+func (b *realBackend) RemoveDesiredApp(ctx context.Context, server, app, expectedHash string) error {
+	return b.ops(io.Discard).RemoveDesiredApp(ctx, server, app, expectedHash)
+}
+
+func (b *realBackend) RecordBuildApproval(ctx context.Context, server, app, script string) error {
+	return b.ops(io.Discard).RecordBuildApproval(server, app, script)
 }
 
 func (b *realBackend) ListBackups(ctx context.Context, server, app string) ([]BackupEntry, error) {
@@ -190,8 +205,10 @@ func (b *realBackend) Run(ctx context.Context, req Request, out io.Writer) (Resu
 		err = op.Backups(ctx, req.Server, req.App)
 	case ActRestore:
 		err = op.Restore(ctx, req.Server, req.App, req.Archive)
-	case ActProxyUpdate:
-		err = op.ProxyUpdate(ctx, req.Server)
+	case ActProxySync:
+		err = op.ProxySync(ctx, req.Server)
+	case ActProxyRestart:
+		err = op.ProxyRestart(ctx, req.Server)
 	case ActSetup:
 		err = op.Setup(ctx, req.Server)
 	case ActLockSSH:
@@ -213,12 +230,18 @@ func (b *realBackend) TerminalCommand(ctx context.Context, req TerminalRequest) 
 	if err != nil {
 		return nil, "", err
 	}
-	if _, err := srv.App(req.App); err != nil {
+	if err := config.ValidateAppName(req.App); err != nil {
 		return nil, "", err
 	}
-	if !b.dryRun {
+	if !b.dryRun && !srv.IsLocal() {
 		if err := remote.CheckIdentityFile(srv.IdentityFile); err != nil {
 			return nil, "", fmt.Errorf("servers.%s.%w", srv.Name, err)
+		}
+	}
+	sess := b.session(ctx, srv)
+	if !b.dryRun {
+		if err := sess.EnsureAgent(b.agent); err != nil {
+			return nil, "", err
 		}
 	}
 	switch req.Kind {
@@ -228,38 +251,39 @@ func (b *realBackend) TerminalCommand(ctx context.Context, req TerminalRequest) 
 				return nil, "", err
 			}
 		}
-		sess := remote.NewSessionContext(srv.Host, b.dryRun, io.Discard, io.Discard, ctx)
-		sess.IdentityFile = srv.IdentityFile
-		if !b.dryRun {
-			if err := sess.EnsureAgent(b.agent); err != nil {
-				return nil, "", err
-			}
-		}
 		args := []string{"logs", req.App}
 		if req.Service != "" {
 			args = append(args, req.Service)
 		}
-		argv := sess.AgentArgv(true, args...)
-		display := "$ " + remote.ShellJoin(append([]string{"ssh"}, argv...))
+		program, argv := sess.AgentCommand(true, args...)
+		display := "$ " + remote.ShellJoin(append([]string{program}, argv...))
 		if b.dryRun {
 			return nil, display, nil
 		}
-		return exec.CommandContext(ctx, "ssh", argv...), display, nil
+		return exec.CommandContext(ctx, program, argv...), display, nil
 	case TerminalEnvEdit:
 		envPath := "/opt/apps/" + req.App + "/.env"
-		dir := path.Dir(envPath)
-		remoteCmd := fmt.Sprintf("sudo -n install -d -m 0755 %s; sudo -n test -f %s || sudo -n install -m 0600 /dev/null %s; sudo -n chmod 0600 %s; sudo -n -e %s && echo 'Saved. Run: ship %s restart %s'",
-			remote.ShellQuote(dir), remote.ShellQuote(envPath), remote.ShellQuote(envPath),
-			remote.ShellQuote(envPath), remote.ShellQuote(envPath), srv.Name, req.App)
-		argv := remote.SSHArgv(srv.Host, srv.IdentityFile, remoteCmd, true)
-		display := "$ " + remote.ShellJoin(append([]string{"ssh"}, argv...))
+		program, argv := sess.EnvEditCommand(envPath, true)
+		display := "$ " + remote.ShellJoin(append([]string{program}, argv...))
 		if b.dryRun {
 			return nil, display, nil
 		}
-		return exec.CommandContext(ctx, "ssh", argv...), display, nil
+		return exec.CommandContext(ctx, program, argv...), display, nil
 	default:
 		return nil, "", fmt.Errorf("unknown terminal action")
 	}
+}
+
+// session builds an ssh session or a local one for srv.
+func (b *realBackend) session(ctx context.Context, srv *config.Server) *remote.Session {
+	if srv.IsLocal() {
+		s := remote.NewLocalSessionContext(b.dryRun, io.Discard, io.Discard, ctx)
+		s.User = srv.User
+		return s
+	}
+	s := remote.NewSessionContext(srv.Host, b.dryRun, io.Discard, io.Discard, ctx)
+	s.IdentityFile = srv.IdentityFile
+	return s
 }
 
 func (r Request) actionLabel() string {
@@ -286,8 +310,10 @@ func (r Request) actionLabel() string {
 		return "List backups " + r.App
 	case ActRestore:
 		return "Restore " + r.App
-	case ActProxyUpdate:
-		return "Proxy update"
+	case ActProxySync:
+		return "Sync Caddy"
+	case ActProxyRestart:
+		return "Restart Caddy"
 	case ActSetup:
 		return "Setup"
 	case ActLockSSH:

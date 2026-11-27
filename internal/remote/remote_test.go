@@ -44,6 +44,97 @@ func TestSSHArgv(t *testing.T) {
 	}
 }
 
+func TestLocalAgentCommandAsRootIgnoresUser(t *testing.T) {
+	withLocalIdentity(t, 0, "root")
+	s := &Session{LocalMode: true, User: "ops"}
+	program, argv := s.AgentCommand(false, "status")
+	if program != agentPath || strings.Join(argv, "\x00") != "status" {
+		t.Fatalf("local root command = %q %#v", program, argv)
+	}
+}
+
+func TestLocalAgentCommandUsesSudo(t *testing.T) {
+	withLocalIdentity(t, 1000, "dev")
+	for _, user := range []string{"", "dev"} {
+		s := &Session{LocalMode: true, User: user}
+		program, argv := s.AgentCommand(false, "status")
+		want := []string{"-n", agentPath, "status"}
+		if program != "sudo" || strings.Join(argv, "\x00") != strings.Join(want, "\x00") {
+			t.Fatalf("user %q command = %q %#v", user, program, argv)
+		}
+	}
+}
+
+func TestLocalAgentCommandBecomesUserThenRoot(t *testing.T) {
+	withLocalIdentity(t, 1000, "dev")
+	s := &Session{LocalMode: true, User: "ops"}
+	program, argv := s.AgentCommand(false, "status")
+	want := []string{"-n", "-u", "ops", "sudo", "-n", agentPath, "status"}
+	if program != "sudo" || strings.Join(argv, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("command = %q %#v", program, argv)
+	}
+
+	program, argv = s.AgentCommand(true, "logs", "app")
+	want = []string{"-u", "ops", "sudo", agentPath, "logs", "app"}
+	if program != "sudo" || strings.Join(argv, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("TTY command = %q %#v", program, argv)
+	}
+}
+
+func TestLocalShellAndUploadUseSudo(t *testing.T) {
+	withLocalIdentity(t, 1000, "dev")
+	s := &Session{LocalMode: true, Out: io.Discard, Err: io.Discard, Runner: &recordRunner{}}
+	program, argv := s.ShellCommand("true", false)
+	if program != "sudo" || strings.Join(argv, "\x00") != "-n\x00sh\x00-c\x00true" {
+		t.Fatalf("shell command = %q %#v", program, argv)
+	}
+
+	r := &recordRunner{}
+	s.Runner = r
+	if err := s.UploadFile("/usr/local/sbin/ship-agent", 0o755, []byte("agent")); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.cmds) != 1 {
+		t.Fatalf("upload commands = %d", len(r.cmds))
+	}
+	up := r.cmds[0]
+	joined := strings.Join(up.Args, " ")
+	if up.Path != "sudo" || !strings.Contains(joined, "mkdir -p '/usr/local/sbin'") ||
+		!strings.Contains(joined, "'/usr/local/sbin/ship-agent' '0755'") ||
+		!strings.Contains(joined, `mv -f "$t" "$1"`) {
+		t.Fatalf("upload command = %q %#v", up.Path, up.Args)
+	}
+	if len(r.stdin) != 1 || string(r.stdin[0]) != "agent" {
+		t.Fatalf("upload stdin = %q", r.stdin)
+	}
+}
+
+func TestLocalShipImageSkipsTransfer(t *testing.T) {
+	withLocalIdentity(t, 1000, "dev")
+	r := &recordRunner{}
+	s := &Session{LocalMode: true, Out: io.Discard, Err: io.Discard, Runner: r}
+	if err := s.ShipImage("ship/app:v1", "image-load", "app", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.cmds) != 1 {
+		t.Fatalf("local image commands = %d", len(r.cmds))
+	}
+	cmd := r.cmds[0]
+	if cmd.Path != "docker" || strings.Join(cmd.Args, " ") != "image inspect ship/app:v1" {
+		t.Fatalf("local image command = %q %#v", cmd.Path, cmd.Args)
+	}
+}
+
+func withLocalIdentity(t *testing.T, euid int, user string) {
+	t.Helper()
+	oldEUID, oldUser := geteuid, currentUser
+	geteuid = func() int { return euid }
+	currentUser = func() string { return user }
+	t.Cleanup(func() {
+		geteuid, currentUser = oldEUID, oldUser
+	})
+}
+
 func TestAgentRemote(t *testing.T) {
 	got := AgentRemote("deploy", "lewbox", "v1.2.3")
 	want := `sudo -n /usr/local/sbin/ship-agent 'deploy' 'lewbox' 'v1.2.3'`
@@ -205,5 +296,16 @@ func TestSSHArgvIdentityFile(t *testing.T) {
 	want := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-i", "/home/me/.ssh/prod", "-o", "IdentitiesOnly=yes", "ops@host", "true"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("SSHArgv = %#v, want %#v", got, want)
+	}
+}
+
+func TestEnsureAgentRefusesEmptyAgent(t *testing.T) {
+	r := &recordRunner{output: probeOutput(AgentProtocol, "deadbeef")}
+	s := &Session{Host: "ops@host", Out: io.Discard, Err: io.Discard, Runner: r}
+	if err := s.EnsureAgent(nil); err == nil {
+		t.Fatal("expected an error for an empty agent")
+	}
+	if len(r.cmds) != 0 {
+		t.Fatalf("must not contact the server, ran %d commands", len(r.cmds))
 	}
 }

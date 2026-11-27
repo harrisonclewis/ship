@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,28 +21,15 @@ import (
 )
 
 const tuiTestDoc = `# keep this comment
+backup_dir_local: ~/backups
 servers:
   prod:
     # prod is the primary server
     host: ops@203.0.113.10
-    apps:
-      app:
-        domains: [app.example.com]
-        upstream: app:8080
-        source:
-          type: github-release
-          repo: example/app
-        backup: {}
   staging:
     host: ops@203.0.113.11
-    apps:
-      web:
-        domains: [web.example.com]
-        upstream: web:3000
-        source:
-          type: image
-          path: ~/web
-        backup: {}
+    sources:
+      web: ~/web
 `
 
 const testConfig = tuiTestDoc
@@ -64,16 +52,43 @@ func writeTestConfig(t *testing.T) (string, *config.Config, *yamldoc.Doc) {
 	return path, cfg, doc
 }
 
+type putCall struct {
+	server, app         string
+	record              *config.App
+	compose, dockerfile []byte
+	arch, expectedHash  string
+}
+
+type serverPutCall struct {
+	server, admin, caddy, expectedHash string
+}
+
+type removeCall struct {
+	server, app, expectedHash string
+}
+
+type approvalCall struct {
+	server, app, script string
+}
+
 type fakeBackend struct {
-	cfg          *config.Config
-	statusFn     func(server string) (ops.StatusReport, error)
-	serverApps   []ops.ServerApp
-	serverAppsFn func(server string) ([]ops.ServerApp, error)
-	backups      []BackupEntry
-	runFn        func(context.Context, Request, io.Writer) (Result, error)
-	runCalls     []Request
-	importFn     func(ops.ImportRequest) (ops.ImportSummary, error)
-	importCalls  []ops.ImportRequest
+	cfg           *config.Config
+	statusFn      func(server string) (ops.StatusReport, error)
+	backups       []BackupEntry
+	runFn         func(context.Context, Request, io.Writer) (Result, error)
+	runCalls      []Request
+	putFn         func(putCall) (string, error)
+	putCalls      []putCall
+	serverPutFn   func(serverPutCall) (string, error)
+	serverPuts    []serverPutCall
+	removeFn      func(removeCall) error
+	removeCalls   []removeCall
+	approvalFn    func(approvalCall) error
+	approvalCalls []approvalCall
+
+	variance      map[string]ops.VarianceReport
+	varianceFn    func(server string) (ops.VarianceReport, error)
+	varianceCalls int
 
 	terminalCmd     *exec.Cmd
 	terminalDisplay string
@@ -94,23 +109,21 @@ func (f *fakeBackend) Status(ctx context.Context, server, app string) (ops.Statu
 	return ops.StatusReport{Server: server, Proxy: "running"}, nil
 }
 
-func (f *fakeBackend) ServerApps(ctx context.Context, server string) ([]ops.ServerApp, error) {
-	if f.serverAppsFn != nil {
-		return f.serverAppsFn(server)
+func (f *fakeBackend) Variances(ctx context.Context, server string) (ops.VarianceReport, error) {
+	f.varianceCalls++
+	if f.varianceFn != nil {
+		return f.varianceFn(server)
 	}
-	return f.serverApps, nil
+	if f.variance != nil {
+		if r, ok := f.variance[server]; ok {
+			return r, nil
+		}
+	}
+	return ops.VarianceReport{Server: server}, nil
 }
 
 func (f *fakeBackend) ListBackups(ctx context.Context, server, app string) ([]BackupEntry, error) {
 	return f.backups, nil
-}
-
-func (f *fakeBackend) Import(ctx context.Context, req ops.ImportRequest) (ops.ImportSummary, error) {
-	f.importCalls = append(f.importCalls, req)
-	if f.importFn != nil {
-		return f.importFn(req)
-	}
-	return ops.ImportSummary{Imported: req.Apps}, nil
 }
 
 func (f *fakeBackend) Run(ctx context.Context, req Request, out io.Writer) (Result, error) {
@@ -119,6 +132,42 @@ func (f *fakeBackend) Run(ctx context.Context, req Request, out io.Writer) (Resu
 		return f.runFn(ctx, req, out)
 	}
 	return Result{}, nil
+}
+
+func (f *fakeBackend) PutDesiredApp(ctx context.Context, server, app string, record *config.App, compose, dockerfile []byte, arch, expectedHash string) (string, error) {
+	call := putCall{server: server, app: app, record: record, compose: compose, dockerfile: dockerfile, arch: arch, expectedHash: expectedHash}
+	f.putCalls = append(f.putCalls, call)
+	if f.putFn != nil {
+		return f.putFn(call)
+	}
+	return "newhash", nil
+}
+
+func (f *fakeBackend) PutServerSettings(ctx context.Context, server, adminUser, caddyImage, expectedHash string) (string, error) {
+	call := serverPutCall{server: server, admin: adminUser, caddy: caddyImage, expectedHash: expectedHash}
+	f.serverPuts = append(f.serverPuts, call)
+	if f.serverPutFn != nil {
+		return f.serverPutFn(call)
+	}
+	return "newhash", nil
+}
+
+func (f *fakeBackend) RemoveDesiredApp(ctx context.Context, server, app, expectedHash string) error {
+	call := removeCall{server: server, app: app, expectedHash: expectedHash}
+	f.removeCalls = append(f.removeCalls, call)
+	if f.removeFn != nil {
+		return f.removeFn(call)
+	}
+	return nil
+}
+
+func (f *fakeBackend) RecordBuildApproval(ctx context.Context, server, app, script string) error {
+	call := approvalCall{server: server, app: app, script: script}
+	f.approvalCalls = append(f.approvalCalls, call)
+	if f.approvalFn != nil {
+		return f.approvalFn(call)
+	}
+	return nil
 }
 
 func (f *fakeBackend) TerminalCommand(ctx context.Context, req TerminalRequest) (*exec.Cmd, string, error) {
@@ -146,6 +195,59 @@ func testModel(t *testing.T, doc string) (*model, *fakeBackend) {
 	m.height = 24
 	m.resizeViewport()
 	return m, fake
+}
+
+func decodedRecord(t *testing.T, doc string) *config.App {
+	t.Helper()
+	record, err := config.DecodeAppRecord(strings.NewReader(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return record
+}
+
+const appRecord = `domains: [app.example.com]
+upstream: app:8080
+source: {type: github-release, repo: example/app}
+`
+
+func testState(server string, records map[string]*config.App) *ops.ServerConfig {
+	state := &ops.ServerConfig{
+		Server:  server,
+		Apps:    map[string]*ops.DesiredApp{},
+		Running: map[string]*ops.RunningApp{},
+		Settings: ops.ServerSettings{
+			AdminUser:  "ops",
+			CaddyImage: config.DefaultCaddyImage,
+			Present:    true,
+			Hash:       "srvhash",
+		},
+		Arch: "amd64",
+	}
+	for name, rec := range records {
+		state.Apps[name] = &ops.DesiredApp{
+			Name:    name,
+			Record:  rec,
+			Compose: []byte("name: " + name + "\n"),
+			Hash:    "hash-" + name,
+		}
+	}
+	return state
+}
+
+func setVariances(m *model, fake *fakeBackend, server string, report ops.VarianceReport) {
+	if report.Server == "" {
+		report.Server = server
+	}
+	if fake.variance == nil {
+		fake.variance = map[string]ops.VarianceReport{}
+	}
+	fake.variance[server] = report
+	m.variances[server] = report
+}
+
+func statusFor(server string, apps ...ops.AppStatus) statusMsg {
+	return statusMsg{server: server, report: ops.StatusReport{Server: server, Proxy: "running", Apps: apps}}
 }
 
 func keyMsg(key string) tea.KeyMsg {
@@ -179,81 +281,668 @@ func press(t *testing.T, m *model, key string) (*model, tea.Cmd) {
 	return got, cmd
 }
 
-func statusFor(server string, apps ...ops.AppStatus) statusMsg {
-	return statusMsg{server: server, report: ops.StatusReport{Server: server, Proxy: "running", Apps: apps}}
+// runCmd runs a command and feeds any messages it produces back into the model.
+func runCmd(t *testing.T, m *model, cmd tea.Cmd) {
+	t.Helper()
+	if cmd == nil {
+		return
+	}
+	var feed func(tea.Cmd)
+	feed = func(c tea.Cmd) {
+		if c == nil {
+			return
+		}
+		switch msg := c().(type) {
+		case tea.BatchMsg:
+			for _, inner := range msg {
+				feed(inner)
+			}
+		default:
+			next, nextCmd := m.Update(msg)
+			if mm, ok := next.(*model); ok {
+				*m = *mm
+			}
+			feed(nextCmd)
+		}
+	}
+	feed(cmd)
 }
 
-func TestEditShipConfigFromServers(t *testing.T) {
-	m, _ := testModel(t, tuiTestDoc)
-	m, cmd := press(t, m, "e")
-	if cmd == nil || m.edit == nil {
-		t.Fatal("e did not start a local edit session")
+func appWithState(t *testing.T, m *model, fake *fakeBackend) *ops.ServerConfig {
+	t.Helper()
+	state := testState("prod", map[string]*config.App{"app": decodedRecord(t, appRecord)})
+	report := ops.VarianceReport{
+		Server: "prod",
+		State:  state,
+		Apps:   []ops.AppVariance{{App: "app", State: ops.VarianceApplied}},
 	}
-	if m.edit.target.path != m.path || m.edit.target.kind != editShipConfig {
-		t.Fatalf("edit target = %#v, want %s", m.edit.target, m.path)
-	}
-	_ = m.edit.session.Close()
-	m.edit = nil
+	setVariances(m, fake, "prod", report)
+	m.serverName = "prod"
+	m.page = pageServer
+	return state
 }
 
-func TestEditComposeFromAppActions(t *testing.T) {
-	m, _ := testModel(t, tuiTestDoc)
+func TestTabsAndOpenServer(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	appWithState(t, m, fake)
+	m.page = pageServers
+	m.tab = 0
+	m.Update(statusFor("prod", ops.AppStatus{App: "app", Current: "v1.2.3", Health: "healthy"}))
+	m.Update(statusFor("staging"))
+	if m.page != pageServers || m.tab != 0 {
+		t.Fatalf("started on page=%v tab=%d", m.page, m.tab)
+	}
+	if view := m.View(); !strings.Contains(view, "Servers (2)") || !strings.Contains(view, "prod") {
+		t.Fatalf("servers view missing content:\n%s", view)
+	}
+
+	m, _ = press(t, m, "2")
+	if m.page != pageActivity || m.tab != 1 {
+		t.Fatalf("2 did not switch to Activity: page=%v tab=%d", m.page, m.tab)
+	}
+	if view := m.View(); !strings.Contains(view, "Activity (0)") {
+		t.Fatalf("activity view missing tab:\n%s", view)
+	}
+
+	m, _ = press(t, m, "tab")
+	if m.page != pageServers || m.tab != 0 {
+		t.Fatalf("tab did not return to Servers: page=%v tab=%d", m.page, m.tab)
+	}
+
 	m, _ = press(t, m, "enter")
-	m, _ = press(t, m, "enter")
-	if m.page != pageAppActions {
-		t.Fatalf("page = %v, want app actions", m.page)
+	if m.page != pageServer || m.serverName != "prod" {
+		t.Fatalf("enter did not open prod: page=%v server=%q", m.page, m.serverName)
 	}
-	m, cmd := press(t, m, "f")
-	if cmd == nil || m.edit == nil {
-		t.Fatal("f did not start a local edit session")
+	m.Update(statusFor("prod", ops.AppStatus{App: "app", Current: "v1.2.3", Health: "healthy"}))
+	view := m.View()
+	for _, want := range []string{"Server", "Applications (1)", "app", "v1.2.3", "healthy", "applied"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("server view missing %q:\n%s", want, view)
+		}
 	}
-	want := filepath.Join(filepath.Dir(m.path), "apps", "app", "compose.yaml")
-	if m.edit.target.path != want || m.edit.target.kind != editCompose {
-		t.Fatalf("edit target = %#v, want %s", m.edit.target, want)
+
+	m, _ = press(t, m, "esc")
+	if m.page != pageServers {
+		t.Fatalf("esc did not go back to Servers: %v", m.page)
 	}
-	_ = m.edit.session.Close()
-	m.edit = nil
 }
 
-func TestAppEditSubmenu(t *testing.T) {
-	m, _ := testModel(t, tuiTestDoc)
-	m, _ = press(t, m, "enter")
-	m, _ = press(t, m, "enter")
-	m, _ = press(t, m, "i")
-	if m.page != pageAppEdit {
-		t.Fatalf("page = %v, want app edit menu", m.page)
+func TestConfigBadgesOnAppRows(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	state := testState("prod", map[string]*config.App{
+		"api": decodedRecord(t, "domains: [api.example.com]\nupstream: api:8080\nsource: {type: github-release, repo: example/api}\n"),
+		"web": decodedRecord(t, "domains: [web.example.com]\nupstream: web:8080\nsource: {type: github-release, repo: example/web}\n"),
+		"new": decodedRecord(t, "domains: [new.example.com]\nupstream: new:8080\nsource: {type: github-release, repo: example/new}\n"),
+	})
+	report := ops.VarianceReport{
+		Server: "prod",
+		State:  state,
+		Apps: []ops.AppVariance{
+			{App: "api", State: ops.VarianceApplied},
+			{App: "new", State: ops.VarianceNotDeployed},
+			{App: "web", State: ops.VariancePending},
+		},
 	}
-	m, _ = press(t, m, "s")
-	if m.form == nil || m.form.purpose != formEditAppSource {
-		t.Fatalf("form = %#v, want source quick form", m.form)
+	setVariances(m, fake, "prod", report)
+	m.serverName = "prod"
+	m.page = pageServer
+	m.Update(statusFor("prod",
+		ops.AppStatus{App: "api", Current: "v1", Health: "healthy"},
+		ops.AppStatus{App: "web", Current: "v2", Health: "unhealthy"},
+	))
+	view := m.View()
+	for _, want := range []string{"CONFIG", "applied", "pending deploy", "not deployed", "healthy"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("app row missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestServerAlertListsOutOfSyncItems(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	state := testState("prod", map[string]*config.App{"web": decodedRecord(t, "domains: [web.example.com]\nupstream: web:8080\nsource: {type: github-release, repo: example/web}\n")})
+	report := ops.VarianceReport{
+		Server:         "prod",
+		State:          state,
+		Apps:           []ops.AppVariance{{App: "web", State: ops.VariancePending}},
+		ProxyOutOfSync: true,
+		ProxyReason:    "the Caddyfile that would be rendered differs from the active one",
+		SetupPending:   true,
+		SetupReason:    "admin_user changed since the last setup",
+	}
+	setVariances(m, fake, "prod", report)
+	m.serverName = "prod"
+	m.page = pageServer
+	view := m.View()
+	for _, want := range []string{
+		"web: config changed, pending deploy",
+		"Caddy: domains changed, restart Caddy to apply (p)",
+		"Server: admin_user changed, run setup (s)",
+	} {
+		if !strings.Contains(view, want) {
+			t.Errorf("alert missing %q:\n%s", want, view)
+		}
+	}
+
+	report.ProxyReason = "the desired caddy_image differs from the running image"
+	report.SetupReason = "app uids changed since the last setup"
+	setVariances(m, fake, "prod", report)
+	view = m.View()
+	for _, want := range []string{
+		"Caddy: caddy_image changed, restart Caddy to apply (p)",
+		"Server: app uids changed, run setup (s)",
+	} {
+		if !strings.Contains(view, want) {
+			t.Errorf("alert missing %q:\n%s", want, view)
+		}
+	}
+
+	report.Apps = []ops.AppVariance{{App: "web", State: ops.VarianceApplied}}
+	report.ProxyOutOfSync = false
+	report.SetupPending = false
+	setVariances(m, fake, "prod", report)
+	view = m.View()
+	for _, unwanted := range []string{"pending deploy", "restart Caddy to apply", "run setup"} {
+		if strings.Contains(view, unwanted) {
+			t.Errorf("in-sync server still shows %q:\n%s", unwanted, view)
+		}
+	}
+}
+
+func TestEditAppWritesServerRecordWithLoadedHash(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	appWithState(t, m, fake)
+	m.appName = "app"
+	m.openAppForm("app", false)
+	if m.form == nil || m.form.purpose != formEditApp {
+		t.Fatalf("form = %#v", m.form)
+	}
+	m.form.app.Upstream = "app:9090"
+	cmd := m.submitForm()
+	if cmd == nil {
+		t.Fatal("submit returned no command")
+	}
+	runCmd(t, m, cmd)
+	if len(fake.putCalls) != 1 {
+		t.Fatalf("put calls = %+v", fake.putCalls)
+	}
+	call := fake.putCalls[0]
+	if call.server != "prod" || call.app != "app" || call.expectedHash != "hash-app" {
+		t.Fatalf("put call = %+v", call)
+	}
+	if call.record.Upstream != "app:9090" {
+		t.Fatalf("record upstream = %q", call.record.Upstream)
+	}
+	if string(call.compose) != "name: app\n" {
+		t.Fatalf("compose changed unexpectedly: %q", call.compose)
+	}
+	if m.form != nil || m.page != pageServer {
+		t.Fatalf("after save form=%v page=%v", m.form, m.page)
+	}
+	if fake.varianceCalls == 0 {
+		t.Fatal("variances were not refreshed after saving")
+	}
+}
+
+func TestRenameIsRejected(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	appWithState(t, m, fake)
+	m.appName = "app"
+	m.openAppForm("app", false)
+	m.form.app.Name = "renamed"
+	runCmd(t, m, m.submitForm())
+	if len(fake.putCalls) != 0 {
+		t.Fatalf("rename wrote to the server: %+v", fake.putCalls)
+	}
+	if m.form == nil || !strings.Contains(m.form.err, "cannot be changed") {
+		t.Fatalf("form error = %q", m.form.err)
+	}
+}
+
+func TestHashConflictShowsMessageAndReloads(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	appWithState(t, m, fake)
+	before := fake.varianceCalls
+	fake.putFn = func(putCall) (string, error) {
+		return "", fmt.Errorf("%w: app 'app' changed on the server since you loaded it", ops.ErrConfigConflict)
+	}
+	m.appName = "app"
+	m.openAppForm("app", false)
+	m.form.app.Upstream = "app:9090"
+	runCmd(t, m, m.submitForm())
+	if m.form != nil {
+		t.Fatal("form stayed open after a conflict")
+	}
+	if m.confirm == nil || m.confirm.title != "Changed on the server" {
+		t.Fatalf("confirm = %#v", m.confirm)
+	}
+	if !strings.Contains(m.confirm.body, "changed on the server since you loaded it") {
+		t.Fatalf("conflict message = %q", m.confirm.body)
+	}
+	if fake.varianceCalls <= before {
+		t.Fatal("variances were not reloaded after a conflict")
+	}
+}
+
+func TestBuildApprovalDialogAndRetry(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	appWithState(t, m, fake)
+	approval := &ops.BuildApprovalError{Server: "prod", App: "app", Script: "#!/bin/sh\necho one\necho two\n"}
+	calls := 0
+	fake.runFn = func(context.Context, Request, io.Writer) (Result, error) {
+		calls++
+		if calls == 1 {
+			return Result{}, approval
+		}
+		return Result{}, nil
+	}
+	runCmd(t, m, m.startRun(Request{Action: ActDeploy, Server: "prod", App: "app"}))
+	if m.confirm == nil || m.confirm.title != "Approve build script" || !m.confirm.scrollable {
+		t.Fatalf("approval dialog = %#v", m.confirm)
+	}
+	if !strings.Contains(m.confirm.script, "echo one") || m.confirm.yesHint != "approve and deploy" {
+		t.Fatalf("approval dialog content = %#v", m.confirm)
+	}
+	view := m.View()
+	if !strings.Contains(view, "echo one") || !strings.Contains(view, "approve and deploy") {
+		t.Fatalf("approval view missing script or action:\n%s", view)
+	}
+	m, _ = press(t, m, "down")
+	if m.confirm.scroll == 0 {
+		t.Fatal("scroll did not move")
+	}
+	_, cmd := press(t, m, "y")
+	if cmd == nil {
+		t.Fatal("approve returned no command")
+	}
+	msg := cmd()
+	_, retry := m.Update(msg)
+	if retry == nil {
+		t.Fatal("approval did not retry the deploy")
+	}
+	runCmd(t, m, retry)
+	if len(fake.approvalCalls) != 1 || fake.approvalCalls[0].script != approval.Script {
+		t.Fatalf("approval calls = %+v", fake.approvalCalls)
+	}
+	if len(fake.runCalls) != 2 || fake.runCalls[1].Action != ActDeploy {
+		t.Fatalf("run calls = %+v", fake.runCalls)
+	}
+	if m.confirm != nil {
+		t.Fatal("approval dialog stayed open")
+	}
+}
+
+func TestCompareShowsVarianceDiff(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	newRecord := decodedRecord(t, appRecord)
+	oldRecord := decodedRecord(t, strings.Replace(appRecord, "app:8080", "app:8080\nenv:\n  OLD: one", 1))
+	state := testState("prod", map[string]*config.App{"app": newRecord})
+	state.Running["app"] = &ops.RunningApp{Name: "app", Record: oldRecord, Compose: []byte("name: old\n")}
+	report := ops.ComputeVariances(state)
+	setVariances(m, fake, "prod", report)
+	m.serverName = "prod"
+	m.appName = "app"
+	m.page = pageServer
+	m.openCompare()
+	if m.page != pageCompare {
+		t.Fatalf("page = %v", m.page)
+	}
+	if !strings.Contains(m.compareText, "@@") {
+		t.Fatalf("compare text has no diff:\n%s", m.compareText)
+	}
+	view := m.View()
+	for _, want := range []string{"Compare", "running → desired", "@@"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("compare view missing %q:\n%s", want, view)
+		}
 	}
 	m, _ = press(t, m, "esc")
-	if m.form != nil || m.page != pageAppEdit {
-		t.Fatalf("esc left form=%v page=%v", m.form, m.page)
+	if m.page != pageServer {
+		t.Fatalf("esc left page = %v", m.page)
 	}
 }
 
-func TestEditAppYAMLStartsBufferEdit(t *testing.T) {
-	m, _ := testModel(t, tuiTestDoc)
-	m, _ = press(t, m, "enter")
-	m, _ = press(t, m, "enter")
-	m, _ = press(t, m, "i")
-	m, cmd := press(t, m, "y")
-	if cmd == nil || m.edit == nil {
-		t.Fatal("y did not start an app YAML edit")
+func TestServerSettingsFormWritesWithHash(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	state := appWithState(t, m, fake)
+	m.serverName = "prod"
+	m.openServerSettingsForm("prod")
+	if m.form == nil || m.form.purpose != formServerSettings {
+		t.Fatalf("form = %#v", m.form)
 	}
-	if m.edit.target.kind != editAppYAML || m.edit.target.label != "ship.yaml (app prod/app)" {
+	if m.form.server.AdminUser != state.Settings.AdminUser {
+		t.Fatalf("admin field = %q", m.form.server.AdminUser)
+	}
+	m.form.server.AdminUser = "admin2"
+	m.form.server.CaddyImage = "caddy:2.9-alpine"
+	runCmd(t, m, m.submitForm())
+	if len(fake.serverPuts) != 1 {
+		t.Fatalf("server puts = %+v", fake.serverPuts)
+	}
+	call := fake.serverPuts[0]
+	if call.server != "prod" || call.admin != "admin2" || call.caddy != "caddy:2.9-alpine" || call.expectedHash != "srvhash" {
+		t.Fatalf("server put = %+v", call)
+	}
+	if m.form != nil || m.page != pageServer {
+		t.Fatalf("after save form=%v page=%v", m.form, m.page)
+	}
+}
+
+func TestImageSourcePathOnlyWritesLocalFile(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	state := testState("staging", map[string]*config.App{
+		"web": decodedRecord(t, "domains: [web.example.com]\nupstream: web:8080\nsource: {type: image}\n"),
+	})
+	setVariances(m, fake, "staging", ops.VarianceReport{
+		Server: "staging",
+		State:  state,
+		Apps:   []ops.AppVariance{{App: "web", State: ops.VarianceApplied}},
+	})
+	m.serverName = "staging"
+	m.appName = "web"
+	m.page = pageAppEdit
+	m.openAppQuickForm(eaSource)
+	if m.form == nil || m.form.purpose != formEditAppSource {
+		t.Fatalf("form = %#v", m.form)
+	}
+	m.form.app.SourcePath = "~/code/web"
+	runCmd(t, m, m.submitForm())
+	if len(fake.putCalls) != 0 {
+		t.Fatalf("local source path wrote to the server: %+v", fake.putCalls)
+	}
+	data, err := os.ReadFile(m.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "web: ~/code/web") {
+		t.Fatalf("local sources not updated:\n%s", data)
+	}
+	cfg, err := config.Load(m.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := cfg.Server("staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if srv.Sources["web"] == "" {
+		t.Fatalf("sources = %+v", srv.Sources)
+	}
+}
+
+func TestRestartAndSyncCaddyActions(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	appWithState(t, m, fake)
+	m.runServerAction(saProxyRestart)
+	if len(m.activities) != 1 || m.activities[0].req.Action != ActProxyRestart {
+		t.Fatalf("restart activities = %+v", m.activities)
+	}
+	m2, _ := testModel(t, tuiTestDoc)
+	m2.serverName = "prod"
+	m2.runServerAction(saProxySync)
+	if len(m2.activities) != 1 || m2.activities[0].req.Action != ActProxySync {
+		t.Fatalf("sync activities = %+v", m2.activities)
+	}
+	_ = fake
+}
+
+func TestOldFormatFilePointsAtConfigPush(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ship.yaml")
+	old := "servers:\n  prod:\n    host: ops@203.0.113.10\n    apps:\n      app:\n        domains: [app.example.com]\n"
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SHIP_CONFIG", path)
+	_, _, _, err := loadForTUI(io.Discard)
+	if err == nil {
+		t.Fatal("old-format file loaded")
+	}
+	if !strings.Contains(err.Error(), "config push") || !strings.Contains(err.Error(), "old full-configuration format") {
+		t.Fatalf("error does not point at config push: %v", err)
+	}
+}
+
+func TestAddServerWritesNewLocalFormat(t *testing.T) {
+	m, _ := testModel(t, tuiTestDoc)
+	m.openServerForm("", true)
+	m.form.server.Name = "new"
+	m.form.server.Host = "ops@203.0.113.12"
+	runCmd(t, m, m.submitForm())
+	data, err := os.ReadFile(m.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "admin_user") || strings.Contains(string(data), "apps:") {
+		t.Fatalf("new server wrote old-format keys:\n%s", data)
+	}
+	cfg, err := config.Load(m.path)
+	if err != nil {
+		t.Fatalf("new local file is not valid: %v\n%s", err, data)
+	}
+	if _, err := cfg.Server("new"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServerFormSwitchesConnectionFields(t *testing.T) {
+	m, _ := testModel(t, tuiTestDoc)
+	m.openServerForm("", true)
+	v := m.form.server
+	if v.Connection != config.ConnectionRemote {
+		t.Fatalf("new server connection = %q, want remote", v.Connection)
+	}
+	if serverRemoteHidden(v) || !serverLocalHidden(v) {
+		t.Fatal("remote server form does not show the SSH fields")
+	}
+	v.Connection = config.ConnectionLocal
+	if !serverRemoteHidden(v) || serverLocalHidden(v) {
+		t.Fatal("local server form does not show the user field")
+	}
+}
+
+func TestAddLocalServerWritesConnection(t *testing.T) {
+	m, _ := testModel(t, tuiTestDoc)
+	m.openServerForm("", true)
+	m.form.server.Name = "self"
+	m.form.server.Connection = config.ConnectionLocal
+	m.form.server.Host = "ops@203.0.113.99"
+	m.form.server.IdentityFile = "~/.ssh/prod"
+	m.form.server.User = "ops"
+	runCmd(t, m, m.submitForm())
+
+	cfg, err := config.Load(m.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := cfg.Server("self")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !srv.IsLocal() || srv.Host != "" || srv.IdentityFile != "" || srv.User != "ops" {
+		t.Fatalf("saved local server = %+v", srv)
+	}
+	data, err := os.ReadFile(m.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "ops@203.0.113.99") {
+		t.Fatalf("local server kept a host:\n%s", data)
+	}
+}
+
+func TestMaintenanceBadgeAndToggle(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	appWithState(t, m, fake)
+	m.Update(statusFor("prod", ops.AppStatus{
+		App:         "app",
+		Current:     "v1.2.3",
+		Health:      "healthy",
+		Maintenance: true,
+	}))
+	m.page = pageServer
+	if view := m.View(); !strings.Contains(view, "MAINT") {
+		t.Fatalf("maintenance badge missing:\n%s", view)
+	}
+	m.appName = "app"
+	m.page = pageAppActions
+	m, _ = press(t, m, "m")
+	if len(m.activities) != 1 {
+		t.Fatalf("maintenance toggle did not start: %d", len(m.activities))
+	}
+	entry := m.activities[0]
+	if entry.req.Action != ActMaintenance || entry.req.MaintenanceOn {
+		t.Fatalf("expected maintenance off, got %+v", entry.req)
+	}
+}
+
+func TestConfirmGatesDeployAll(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	appWithState(t, m, fake)
+	m.page = pageServerActions
+	m.serverActCur = 0
+	m, _ = press(t, m, "enter")
+	if m.confirm == nil {
+		t.Fatal("deploy all did not ask for confirmation")
+	}
+	if len(m.activities) != 0 {
+		t.Fatalf("an operation started before confirmation: %d", len(m.activities))
+	}
+	m, _ = press(t, m, "y")
+	if m.confirm != nil {
+		t.Fatal("confirmation stayed open")
+	}
+	if len(m.activities) != 1 {
+		t.Fatalf("activities = %d, want 1", len(m.activities))
+	}
+	entry := m.activities[0]
+	if entry.req.Action != ActDeployAll || entry.req.Server != "prod" || entry.state != runRunning {
+		t.Fatalf("unexpected activity: %+v", entry)
+	}
+	if m.page != pageOutput {
+		t.Fatalf("starting a run did not open its output: %v", m.page)
+	}
+}
+
+func TestRunStreamsOutputAndFinishes(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	appWithState(t, m, fake)
+	fake.runFn = func(ctx context.Context, req Request, out io.Writer) (Result, error) {
+		fmt.Fprintln(out, "line one")
+		fmt.Fprintln(out, "line two")
+		return Result{}, nil
+	}
+	cmd := m.startRun(Request{Action: ActDeploy, Server: "prod", App: "app"})
+	if cmd == nil {
+		t.Fatal("startRun returned no command")
+	}
+	if len(m.activities) != 1 {
+		t.Fatalf("activities = %d", len(m.activities))
+	}
+	entry := m.activities[0]
+	entry.out.Write([]byte("early output\n"))
+	m.Update(runTickMsg{})
+	if view := m.View(); !strings.Contains(view, "early output") {
+		t.Fatalf("live output not shown:\n%s", view)
+	}
+	runCmd(t, m, cmd)
+	if entry.state != runSucceeded {
+		t.Fatalf("state = %v, want succeeded", entry.state)
+	}
+	view := m.View()
+	for _, want := range []string{"line one", "line two", "succeeded"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("output view missing %q:\n%s", want, view)
+		}
+	}
+	if fake.varianceCalls == 0 {
+		t.Fatal("deploy did not refresh variances")
+	}
+}
+
+func TestSameServerRunsAreRefused(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	appWithState(t, m, fake)
+	m.startRun(Request{Action: ActRestart, Server: "prod", App: "app"})
+	if len(m.activities) != 1 {
+		t.Fatalf("first run did not start: %d", len(m.activities))
+	}
+	m.startRun(Request{Action: ActRestart, Server: "prod", App: "app"})
+	if len(m.activities) != 1 {
+		t.Fatalf("second run on the same server started: %d", len(m.activities))
+	}
+	if m.toast == nil || m.toast.kind != toastWarning {
+		t.Fatalf("no warning toast: %+v", m.toast)
+	}
+	m.startRun(Request{Action: ActRestart, Server: "staging", App: "web"})
+	if len(m.activities) != 2 {
+		t.Fatalf("run on another server was refused: %d", len(m.activities))
+	}
+}
+
+func TestViewsFitEightyByTwentyFour(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	state := testState("prod", map[string]*config.App{"app": decodedRecord(t, appRecord)})
+	setVariances(m, fake, "prod", ops.VarianceReport{
+		Server:         "prod",
+		State:          state,
+		Apps:           []ops.AppVariance{{App: "app", State: ops.VariancePending}},
+		ProxyOutOfSync: true,
+		ProxyReason:    "the Caddyfile that would be rendered differs from the active one",
+		SetupPending:   true,
+		SetupReason:    "admin_user changed since the last setup",
+	})
+	m.Update(statusFor("prod", ops.AppStatus{App: "app", Current: "v1.2.3", Health: "healthy"}))
+	check := func(name string) {
+		t.Helper()
+		lines := strings.Split(m.View(), "\n")
+		if len(lines) > 24 {
+			t.Errorf("%s view has %d lines, want <= 24", name, len(lines))
+		}
+		for i, line := range lines {
+			if ansi.StringWidth(line) > 80 {
+				t.Errorf("%s view line %d is %d cells wide, want <= 80", name, i, ansi.StringWidth(line))
+			}
+		}
+	}
+	check("servers")
+	press(t, m, "2")
+	check("activity")
+	press(t, m, "1")
+	press(t, m, "enter")
+	check("server")
+	press(t, m, "m")
+	check("server actions")
+	press(t, m, "esc")
+	m.appName = "app"
+	m.page = pageAppActions
+	check("app actions")
+	press(t, m, "esc")
+	press(t, m, "a")
+	check("form")
+}
+
+func TestEditComposeUsesServerDesiredFile(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	appWithState(t, m, fake)
+	m.appName = "app"
+	m.page = pageAppActions
+	m, cmd := press(t, m, "f")
+	if cmd == nil || m.edit == nil {
+		t.Fatal("f did not start an editor")
+	}
+	if m.edit.target.kind != editDesiredCompose || m.edit.target.label != "apps/app/compose.yaml" {
 		t.Fatalf("edit target = %#v", m.edit.target)
 	}
 	data, err := m.edit.session.Read()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "server prod, app app") {
-		t.Fatalf("app YAML header missing:\n%s", data)
+	if string(data) != "name: app\n" {
+		t.Fatalf("editor data = %q", data)
 	}
 	_ = m.edit.session.Close()
 	m.edit = nil
+	_ = fake
 }
 
 func TestInvalidShipEditOffersReopenOrDiscard(t *testing.T) {
@@ -291,539 +980,59 @@ func TestInvalidShipEditOffersReopenOrDiscard(t *testing.T) {
 	}
 }
 
-func TestTabsAndOpenServer(t *testing.T) {
+func TestEditShipConfigFromServers(t *testing.T) {
 	m, _ := testModel(t, tuiTestDoc)
-	m.Update(statusFor("prod", ops.AppStatus{App: "app", Current: "v1.2.3", Health: "healthy"}))
-	m.Update(statusFor("staging"))
-	if m.page != pageServers || m.tab != 0 {
-		t.Fatalf("started on page=%v tab=%d", m.page, m.tab)
+	m, cmd := press(t, m, "e")
+	if cmd == nil || m.edit == nil {
+		t.Fatal("e did not start a local edit session")
 	}
-	if view := m.View(); !strings.Contains(view, "Servers (2)") || !strings.Contains(view, "prod") {
-		t.Fatalf("servers view missing content:\n%s", view)
+	if m.edit.target.path != m.path || m.edit.target.kind != editShipConfig {
+		t.Fatalf("edit target = %#v, want %s", m.edit.target, m.path)
 	}
-
-	m, _ = press(t, m, "2")
-	if m.page != pageActivity || m.tab != 1 {
-		t.Fatalf("2 did not switch to Activity: page=%v tab=%d", m.page, m.tab)
-	}
-	if view := m.View(); !strings.Contains(view, "Activity (0)") {
-		t.Fatalf("activity view missing tab:\n%s", view)
-	}
-
-	m, _ = press(t, m, "tab")
-	if m.page != pageServers || m.tab != 0 {
-		t.Fatalf("tab did not return to Servers: page=%v tab=%d", m.page, m.tab)
-	}
-
-	m, _ = press(t, m, "enter")
-	if m.page != pageServer || m.serverName != "prod" {
-		t.Fatalf("enter did not open prod: page=%v server=%q", m.page, m.serverName)
-	}
-	m.Update(statusFor("prod", ops.AppStatus{App: "app", Current: "v1.2.3", Health: "healthy"}))
-	view := m.View()
-	for _, want := range []string{"Server", "Applications (1)", "app", "v1.2.3", "healthy"} {
-		if !strings.Contains(view, want) {
-			t.Errorf("server view missing %q:\n%s", want, view)
-		}
-	}
-
-	m, _ = press(t, m, "esc")
-	if m.page != pageServers {
-		t.Fatalf("esc did not go back to Servers: %v", m.page)
-	}
+	_ = m.edit.session.Close()
+	m.edit = nil
 }
 
-func TestConfirmGatesDeployAll(t *testing.T) {
-	m, _ := testModel(t, tuiTestDoc)
-	m, _ = press(t, m, "enter")
-	m, _ = press(t, m, "m")
-	if m.page != pageServerActions {
-		t.Fatalf("server actions not open: %v", m.page)
-	}
-	m.serverActCur = 0
-	m, _ = press(t, m, "enter")
-	if m.confirm == nil {
-		t.Fatal("deploy all did not ask for confirmation")
-	}
-	if len(m.activities) != 0 {
-		t.Fatalf("an operation started before confirmation: %d", len(m.activities))
-	}
-	m, _ = press(t, m, "y")
-	if m.confirm != nil {
-		t.Fatal("confirmation stayed open")
-	}
-	if len(m.activities) != 1 {
-		t.Fatalf("activities = %d, want 1", len(m.activities))
-	}
-	entry := m.activities[0]
-	if entry.req.Action != ActDeployAll || entry.req.Server != "prod" || entry.state != runRunning {
-		t.Fatalf("unexpected activity: %+v", entry)
-	}
-	if m.page != pageOutput {
-		t.Fatalf("starting a run did not open its output: %v", m.page)
-	}
-}
-
-func TestRunStreamsOutputAndFinishes(t *testing.T) {
+func TestAppDeleteUsesLoadedHash(t *testing.T) {
 	m, fake := testModel(t, tuiTestDoc)
-	fake.runFn = func(ctx context.Context, req Request, out io.Writer) (Result, error) {
-		fmt.Fprintln(out, "line one")
-		fmt.Fprintln(out, "line two")
-		return Result{}, nil
-	}
-
-	cmd := m.startRun(Request{Action: ActDeploy, Server: "prod", App: "app"})
-	if cmd == nil {
-		t.Fatal("startRun returned no command")
-	}
-	if len(m.activities) != 1 {
-		t.Fatalf("activities = %d", len(m.activities))
-	}
-	entry := m.activities[0]
-
-	// Live output between ticks.
-	entry.out.Write([]byte("early output\n"))
-	m.Update(runTickMsg{})
-	if view := m.View(); !strings.Contains(view, "early output") {
-		t.Fatalf("live output not shown:\n%s", view)
-	}
-	if entry.state != runRunning {
-		t.Fatalf("entry finished too early: %v", entry.state)
-	}
-
-	msg := cmd()
-	batch, ok := msg.(tea.BatchMsg)
-	if !ok || len(batch) == 0 {
-		t.Fatalf("startRun command did not batch: %T", msg)
-	}
-	doneMsg := batch[0]()
-	done, ok := doneMsg.(runDoneMsg)
-	if !ok {
-		t.Fatalf("run command returned %T", doneMsg)
-	}
-	m.Update(done)
-
-	if entry.state != runSucceeded {
-		t.Fatalf("state = %v, want succeeded", entry.state)
-	}
-	if len(fake.runCalls) != 1 || fake.runCalls[0].Action != ActDeploy {
-		t.Fatalf("run calls = %+v", fake.runCalls)
-	}
-	view := m.View()
-	for _, want := range []string{"line one", "line two", "succeeded"} {
-		if !strings.Contains(view, want) {
-			t.Errorf("output view missing %q:\n%s", want, view)
-		}
-	}
-	if m.toast == nil || m.toast.kind != toastSuccess {
-		t.Fatalf("no success toast: %+v", m.toast)
-	}
-
-	m, _ = press(t, m, "esc")
-	m, _ = press(t, m, "esc")
-	m, _ = press(t, m, "2")
-	if view := m.View(); !strings.Contains(view, "Deploy app") || !strings.Contains(view, "succeeded") {
-		t.Fatalf("activity tab missing the run:\n%s", view)
-	}
-}
-
-func TestSameServerRunsAreRefused(t *testing.T) {
-	m, _ := testModel(t, tuiTestDoc)
-	m.startRun(Request{Action: ActRestart, Server: "prod", App: "app"})
-	if len(m.activities) != 1 {
-		t.Fatalf("first run did not start: %d", len(m.activities))
-	}
-	m.startRun(Request{Action: ActRestart, Server: "prod", App: "app"})
-	if len(m.activities) != 1 {
-		t.Fatalf("second run on the same server started: %d", len(m.activities))
-	}
-	if m.toast == nil || m.toast.kind != toastWarning {
-		t.Fatalf("no warning toast: %+v", m.toast)
-	}
-	m.startRun(Request{Action: ActRestart, Server: "staging", App: "web"})
-	if len(m.activities) != 2 {
-		t.Fatalf("run on another server was refused: %d", len(m.activities))
-	}
-}
-
-func TestMaintenanceBadgeAndToggle(t *testing.T) {
-	m, _ := testModel(t, tuiTestDoc)
-	m.Update(statusFor("prod", ops.AppStatus{
-		App:         "app",
-		Current:     "v1.2.3",
-		Health:      "healthy",
-		Maintenance: true,
-	}))
-	m, _ = press(t, m, "enter")
-	m.Update(statusFor("prod", ops.AppStatus{
-		App:         "app",
-		Current:     "v1.2.3",
-		Health:      "healthy",
-		Maintenance: true,
-	}))
-	if view := m.View(); !strings.Contains(view, "MAINT") {
-		t.Fatalf("maintenance badge missing:\n%s", view)
-	}
-	m, _ = press(t, m, "enter") // open app actions
-	m, _ = press(t, m, "m")
-	if len(m.activities) != 1 {
-		t.Fatalf("maintenance toggle did not start: %d", len(m.activities))
-	}
-	entry := m.activities[0]
-	if entry.req.Action != ActMaintenance || entry.req.MaintenanceOn {
-		t.Fatalf("expected maintenance off, got %+v", entry.req)
-	}
-}
-
-func TestViewsFitEightyByTwentyFour(t *testing.T) {
-	m, _ := testModel(t, tuiTestDoc)
-	m.Update(statusFor("prod", ops.AppStatus{App: "app", Current: "v1.2.3", Health: "healthy"}))
-	check := func(name string) {
-		t.Helper()
-		lines := strings.Split(m.View(), "\n")
-		if len(lines) > 24 {
-			t.Errorf("%s view has %d lines, want <= 24", name, len(lines))
-		}
-		for i, line := range lines {
-			if ansi.StringWidth(line) > 80 {
-				t.Errorf("%s view line %d is %d cells wide, want <= 80", name, i, ansi.StringWidth(line))
-			}
-		}
-	}
-	check("servers")
-	press(t, m, "2")
-	check("activity")
-	press(t, m, "1")
-	press(t, m, "enter")
-	check("server")
-	press(t, m, "m")
-	check("server actions")
-	press(t, m, "esc")
-	press(t, m, "enter")
-	check("app actions")
-	press(t, m, "esc")
-	press(t, m, "a")
-	check("form")
-	press(t, m, "esc")
-	press(t, m, "l")
-	check("confirm")
-	press(t, m, "n")
-}
-
-func TestAppFormLoadsSourceAndDeployValues(t *testing.T) {
-	m, _ := testModel(t, tuiTestDoc)
-	m.serverName = "staging"
-	m.appName = "web"
-	v := m.newAppFormValues("staging", "web", false)
-	if v.SourceType != "image" || v.SourcePath != "~/web" {
-		t.Fatalf("image source not loaded: %+v", v)
-	}
-	if !v.DeployMaintenance {
-		t.Fatal("maintenance should default to on")
-	}
-	if form := m.buildForm(&formHost{purpose: formEditApp, app: v}); form == nil {
-		t.Fatal("no app form")
-	}
-}
-
-func decodedRecord(t *testing.T, doc string) *config.App {
-	t.Helper()
-	record, err := config.DecodeAppRecord(strings.NewReader(doc))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return record
-}
-
-func setServerApps(m *model, fake *fakeBackend, server string, apps []ops.ServerApp) {
-	m.serverName = server
-	m.page = pageServer
-	m.serverApps[server] = apps
-	fake.serverApps = apps
-	m.recomputeDiffs(server)
-}
-
-func TestServerRowsShowDiffBadgeAndImportAction(t *testing.T) {
-	m, fake := testModel(t, tuiTestDoc)
-	srv := m.cfg.Servers["prod"]
-	dir := filepath.Join(srv.Dir, "apps", "app")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "compose.yaml"), []byte("name: app\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	apps := []ops.ServerApp{
-		{
-			Name: "app",
-			Record: decodedRecord(t, `domains: [app.example.com]
-upstream: app:8080
-source: {type: github-release, repo: example/app}
-env:
-  REMOTE: one
-`),
-			Compose: []byte("name: app\n"),
-		},
-		{
-			Name: "zzz",
-			Record: decodedRecord(t, `domains: [zzz.example.com]
-upstream: zzz:8080
-source: {type: github-release, repo: example/zzz}
-`),
-			Compose: []byte("name: zzz\n"),
-		},
-	}
-	setServerApps(m, fake, "prod", apps)
-	view := m.View()
-	for _, want := range []string{"DIFF", "zzz", "on server"} {
-		if !strings.Contains(view, want) {
-			t.Errorf("server view missing %q:\n%s", want, view)
-		}
-	}
-
-	for i, e := range m.appEntries() {
-		if e.Name == "zzz" {
-			m.appCursor = i
-		}
-	}
-	m, _ = press(t, m, "enter")
-	if m.page != pageAppActions || m.appName != "zzz" {
-		t.Fatalf("page=%v app=%q", m.page, m.appName)
-	}
-	if view := m.View(); !strings.Contains(view, "Import app") {
-		t.Fatalf("server-only app has no import action:\n%s", view)
-	}
-	_, cmd := press(t, m, "i")
-	if cmd == nil {
-		t.Fatal("import action returned no command")
-	}
-	done := cmd()
-	m.Update(done)
-	if len(fake.importCalls) != 1 || len(fake.importCalls[0].Apps) != 1 || fake.importCalls[0].Apps[0] != "zzz" {
-		t.Fatalf("import calls = %+v", fake.importCalls)
-	}
-	if m.page != pageServer {
-		t.Fatalf("after import page = %v", m.page)
-	}
-}
-
-func TestNoRecordAppOffersComposeImportOnly(t *testing.T) {
-	m, fake := testModel(t, tuiTestDoc)
-	setServerApps(m, fake, "prod", []ops.ServerApp{{Name: "old", Compose: []byte("name: old\n")}})
-	if view := m.View(); !strings.Contains(view, "no record") || !strings.Contains(view, "older ship") {
-		t.Fatalf("no-record marker missing:\n%s", view)
-	}
-	for i, e := range m.appEntries() {
-		if e.Name == "old" {
-			m.appCursor = i
-		}
-	}
-	m, _ = press(t, m, "enter")
-	if actions := m.appActions(); len(actions) != 1 || actions[0].label != "Import compose file" {
-		t.Fatalf("actions = %+v", actions)
-	}
-	_, cmd := press(t, m, "i")
-	if cmd == nil {
-		t.Fatal("compose import returned no command")
-	}
-	done := cmd()
-	m.Update(done)
-	if len(fake.importCalls) != 1 || !fake.importCalls[0].FilesOnly {
-		t.Fatalf("import calls = %+v", fake.importCalls)
-	}
-}
-
-func TestAddServerOffersMultiSelectImport(t *testing.T) {
-	m, fake := testModel(t, tuiTestDoc)
-	values := &serverFormValues{
-		Name:       "new",
-		Host:       "ops@203.0.113.12",
-		AdminUser:  "ops",
-		Arch:       "linux/amd64",
-		CaddyImage: "caddy:2.10-alpine",
-		IsNew:      true,
-	}
-	m.form = &formHost{purpose: formAddServer, server: values}
-	if cmd := m.submitForm(); cmd == nil {
-		t.Fatal("add server returned no follow-up command")
-	}
-	if m.form != nil {
-		t.Fatal("form stayed open after saving")
-	}
-
-	apps := []ops.ServerApp{
-		{Name: "api", Record: decodedRecord(t, "domains: [api.example.com]\nupstream: api:8080\nsource: {type: github-release, repo: example/api}\n")},
-		{Name: "worker", Record: decodedRecord(t, "domains: [worker.example.com]\nupstream: worker:8080\nsource: {type: github-release, repo: example/worker}\n")},
-	}
-	m.Update(serverAppsMsg{server: "new", apps: apps, forImport: true})
-	if m.form == nil || m.form.purpose != formImportApps {
-		t.Fatalf("import dialog did not open: %+v", m.form)
-	}
-	if got := strings.Join(m.form.importSelected, ","); got != "api,worker" {
-		t.Fatalf("preselected = %q", got)
-	}
-	cmd := m.submitForm()
-	if cmd == nil {
-		t.Fatal("import dialog returned no command")
-	}
-	done := cmd()
-	m.Update(done)
-	if len(fake.importCalls) != 1 {
-		t.Fatalf("import calls = %+v", fake.importCalls)
-	}
-	if got := strings.Join(fake.importCalls[0].Apps, ","); got != "api,worker" {
-		t.Fatalf("imported apps = %q", got)
-	}
-	if m.page != pageServer || m.serverName != "new" {
-		t.Fatalf("page=%v server=%q", m.page, m.serverName)
-	}
-}
-
-func TestCompareCanUseServerVersion(t *testing.T) {
-	m, fake := testModel(t, tuiTestDoc)
-	srv := m.cfg.Servers["prod"]
-	dir := filepath.Join(srv.Dir, "apps", "app")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "compose.yaml"), []byte("name: app\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	apps := []ops.ServerApp{{
-		Name: "app",
-		Record: decodedRecord(t, `domains: [app.example.com]
-upstream: app:8080
-source: {type: github-release, repo: example/app}
-env:
-  REMOTE: one
-`),
-		Compose: []byte("name: app\n"),
-	}}
-	setServerApps(m, fake, "prod", apps)
+	appWithState(t, m, fake)
 	m.appName = "app"
-	m.openCompare()
-	if m.page != pageCompare {
-		t.Fatalf("page = %v", m.page)
-	}
-	if !strings.Contains(m.View(), "Compare") || !strings.Contains(m.compare.Diff, "@@") {
-		t.Fatalf("compare view missing:\n%s\ndiff:\n%s", m.View(), m.compare.Diff)
-	}
-
-	m, _ = press(t, m, "u")
+	m.page = pageAppActions
+	m.runAppAction(aaDelete)
 	if m.confirm == nil {
-		t.Fatal("use server version did not ask for confirmation")
+		t.Fatal("delete did not ask for confirmation")
 	}
 	_, cmd := press(t, m, "y")
-	if cmd == nil {
-		t.Fatal("use server version returned no command")
-	}
-	done := cmd()
-	m.Update(done)
-	if len(fake.importCalls) != 1 || !fake.importCalls[0].Overwrite {
-		t.Fatalf("import calls = %+v", fake.importCalls)
+	runCmd(t, m, cmd)
+	if len(fake.removeCalls) != 1 || fake.removeCalls[0].expectedHash != "hash-app" {
+		t.Fatalf("remove calls = %+v", fake.removeCalls)
 	}
 	if m.page != pageServer {
-		t.Fatalf("page after use server = %v", m.page)
-	}
-
-	// Keep mine just closes the comparison.
-	m.page = pageCompare
-	m, _ = press(t, m, "k")
-	if m.page != pageServer || m.toast == nil {
-		t.Fatalf("keep mine: page=%v toast=%+v", m.page, m.toast)
+		t.Fatalf("page = %v", m.page)
 	}
 }
 
-func TestImportConfirmsDifferingFiles(t *testing.T) {
+func TestDeleteHashConflictReloads(t *testing.T) {
 	m, fake := testModel(t, tuiTestDoc)
-	srv := m.cfg.Servers["prod"]
-	dir := filepath.Join(srv.Dir, "apps", "blog")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
+	appWithState(t, m, fake)
+	fake.removeFn = func(removeCall) error {
+		return fmt.Errorf("%w: app changed on the server since you loaded it", ops.ErrConfigConflict)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "compose.yaml"), []byte("name: local\n"), 0o644); err != nil {
-		t.Fatal(err)
+	m.appName = "app"
+	m.page = pageAppActions
+	m.runAppAction(aaDelete)
+	_, cmd := press(t, m, "y")
+	runCmd(t, m, cmd)
+	if m.confirm == nil || m.confirm.title != "Changed on the server" {
+		t.Fatalf("confirm = %#v", m.confirm)
 	}
-	setServerApps(m, fake, "prod", []ops.ServerApp{{
-		Name: "blog",
-		Record: decodedRecord(t, `domains: [blog.example.com]
-upstream: blog:8080
-source: {type: github-release, repo: example/blog}
-`),
-		Compose: []byte("name: server\n"),
-	}})
-	for i, e := range m.appEntries() {
-		if e.Name == "blog" {
-			m.appCursor = i
-		}
-	}
-	m, _ = press(t, m, "enter")
-	_, cmd := press(t, m, "i")
-	if cmd != nil {
-		t.Fatal("differing file import started without confirmation")
-	}
-	if m.confirm == nil {
-		t.Fatal("no confirmation dialog opened")
-	}
-	for _, want := range []string{"apps/blog/compose.yaml differs from the server's", ".bak"} {
-		if !strings.Contains(m.confirm.body, want) {
-			t.Errorf("confirmation missing %q: %q", want, m.confirm.body)
-		}
-	}
-	m, _ = press(t, m, "n")
-	if m.confirm != nil || len(fake.importCalls) != 0 {
-		t.Fatalf("cancel still imported: confirm=%v calls=%+v", m.confirm, fake.importCalls)
-	}
-
-	m, _ = press(t, m, "i")
-	if m.confirm == nil {
-		t.Fatal("confirmation did not reopen")
-	}
-	_, cmd = press(t, m, "y")
-	if cmd == nil {
-		t.Fatal("confirming returned no import command")
-	}
-	done := cmd()
-	m.Update(done)
-	if len(fake.importCalls) != 1 || !fake.importCalls[0].Overwrite {
-		t.Fatalf("import calls = %+v", fake.importCalls)
+	if !strings.Contains(m.confirm.body, "changed on the server since you loaded it") {
+		t.Fatalf("conflict message = %q", m.confirm.body)
 	}
 }
 
-func TestImportIdenticalFileNeedsNoConfirmation(t *testing.T) {
-	m, fake := testModel(t, tuiTestDoc)
-	srv := m.cfg.Servers["prod"]
-	dir := filepath.Join(srv.Dir, "apps", "blog")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "compose.yaml"), []byte("name: same\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	setServerApps(m, fake, "prod", []ops.ServerApp{{
-		Name: "blog",
-		Record: decodedRecord(t, `domains: [blog.example.com]
-upstream: blog:8080
-source: {type: github-release, repo: example/blog}
-`),
-		Compose: []byte("name: same\n"),
-	}})
-	for i, e := range m.appEntries() {
-		if e.Name == "blog" {
-			m.appCursor = i
-		}
-	}
-	m, _ = press(t, m, "enter")
-	_, cmd := press(t, m, "i")
-	if m.confirm != nil {
-		t.Fatal("identical file opened an overwrite confirmation")
-	}
-	if cmd == nil {
-		t.Fatal("identical file import returned no command")
-	}
-	done := cmd()
-	m.Update(done)
-	if len(fake.importCalls) != 1 || fake.importCalls[0].Overwrite {
-		t.Fatalf("import calls = %+v", fake.importCalls)
+func TestErrorsIsConflictSentinel(t *testing.T) {
+	if !errors.Is(fmt.Errorf("wrap: %w", ops.ErrConfigConflict), ops.ErrConfigConflict) {
+		t.Fatal("ErrConfigConflict is not usable with errors.Is")
 	}
 }

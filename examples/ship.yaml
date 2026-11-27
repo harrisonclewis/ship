@@ -1,5 +1,10 @@
-# Example ship.yaml. Copy this folder to ~/.config/ship (or anywhere, with
-# SHIP_CONFIG=/path/to/ship.yaml), set the servers and apps, and keep secrets in
+# Example ship.yaml. This file is machine-specific: it only holds how to reach
+# each server and where image app checkouts live on this machine.
+#
+# App records, compose files and Dockerfiles live on the server. Create them
+# with `ship <server> app create <app>`, then `ship <server> config edit <app>
+# compose` and `ship <server> deploy <app>`. Migrate an old full-format file
+# once per server with `ship <server> config push`. Keep secrets in
 # /opt/apps/<app>/.env on each server (ship <server> env edit <app>).
 
 # `ship <server> backup` downloads archives here, under <server>/<app>/.
@@ -7,79 +12,30 @@ backup_dir_local: ~/backups/vps
 
 servers:
   prod:
-    # For the first `ship prod setup`, use root@<ip>, then switch to admin_user
-    # and run `ship prod lock-ssh`.
+    # For the first `ship prod setup`, use root@<ip>, then switch to the
+    # admin user and run `ship prod lock-ssh`.
     host: ops@203.0.113.10
     # Optional: the private key for this server. Without it, ssh uses your
     # ssh config and agent.
     identity_file: ~/.ssh/id_ed25519
-    admin_user: ops
-    arch: linux/amd64
-    caddy_image: caddy:2.10-alpine
+    # Local checkouts for image apps built on this machine. Never uploaded.
+    sources:
+      web: ~/code/web
 
-    apps:
-      # Built on the server from a GitHub release binary.
-      hello:
-        domains: [hello.example.com]
-        upstream: hello:8080
-        source:
-          type: github-release
-          repo: example/hello
-          asset: hello_linux_{arch}
-        uid: 10001
-        data: [/srv/hello]
-        health:
-          http_path: /health
-        backup:
-          sqlite: [/srv/hello/hello.db]
-        env:
-          HELLO_DB: /data/hello.db
-
-      # Built on this machine from a local repo and loaded onto the server over ssh.
-      web:
-        domains: [example.com]
-        redirects: [www.example.com]
-        upstream: web:3000
-        source:
-          type: image
-          path: ~/code/web
-        health:
-          http_path: /
-        # Run on this machine in source.path before the image is built.
-        build:
-          commands: |
-            npm ci --audit false
-            npm run build
-        # Run on the server in the new image just before it goes live. The
-        # site shows a 503 maintenance page from backup until health checks pass.
-        deploy:
-          commands: |
-            npm run migrate
-          maintenance: true
-        backup: {}
-        env: {}
+    # admin_user and caddy_image are server settings, not local keys:
+    #   ship prod server set admin_user ops
+    #   ship prod server set caddy_image caddy:2.10-alpine
 
   staging:
     host: ops@203.0.113.20
-    admin_user: ops
-    arch: linux/amd64
-    caddy_image: caddy:2.10-alpine
+    # The same app can use a different local checkout on each machine.
+    sources:
+      web: ~/code/web-staging
 
-    apps:
-      # The same app folder can be deployed to more than one server; domains
-      # must still be unique across every server.
-      hello:
-        domains: [hello.staging.example.com]
-        upstream: hello:8080
-        source:
-          type: github-release
-          repo: example/hello
-          asset: hello_linux_{arch}
-        uid: 10001
-        data: [/srv/hello]
-        health:
-          http_path: /health
-        backup:
-          sqlite: [/srv/hello/hello.db]
-        env:
-          HELLO_DB: /data/hello.db
+  # Run ship on the server itself. There is no host or identity_file; user is
+  # the optional admin user to act as. See docs/guides/run-on-the-server.md.
+  # self:
+  #   connection: local
+  #   user: ops
+  #   sources:
+  #     web: /srv/code/web

@@ -1,17 +1,15 @@
 # Manage domains
 
-An app's `domains` are all served by Caddy; the first is the canonical domain. `redirects` are optional hostnames that permanently redirect to the canonical domain.
+An app's `domains` are all served by Caddy; the first is the canonical domain. `redirects` are optional hostnames that permanently redirect to the canonical domain. Both are part of the app's desired record on the server.
 
 ```yaml
-apps:
-  web:
-    domains: [example.com, www.example.com]
-    redirects: [example.net]
+domains: [example.com, www.example.com]
+redirects: [example.net]
 ```
 
 - Domains must be lowercase FQDNs with at least one dot and no trailing dot.
-- Every domain and redirect must be unique across every app on every server.
-- After changing domains or redirects, run `ship prod proxy update` to render and reload the Caddyfile. A deploy does not do this for you.
+- Every domain and redirect must be unique across the desired apps on that server.
+- Saving domains or redirects only updates desired config. Apply them with `ship prod proxy restart`; a deploy does not do this for you.
 
 ## Point your domain at the server
 
@@ -26,7 +24,7 @@ See [Point your domain at the server](../quick-start.md#6-point-your-domain-at-t
 
 ## Change domains from the command line
 
-These commands edit only the local `ship.yaml` and validate the whole file before saving:
+These commands update the desired record on the server and validate it against the server's other apps:
 
 ```sh
 ship prod app add web domains www.example.com
@@ -39,7 +37,7 @@ ship prod app set web domains example.com www.example.com
 - `remove` is atomic: if any value is missing it changes nothing and exits non-zero.
 - Removing the last domain is an error. Removing the first (canonical) domain is allowed and prints the new canonical domain.
 - Duplicate values in one command are collapsed.
-- An empty value clears the list; `domains` still needs at least one entry to validate.
+- An empty value clears the list. `domains` must keep at least one entry, so an empty `domains` is rejected.
 
 Redirects use the same commands:
 
@@ -49,18 +47,39 @@ ship prod app remove web redirects www.example.net
 ship prod app set web redirects ""
 ```
 
-Then update the proxy:
+Saving a route change prints:
 
-```sh
-ship prod proxy update
+```text
+Restart Caddy to apply: ship prod proxy restart
 ```
 
-## Change domains in the TUI
+Run it after the change:
 
-On the server page, choose the app, **Edit…** (`i`), then **Domains & redirects** (`d`). The full app form under **All settings** (`a`) also edits them. Saving writes `ship.yaml`; run **Proxy update** (`p`) on the server page afterwards.
+```sh
+ship prod proxy restart
+```
+
+`proxy restart` renders the Caddyfile from desired domains and redirects, activates the desired `caddy_image` and recreates Caddy, so pending routing changes always apply. `proxy sync` reloads without the forced recreate. Apps that have never been deployed are left out of the rendered Caddyfile.
+
+## Editing the full record
+
+```sh
+ship prod app edit web
+```
+
+Change `domains` or `redirects` there and save. The same rule applies: desired config changes immediately, routing goes live on `proxy restart`.
+
+## Check what is pending
+
+```sh
+ship prod status web
+ship prod diff web
+```
+
+`status` shows `config=applied`, `config=pending deploy` or `config=not deployed`, and notes when the proxy is out of sync. `diff` prints the desired-vs-running difference and the server-level proxy state. Neither applies the change.
 
 ## How redirects behave
 
 Caddy answers each redirect host with a permanent redirect to `https://<canonical>{uri}`. The app's maintenance page applies to redirect hosts too while maintenance is on.
 
-See [ship.yaml](../reference/ship-yaml.md#keys) for all app keys.
+See [ship.yaml](../reference/ship-yaml.md#app-record-keys) for all record keys.

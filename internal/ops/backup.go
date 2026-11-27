@@ -60,7 +60,7 @@ func (o *Ops) Backup(ctx context.Context, server, target string, pull bool) ([]B
 		return nil, err
 	}
 	if target != "all" {
-		if _, err := srv.App(target); err != nil {
+		if err := config.ValidateAppName(target); err != nil {
 			return nil, err
 		}
 	}
@@ -117,14 +117,11 @@ func validRemoteArchive(app, p string) bool {
 // Restore restores an app from a server archive or a local file, which is
 // uploaded first. Callers confirm first.
 func (o *Ops) Restore(ctx context.Context, server, app, archive string) error {
-	s, srv, err := o.session(ctx, server)
+	s, _, err := o.session(ctx, server)
 	if err != nil {
 		return err
 	}
 	if err := config.ValidateAppName(app); err != nil {
-		return err
-	}
-	if _, err := srv.App(app); err != nil {
 		return err
 	}
 	if err := o.ensureAgent(s); err != nil {
@@ -133,14 +130,34 @@ func (o *Ops) Restore(ctx context.Context, server, app, archive string) error {
 
 	remotePath := archive
 	if fi, err := os.Stat(archive); err == nil && fi.Mode().IsRegular() {
-		f, err := os.Open(archive)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		remotePath = fmt.Sprintf("/tmp/ship-restore-%s-%d.tar.gz", app, time.Now().Unix())
-		if err := s.UploadStream(remotePath, 0o600, f, fi.Size()); err != nil {
-			return fmt.Errorf("upload archive: %w", err)
+		if s.LocalMode {
+			abs, err := filepath.Abs(archive)
+			if err != nil {
+				return err
+			}
+			if validRemoteArchive(app, abs) {
+				remotePath = abs
+			} else {
+				// The agent only accepts its own archive directory or a
+				// /tmp/ship-restore-* path. Copy a local archive there instead
+				// of uploading it over ssh.
+				remotePath = fmt.Sprintf("/tmp/ship-restore-%s-%d.tar.gz", app, time.Now().UnixNano())
+				if o.opts.DryRun {
+					fmt.Fprintf(o.opts.Out, "# would copy %s to %s\n", abs, remotePath)
+				} else if err := copyLocalFile(abs, remotePath); err != nil {
+					return fmt.Errorf("copy archive: %w", err)
+				}
+			}
+		} else {
+			f, err := os.Open(archive)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			remotePath = fmt.Sprintf("/tmp/ship-restore-%s-%d.tar.gz", app, time.Now().Unix())
+			if err := s.UploadStream(remotePath, 0o600, f, fi.Size()); err != nil {
+				return fmt.Errorf("upload archive: %w", err)
+			}
 		}
 	} else if !validRemoteArchive(app, archive) {
 		return fmt.Errorf("archive %q is neither a local file nor a ship archive for %s", archive, app)
@@ -166,7 +183,7 @@ func downloadSHA(s *remote.Session, localDir, remotePath, wantSHA string) (strin
 		f.Close()
 		return "", err
 	}
-	if err := s.StreamSSH("sudo -n cat "+remote.ShellQuote(remotePath), f); err != nil {
+	if err := s.DownloadFile(remotePath, f); err != nil {
 		f.Close()
 		return "", fmt.Errorf("download %s: %w", remotePath, err)
 	}
@@ -195,6 +212,24 @@ func downloadSHA(s *remote.Session, localDir, remotePath, wantSHA string) (strin
 		return "", err
 	}
 	return dst, nil
+}
+
+func copyLocalFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return err
+	}
+	return out.Close()
 }
 
 func fileSHA(path string) (string, error) {

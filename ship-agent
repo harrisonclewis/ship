@@ -6,9 +6,17 @@
 #   sudo ship-agent setup <admin-user> <caddy-image> <app:uid,...>
 #   sudo ship-agent lock-ssh <admin-user>
 #   sudo ship-agent vps-update | reboot
-#   sudo ship-agent proxy-update <caddy-image>        (Caddyfile on stdin)
+#   sudo ship-agent proxy-sync <caddy-image>          (Caddyfile on stdin; reload)
+#   sudo ship-agent proxy-restart <caddy-image>       (Caddyfile on stdin; recreate)
+#   sudo ship-agent proxy-update <caddy-image>        (alias for proxy-sync)
+#   sudo ship-agent app-put <app> <expected-hash>     (tar of desired app files on stdin)
+#   sudo ship-agent app-remove <app> <expected-hash>
+#   sudo ship-agent server-put <expected-hash>        (tar with server.yaml on stdin)
+#   sudo ship-agent setup-record <admin> <app:uid,..> (record an already-applied setup)
+#   sudo ship-agent config-export                     (tar of desired/running config)
 #   sudo ship-agent app-files <app>                   (tar of app files on stdin)
 #   sudo ship-agent app-export                        (tar of app records on stdout)
+#   sudo ship-agent arch                              (uname -m)
 #   sudo ship-agent image-load <app> <version>        (compressed docker save on stdin)
 #   sudo ship-agent deploy <app> <version|latest>
 #   sudo ship-agent rollback <app>
@@ -29,13 +37,17 @@
 set -euo pipefail
 umask 022
 
-AGENT_VERSION=4
+AGENT_VERSION=5
 
 APPS=/opt/apps
 PROXY=/opt/proxy
 BACKUPS=/var/backups/ship
 WEB_SUBNET=172.30.0.0/24
 CADDY_DEFAULT=caddy:2.10-alpine
+STATE="$APPS/.ship"
+PUT_FILE_LIMIT=$((1 << 20))
+PUT_TOTAL_LIMIT=$((16 << 20))
+EXPORT_TOTAL_LIMIT=$((32 << 20))
 
 APP_RE='^[a-z][a-z0-9-]{0,30}[a-z0-9]$'
 TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
@@ -80,9 +92,52 @@ validate_app() {
   [ -f "$APPS/$app/.ship-meta" ] || die "app '$app' is not installed; run ship deploy $app"
 }
 
+desired_dir() {
+  printf '%s/%s/.ship/desired\n' "$APPS" "$1"
+}
+
+# All desired/running configuration changes take one server-wide lock so a
+# hash check and the swap that follows it cannot interleave.
+lock_state() {
+  install -d -m 0755 "$STATE"
+  exec 9>"$STATE/.lock"
+  chmod 0600 "$STATE/.lock"
+  flock 9
+}
+
+unlock_state() {
+  flock -u 9 || true
+  exec 9>&-
+}
+
+# desired_matches_running is true when every desired file is byte-identical to
+# the running file (and a removed Dockerfile is absent in both).
+desired_matches_running() {
+  local app=$1 d f
+  d=${DEPLOY_SNAPSHOT:-$(desired_dir "$app")}
+  [ -d "$d" ] || return 1
+  for f in ship-app.yaml compose.yaml Dockerfile .ship-meta .ship-env .ship-deploy.sh; do
+    if [ -f "$d/$f" ]; then
+      cmp -s "$d/$f" "$APPS/$app/$f" || return 1
+    else
+      [ ! -e "$APPS/$app/$f" ] || return 1
+    fi
+  done
+  return 0
+}
+
+validate_desired_app() {
+  local app=${1:-}
+  [[ $app =~ $APP_RE ]] || die "invalid app name '$app'"
+  [ -f "$(desired_dir "$app")/.ship-meta" ] || die "app '$app' has no desired configuration on this server; run ship <server> config push or ship <server> app create $app"
+}
+
+# meta_get reads the desired record during a deploy and the running record
+# everywhere else. META_DIR overrides the directory for deploy.
 meta_get() {
   local app=$1 key=$2
-  awk -v k="$key" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$APPS/$app/.ship-meta"
+  local dir=${META_DIR:-$APPS/$app}
+  awk -v k="$key" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$dir/.ship-meta"
 }
 
 meta_list() {
@@ -118,13 +173,14 @@ image_for() {
 }
 
 write_ship_env() {
-  local app=$1 image=$2 tmp
+  local app=$1 image=$2 tmp env
   [[ $image =~ $IMAGE_RE ]] || die "refusing to write IMAGE='$image'"
+  env="${META_DIR:-$APPS/$app}/.ship-env"
   tmp=$(mktemp)
   {
     printf 'IMAGE=%s\n' "$image"
-    if [ -f "$APPS/$app/.ship-env" ]; then
-      cat "$APPS/$app/.ship-env"
+    if [ -f "$env" ]; then
+      cat "$env"
     fi
   } > "$tmp"
   chmod 0600 "$tmp"
@@ -136,6 +192,7 @@ compose_app() {
   shift
   local args=(--project-directory "$APPS/$app")
   [ -f "$APPS/$app/.ship.env" ] && args+=(--env-file "$APPS/$app/.ship.env")
+  [ -n "${APP_COMPOSE_FILE:-}" ] && args+=(-f "$APP_COMPOSE_FILE")
   docker compose "${args[@]}" "$@"
 }
 
@@ -173,7 +230,7 @@ maintenance_app() {
   case "$state" in
     on)
       maintenance_mount \
-        || die "the proxy has no maintenance mount; run 'ship $(server_label "$app") setup' then 'ship $(server_label "$app") proxy update'"
+        || die "the proxy has no maintenance mount; run 'ship $(server_label "$app") setup' then 'ship $(server_label "$app") proxy sync'"
       install -d -m 0755 "$PROXY/maintenance"
       printf 'maintenance on for %s\n' "$app" > "$PROXY/maintenance/.$app.tmp"
       chmod 0644 "$PROXY/maintenance/.$app.tmp"
@@ -428,9 +485,10 @@ deploy_release() {
   note "sha256 ok ($got)"
 
   cp "$work/$asset" "$work/$app"
-  [ -f "$APPS/$app/Dockerfile" ] || die "missing $APPS/$app/Dockerfile"
+  local df="${META_DIR:-$APPS/$app}/Dockerfile"
+  [ -f "$df" ] || die "missing $df"
   docker build -q --build-arg "VERSION=$tag" --build-arg "BINARY=$app" \
-    -f "$APPS/$app/Dockerfile" -t "$image" "$work" >/dev/null
+    -f "$df" -t "$image" "$work" >/dev/null
   if ! reported=$(docker run --rm --network none "$image" version); then
     docker rmi "$image" >/dev/null 2>&1 || true
     die "could not run 'version' in $image"
@@ -499,14 +557,14 @@ app_files() {
 }
 
 # write_ship_yaml builds the human-readable, generated /opt/apps/ship.yaml from
-# every app's last-deployed ship-app.yaml. The local ship.yaml stays the source
-# of truth; this file is only a record of what was deployed.
+# every app's last-deployed ship-app.yaml. It is a record of what is running,
+# not the source of truth (that is each app's desired configuration).
 write_ship_yaml() {
   local f app tmp first=1
   tmp=$(mktemp "$APPS/.ship.yaml.XXXXXX")
   {
     printf '# Generated by ship from each app record on this server.\n'
-    printf '# Read-only: every deploy rewrites this file; edit your local ship.yaml instead.\n'
+    printf '# Read-only: every deploy rewrites this file; use ship app/config to edit desired config.\n'
     for f in "$APPS"/*/ship-app.yaml; do
       [ -f "$f" ] || continue
       [ ! -L "$f" ] || continue
@@ -553,6 +611,248 @@ app_export() {
   fi
 }
 
+# read_limited_stdin copies stdin to a file, refusing an empty or oversized
+# upload. Every new command uses it so a client cannot fill the disk.
+read_limited_stdin() {
+  local f=$1 limit=$2 size
+  head -c $((limit + 1)) > "$f"
+  size=$(stat -c %s "$f")
+  [ "$size" -gt 0 ] || die "empty upload on stdin"
+  [ "$size" -le "$limit" ] || die "upload is larger than $limit bytes"
+}
+
+# check_put_tar validates a desired-config tar. Members are plain basenames from
+# the caller's allowed set; no paths, links or duplicates.
+check_put_tar() {
+  local tarfile=$1
+  shift
+  local -A allowed_names=() seen=()
+  local name
+  for name in "$@"; do allowed_names[$name]=1; done
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    case "$name" in
+      /*|*..*|*/*|*\\*) die "unexpected app file in upload: '$name'" ;;
+    esac
+    [ -n "${allowed_names[$name]:-}" ] || die "unexpected app file in upload: '$name'"
+    [ -z "${seen[$name]:-}" ] || die "duplicate app file in upload: '$name'"
+    seen[$name]=1
+  done < <(tar -tf "$tarfile")
+}
+
+check_extracted_files() {
+  local dir=$1
+  shift
+  local name size
+  for name in "$@"; do
+    [ -f "$dir/$name" ] || die "upload member '$name' is not a regular file"
+    [ ! -L "$dir/$name" ] || die "upload member '$name' is a link"
+    size=$(stat -c %s "$dir/$name")
+    [ "$size" -le "$PUT_FILE_LIMIT" ] || die "upload member '$name' is larger than $PUT_FILE_LIMIT bytes"
+    if [ "$(id -u)" = 0 ]; then
+      chown root:root "$dir/$name"
+    fi
+    chmod 0644 "$dir/$name"
+  done
+}
+
+# app_put atomically replaces one app's desired configuration. The expected
+# hash is what config-export returned when the client loaded the record; a
+# mismatch means another machine changed it in between.
+app_put() {
+  local app=${1:-} expected=${2:-} work state tmp hash cur old
+  [[ $app =~ $APP_RE ]] || die "invalid app name '$app'"
+  state="$APPS/$app/.ship"
+  work=$(mktmp)
+  read_limited_stdin "$work/files.tar" "$PUT_TOTAL_LIMIT"
+  check_put_tar "$work/files.tar" ship-app.yaml compose.yaml Dockerfile .ship-meta .ship-env .ship-deploy.sh
+  local -A seen=()
+  while IFS= read -r name; do
+    [ -n "$name" ] && seen[$name]=1
+  done < <(tar -tf "$work/files.tar")
+  [ -n "${seen[ship-app.yaml]:-}" ] || die "upload is missing ship-app.yaml"
+  [ -n "${seen[compose.yaml]:-}" ] || die "upload is missing compose.yaml"
+  [ -n "${seen[.ship-meta]:-}" ] || die "upload is missing .ship-meta"
+  [ -n "${seen[.ship-env]:-}" ] || die "upload is missing .ship-env"
+
+  hash=$(sha256sum "$work/files.tar" | cut -d' ' -f1)
+  install -d -m 0755 "$state"
+  tmp=$(mktemp -d "$state/.put.XXXXXX")
+  printf '%s\n' "$tmp" >> "$TMPLIST"
+  tar --no-same-owner --no-same-permissions -xf "$work/files.tar" -C "$tmp"
+  check_extracted_files "$tmp" "${!seen[@]}"
+
+  lock_state
+  cur=""
+  if [ -f "$state/desired.hash" ]; then
+    cur=$(cat "$state/desired.hash")
+  fi
+  if [ -n "$cur" ] || [ -d "$state/desired" ]; then
+    [ "$expected" = "$cur" ] || die "app '$app' changed on the server since you loaded it; run the command again to reload it"
+  else
+    [ -z "$expected" ] || die "app '$app' changed on the server since you loaded it; run the command again to reload it"
+  fi
+  old="$state/.desired.old.$$"
+  rm -rf "$old"
+  [ ! -d "$state/desired" ] || mv "$state/desired" "$old"
+  mv "$tmp" "$state/desired"
+  rm -rf "$old"
+  printf '%s\n' "$hash" > "$state/desired.hash.tmp"
+  chmod 0644 "$state/desired.hash.tmp"
+  mv -f "$state/desired.hash.tmp" "$state/desired.hash"
+  unlock_state
+  printf 'hash=%s\n' "$hash"
+}
+
+# app_remove deletes an app's desired configuration and stops its running stack.
+# Data directories and .env are deliberately kept.
+app_remove() {
+  local app=${1:-} expected=${2:-} state f cur
+  [[ $app =~ $APP_RE ]] || die "invalid app name '$app'"
+  state="$APPS/$app/.ship"
+  lock_state
+  cur=""
+  [ -f "$state/desired.hash" ] && cur=$(cat "$state/desired.hash")
+  [ -n "$cur" ] || die "app '$app' has no desired configuration on this server"
+  [ "$expected" = "$cur" ] || die "app '$app' changed on the server since you loaded it; run the command again to reload it"
+  if [ -f "$APPS/$app/.ship-meta" ]; then
+    note "stopping $app"
+    compose_app "$app" down >/dev/null 2>&1 || true
+  fi
+  rm -rf "$state"
+  for f in ship-app.yaml compose.yaml Dockerfile .ship-meta .ship-env .ship-deploy.sh .ship-state .ship.env; do
+    rm -f "$APPS/$app/$f"
+  done
+  write_ship_yaml
+  unlock_state
+  note "removed desired configuration for $app (data directories and .env kept)"
+}
+
+# server_put replaces the desired server-wide settings. The tar carries exactly
+# one server.yaml.
+server_put() {
+  local expected=${1:-} work tmp hash cur
+  work=$(mktmp)
+  read_limited_stdin "$work/files.tar" "$PUT_FILE_LIMIT"
+  check_put_tar "$work/files.tar" server.yaml
+  local -A seen=()
+  while IFS= read -r name; do
+    [ -n "$name" ] && seen[$name]=1
+  done < <(tar -tf "$work/files.tar")
+  [ -n "${seen[server.yaml]:-}" ] || die "upload is missing server.yaml"
+
+  hash=$(sha256sum "$work/files.tar" | cut -d' ' -f1)
+  install -d -m 0755 "$STATE"
+  tmp=$(mktemp -d "$STATE/.server-put.XXXXXX")
+  printf '%s\n' "$tmp" >> "$TMPLIST"
+  tar --no-same-owner --no-same-permissions -xf "$work/files.tar" -C "$tmp"
+  check_extracted_files "$tmp" server.yaml
+
+  lock_state
+  cur=""
+  [ -f "$STATE/server.hash" ] && cur=$(cat "$STATE/server.hash")
+  if [ -n "$cur" ] || [ -f "$STATE/server.yaml" ]; then
+    [ "$expected" = "$cur" ] || die "server settings changed on the server since you loaded them; run the command again to reload"
+  else
+    [ -z "$expected" ] || die "server settings changed on the server since you loaded them; run the command again to reload"
+  fi
+  mv -f "$tmp/server.yaml" "$STATE/server.yaml.tmp"
+  chmod 0644 "$STATE/server.yaml.tmp"
+  mv -f "$STATE/server.yaml.tmp" "$STATE/server.yaml"
+  printf '%s\n' "$hash" > "$STATE/server.hash.tmp"
+  chmod 0644 "$STATE/server.hash.tmp"
+  mv -f "$STATE/server.hash.tmp" "$STATE/server.hash"
+  unlock_state
+  printf 'hash=%s\n' "$hash"
+}
+
+# setup_record records that setup already matches these settings. config push
+# uses it for a legacy server whose old local file was what setup was run from,
+# without forcing a heavy re-setup.
+setup_record() {
+  local admin=${1:-} appspec=${2:-} pair app uid pairs
+  [[ $admin =~ $USER_RE ]] || die "invalid admin user '$admin'"
+  [ "$admin" != root ] || die "admin_user must not be root"
+  [ "$admin" != deploy ] || die "admin_user must not be deploy"
+  if [ -n "$appspec" ]; then
+    IFS=',' read -ra pairs <<< "$appspec"
+    for pair in "${pairs[@]}"; do
+      app=${pair%%:*}
+      uid=${pair#*:}
+      [ "$pair" = "$app:$uid" ] || die "invalid app spec '$pair'"
+      [[ $app =~ $APP_RE ]] || die "invalid app name '$app'"
+      [[ $uid =~ ^[0-9]+$ ]] || die "invalid uid '$uid'"
+    done
+  fi
+  install -d -m 0755 "$STATE"
+  lock_state
+  {
+    printf 'admin_user=%s\n' "$admin"
+    printf 'apps=%s\n' "$appspec"
+  } > "$STATE/applied-setup.yaml.tmp"
+  chmod 0644 "$STATE/applied-setup.yaml.tmp"
+  mv -f "$STATE/applied-setup.yaml.tmp" "$STATE/applied-setup.yaml"
+  unlock_state
+  note "recorded setup as applied for $admin"
+}
+
+# config_export streams the desired configuration, the running records and the
+# last applied setup/proxy facts as one bounded tar. It never exports secrets.
+config_export() {
+  local stage app d dst src size total=0
+  stage=$(mktmp)
+  mkdir -p "$stage/config" "$stage/proxy"
+  for pair in "server.yaml:config/server.yaml" "server.hash:config/server.hash" "applied-setup.yaml:config/applied-setup.yaml" "applied-proxy.yaml:config/applied-proxy.yaml"; do
+    src="$STATE/${pair%%:*}"
+    dst="$stage/${pair#*:}"
+    [ -f "$src" ] && { cp -f "$src" "$dst"; chmod 0644 "$dst"; }
+  done
+  if [ -f "$PROXY/Caddyfile" ]; then
+    cp -f "$PROXY/Caddyfile" "$stage/proxy/Caddyfile"
+    chmod 0644 "$stage/proxy/Caddyfile"
+  fi
+  local want=""
+  if [ -f "$PROXY/.env" ]; then
+    want=$(sed -n 's/^CADDY_IMAGE=//p' "$PROXY/.env" | tail -n1)
+    printf '%s\n' "$want" > "$stage/proxy/desired-image"
+  fi
+  local id running=""
+  id=$(compose_proxy ps -q caddy 2>/dev/null | head -n1 || true)
+  if [ -n "$id" ]; then
+    running=$(docker inspect -f '{{.Config.Image}}' "$id" 2>/dev/null || true)
+  fi
+  printf '%s\n' "$running" > "$stage/proxy/running-image"
+  printf '%s\n' "$(uname -m)" > "$stage/config/arch"
+
+  for d in "$APPS"/*; do
+    [ -d "$d" ] || continue
+    [ ! -L "$d" ] || continue
+    app=$(basename "$d")
+    [[ $app =~ $APP_RE ]] || continue
+    if [ -d "$d/.ship/desired" ]; then
+      mkdir -p "$stage/desired/$app"
+      for f in ship-app.yaml compose.yaml Dockerfile; do
+        [ -f "$d/.ship/desired/$f" ] && cp -f "$d/.ship/desired/$f" "$stage/desired/$app/$f"
+      done
+      [ -f "$d/.ship/desired.hash" ] && cp -f "$d/.ship/desired.hash" "$stage/desired/$app/.hash"
+    fi
+    if [ -f "$d/.ship-meta" ]; then
+      mkdir -p "$stage/running/$app"
+      for f in ship-app.yaml compose.yaml Dockerfile .ship-meta .ship-state; do
+        [ -f "$d/$f" ] && cp -f "$d/$f" "$stage/running/$app/$f"
+      done
+    fi
+  done
+  # Refuse to stream more than the CLI will accept.
+  while IFS= read -r f; do
+    size=$(stat -c %s "$f")
+    total=$((total + size))
+    [ "$total" -le "$EXPORT_TOTAL_LIMIT" ] || die "configuration on this server is larger than $EXPORT_TOTAL_LIMIT bytes"
+  done < <(find "$stage" -type f)
+  # Only files (never directory entries), with names relative to the stage root.
+  ( cd "$stage" && find . -type f -printf '%P\n' | sort | tar -cf - -T - )
+}
+
 # image_load takes a gzip-compressed docker save stream on stdin and verifies
 # that the expected tag ended up in the local image store.
 image_load() {
@@ -581,7 +881,7 @@ rollback_to() {
 }
 
 deploy_script_present() {
-  local f="$APPS/$1/.ship-deploy.sh"
+  local f="${META_DIR:-$APPS/$1}/.ship-deploy.sh"
   [ -f "$f" ] && [ -s "$f" ]
 }
 
@@ -597,7 +897,7 @@ run_deploy_commands() {
   # changed, so a later failure must leave the maintenance page on.
   DEPLOY_COMMANDS_RAN=1
   compose_app "$app" run --rm --no-deps -T --entrypoint sh "$svc" -e -s \
-    < "$APPS/$app/.ship-deploy.sh"
+    < "${META_DIR:-$APPS/$app}/.ship-deploy.sh"
 }
 
 # take_backup runs backup_app in a subshell with errexit so a failure stops it
@@ -618,13 +918,23 @@ take_backup() {
 
 restore_previous_image() {
   local app=$1 prev=$2 prevprev=$3 resolved=$4
+  # Always restore with the running files, never the desired config that just
+  # failed to come up.
+  META_DIR=
+  APP_COMPOSE_FILE=
   if [ -n "$prev" ] && [ "$prev" != "$resolved" ]; then
     rollback_to "$app" "$prev" "$prevprev"
   elif [ -z "$prev" ]; then
     note "no previous version; stopping $app"
     compose_app "$app" stop || true
   else
-    note "keeping the running $prev container"
+    note "restoring the running $prev configuration"
+    write_ship_env "$app" "$(image_for "$app" "$prev")"
+    if compose_app "$app" up -d --wait --wait-timeout 120; then
+      is_healthy "$app" || note "warning: $app is not healthy after restoring the running configuration"
+    else
+      note "warning: could not restore the running configuration for $app"
+    fi
   fi
 }
 
@@ -650,13 +960,50 @@ recovery_hint() {
   note "  ship $server maintenance off $app"
 }
 
-# deploy_app switches one app to a version. run_commands is "no" for rollback,
-# because the uploaded deploy script belongs to the version being rolled back
-# from, not to the image being restored.
+# promote_desired copies the app's desired configuration over the running files
+# after a successful deploy. The previous running files are replaced
+# atomically enough for the next command; .env and data directories are never
+# touched.
+promote_desired() {
+  local app=$1 d f
+  d=${DEPLOY_SNAPSHOT:-$(desired_dir "$app")}
+  install -d -m 0755 "$APPS/$app"
+  lock_state
+  for f in ship-app.yaml compose.yaml Dockerfile .ship-meta .ship-env .ship-deploy.sh; do
+    if [ -f "$d/$f" ]; then
+      cp -f "$d/$f" "$APPS/$app/$f"
+      chmod 0644 "$APPS/$app/$f"
+    elif [ "$f" = Dockerfile ]; then
+      rm -f "$APPS/$app/Dockerfile"
+    fi
+  done
+  write_ship_yaml
+  unlock_state
+}
+
+# deploy_app switches one app to a version. It normally reads the desired
+# configuration and promotes desired -> running once the app is healthy.
+# config=running is used by rollback: it reads the running files and never
+# promotes. run_commands is "no" for rollback, because the deploy script
+# belongs to the version being rolled back from, not to the restored image.
 deploy_app() {
-  local app=$1 version=$2 run_commands=${3:-yes}
-  local source prev prevprev image resolved maintenance archive deploy_script
-  validate_app "$app"
+  local app=$1 version=$2 run_commands=${3:-yes} config=${4:-desired}
+  local source prev prevprev image resolved maintenance archive deploy_script desired
+  if [ "$config" = running ]; then
+    validate_app "$app"
+  else
+    validate_desired_app "$app"
+    # Deploy from a snapshot so an app-put during the deploy can't change what
+    # gets promoted to running.
+    desired=$(mktmp)
+    lock_state
+    cp -a "$(desired_dir "$app")"/. "$desired"/
+    unlock_state
+    DEPLOY_SNAPSHOT=$desired
+    META_DIR=$desired
+    APP_COMPOSE_FILE=$desired/compose.yaml
+  fi
+  install -d -m 0755 "$APPS/$app"
   source=$(meta_get "$app" source)
   case "$source" in
     github-release)
@@ -673,15 +1020,15 @@ deploy_app() {
   maintenance=$(meta_get "$app" maintenance)
   [ "$maintenance" = on ] || maintenance=off
 
-  if [ "$prev" = "$version" ] && is_healthy "$app"; then
-    note "$app $version is already running and healthy"
+  if [ "$config" = desired ] && [ "$prev" = "$version" ] && is_healthy "$app" && desired_matches_running "$app"; then
+    note "$app $version is already running with the desired configuration"
     [ "$maintenance" = on ] && { maintenance_app "$app" off || true; }
     return 0
   fi
 
   if [ "$maintenance" = on ]; then
     maintenance_mount \
-      || die "the proxy has no maintenance mount; run 'ship $(server_label "$app") setup' then 'ship $(server_label "$app") proxy update'"
+      || die "the proxy has no maintenance mount; run 'ship $(server_label "$app") setup' then 'ship $(server_label "$app") proxy sync'"
   fi
 
   RESOLVED_TAG=
@@ -695,6 +1042,14 @@ deploy_app() {
   resolved=$RESOLVED_TAG
   [ -n "$image" ] || die "no image was produced"
   [ -n "$resolved" ] || die "no resolved version was produced"
+
+  # A resolved version can match even when the request said latest or an image
+  # app built the same version again.
+  if [ "$config" = desired ] && [ "$prev" = "$resolved" ] && is_healthy "$app" && desired_matches_running "$app"; then
+    note "$app $resolved is already running with the desired configuration"
+    [ "$maintenance" = on ] && { maintenance_app "$app" off || true; }
+    return 0
+  fi
 
   # Data directories need no maintenance page; create them before it goes on.
   ensure_data_dirs "$app"
@@ -733,6 +1088,8 @@ deploy_app() {
     if ! run_deploy_commands "$app"; then
       note "deploy commands for $app failed; logs:"
       compose_app "$app" logs --tail 60 || true
+      META_DIR=
+      APP_COMPOSE_FILE=
       restore_previous_image "$app" "$prev" "$prevprev" "$resolved"
       recovery_hint "$app" "$archive"
       exit 1
@@ -750,12 +1107,17 @@ deploy_app() {
     if [ "$maintenance" = on ]; then
       maintenance_app "$app" off
     fi
+    if [ "$config" = desired ]; then
+      promote_desired "$app"
+    fi
     note "$app $resolved is running and healthy"
     return 0
   fi
 
   note "deploy of $app $resolved failed; logs:"
   compose_app "$app" logs --tail 60 || true
+  META_DIR=
+  APP_COMPOSE_FILE=
   restore_previous_image "$app" "$prev" "$prevprev" "$resolved"
   if [ "$DEPLOY_COMMANDS_RAN" = 1 ]; then
     note "deploy commands ran for $app; leaving the maintenance page ON"
@@ -773,7 +1135,7 @@ rollback_app() {
   prev=$(state_get "$app" previous)
   [[ $prev =~ $VER_RE ]] || die "no previous version recorded for $app"
   note "rolling back $app from ${current:-none} to $prev. The database is not restored."
-  deploy_app "$app" "$prev" no
+  deploy_app "$app" "$prev" no running
 }
 
 restart_app() {
@@ -997,10 +1359,14 @@ do_reboot() {
   systemctl reboot
 }
 
-proxy_update() {
-  local image=${1:-} work new prev
+# proxy_activate installs a rendered Caddyfile and the desired image. mode
+# "sync" reloads Caddy; mode "restart" recreates the container so pending
+# configuration always takes effect.
+proxy_activate() {
+  local image=${1:-} mode=${2:-sync} work new prev sha
   [[ $image =~ $IMAGE_RE ]] || die "invalid caddy image '$image'"
-  install -d -m 0755 "$PROXY"
+  [ "$mode" = sync ] || [ "$mode" = restart ] || die "invalid proxy mode '$mode'"
+  install -d -m 0755 "$PROXY" "$STATE"
 
   work=$(mktmp)
   new="$work/Caddyfile"
@@ -1026,8 +1392,16 @@ proxy_update() {
   printf 'CADDY_IMAGE=%s\n' "$image" > "$PROXY/.env"
   chmod 0644 "$PROXY/.env"
 
-  if ! compose_proxy up -d --wait --wait-timeout 60 || ! reload_caddy; then
-    note "proxy update failed; restoring the previous Caddyfile"
+  local ok=1
+  if [ "$mode" = restart ]; then
+    compose_proxy up -d --force-recreate --wait --wait-timeout 60 || ok=0
+  else
+    if ! compose_proxy up -d --wait --wait-timeout 60 || ! reload_caddy; then
+      ok=0
+    fi
+  fi
+  if [ "$ok" != 1 ]; then
+    note "proxy sync failed; restoring the previous Caddyfile"
     if [ -f "$prev" ]; then
       cat "$prev" > "$PROXY/Caddyfile"
       compose_proxy up -d --wait --wait-timeout 60 || true
@@ -1036,9 +1410,22 @@ proxy_update() {
       rm -f "$PROXY/Caddyfile"
       compose_proxy down || true
     fi
-    die "proxy update failed"
+    die "proxy sync failed"
   fi
-  note "proxy reloaded; previous Caddyfile kept at $prev"
+  sha=$(sha256sum "$PROXY/Caddyfile" | cut -d' ' -f1)
+  install -d -m 0755 "$STATE"
+  {
+    printf 'caddyfile_sha256=%s\n' "$sha"
+    printf 'caddy_image=%s\n' "$image"
+    printf 'mode=%s\n' "$mode"
+  } > "$STATE/applied-proxy.yaml.tmp"
+  chmod 0644 "$STATE/applied-proxy.yaml.tmp"
+  mv -f "$STATE/applied-proxy.yaml.tmp" "$STATE/applied-proxy.yaml"
+  note "proxy $mode complete; previous Caddyfile kept at $prev"
+}
+
+proxy_update() {
+  proxy_activate "${1:-}" sync
 }
 
 setup_server() {
@@ -1193,11 +1580,11 @@ PY
   docker compose version
 
   step "directories and proxy stack"
-  install -d -m 0755 "$APPS" "$PROXY"
+  install -d -m 0755 "$APPS" "$PROXY" "$STATE"
   install -d -m 0755 "$PROXY/maintenance"
   install -d -m 0700 "$BACKUPS"
   cat > "$PROXY/compose.yaml" <<'YAML'
-# Caddy for every app on this VPS. Managed by ship; edit ship.yaml instead.
+# Caddy for every app on this VPS. Managed by ship; edit desired config instead.
 name: proxy
 
 x-logging: &logging
@@ -1237,7 +1624,7 @@ YAML
   chmod 0644 "$PROXY/.env"
   if [ ! -f "$PROXY/Caddyfile" ]; then
     # shellcheck disable=SC2016 # literal backticks
-    printf '# Run `ship proxy update` to render sites.\n' > "$PROXY/Caddyfile"
+    printf '# Run `ship proxy sync` to render sites.\n' > "$PROXY/Caddyfile"
     chmod 0644 "$PROXY/Caddyfile"
   fi
 
@@ -1266,6 +1653,14 @@ EOF
   chmod 0644 /etc/systemd/system/ship-backup.service /etc/systemd/system/ship-backup.timer
   systemctl daemon-reload
   systemctl enable --now ship-backup.timer >/dev/null
+
+  install -d -m 0755 "$STATE"
+  {
+    printf 'admin_user=%s\n' "$admin"
+    printf 'apps=%s\n' "$appspec"
+  } > "$STATE/applied-setup.yaml.tmp"
+  chmod 0644 "$STATE/applied-setup.yaml.tmp"
+  mv -f "$STATE/applied-setup.yaml.tmp" "$STATE/applied-setup.yaml"
 
   step "done"
   note "setup complete. Next: ssh $admin@<host> sudo true, then ship lock-ssh"
@@ -1321,6 +1716,38 @@ main() {
     proxy-update)
       [ $# -eq 1 ] || die "usage: ship-agent proxy-update <caddy-image>"
       proxy_update "$1"
+      ;;
+    proxy-sync)
+      [ $# -eq 1 ] || die "usage: ship-agent proxy-sync <caddy-image>"
+      proxy_activate "$1" sync
+      ;;
+    proxy-restart)
+      [ $# -eq 1 ] || die "usage: ship-agent proxy-restart <caddy-image>"
+      proxy_activate "$1" restart
+      ;;
+    app-put)
+      [ $# -eq 2 ] || die "usage: ship-agent app-put <app> <expected-hash>"
+      app_put "$1" "$2"
+      ;;
+    app-remove)
+      [ $# -eq 2 ] || die "usage: ship-agent app-remove <app> <expected-hash>"
+      app_remove "$1" "$2"
+      ;;
+    server-put)
+      [ $# -eq 1 ] || die "usage: ship-agent server-put <expected-hash>"
+      server_put "$1"
+      ;;
+    setup-record)
+      [ $# -eq 2 ] || die "usage: ship-agent setup-record <admin-user> <app:uid,...>"
+      setup_record "$1" "$2"
+      ;;
+    config-export)
+      [ $# -eq 0 ] || die "usage: ship-agent config-export"
+      config_export
+      ;;
+    arch)
+      [ $# -eq 0 ] || die "usage: ship-agent arch"
+      uname -m
       ;;
     app-files)
       [ $# -eq 1 ] || die "usage: ship-agent app-files <app>"

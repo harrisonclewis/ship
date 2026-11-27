@@ -1,23 +1,12 @@
 package render
 
 import (
-	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/harrisonclewis/ship/internal/config"
 )
 
 func TestCaddyfileMaintenanceForDomainsAndRedirects(t *testing.T) {
-	c, err := config.Load(filepath.Join("testdata", "ship.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv, err := c.Server("prod")
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := Caddyfile(srv)
+	got := CaddyfileFor(goldenApps())
 	for _, want := range []string{
 		"@maintenance file {",
 		"root /etc/caddy/maintenance",

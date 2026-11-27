@@ -188,69 +188,6 @@ func (r *serverExportRunner) Output(c remote.Cmd) ([]byte, error) {
 	return []byte("version=" + strconv.Itoa(remote.AgentProtocol) + "\nsha256=" + hex.EncodeToString(sum[:]) + "\n"), nil
 }
 
-func TestUploadAppFilesIncludesCanonicalRecord(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "apps", "app"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	compose := []byte("name: app\n")
-	if err := os.WriteFile(filepath.Join(dir, "apps", "app", "compose.yaml"), compose, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	srv := &config.Server{
-		Name: "prod",
-		Dir:  dir,
-		Apps: map[string]*config.App{
-			"app": {Domains: []string{"app.example.com"}, Upstream: "app:8080",
-				Source: config.Source{Type: "image", Path: filepath.Join(dir, "src")}},
-		},
-	}
-	var sent []byte
-	r := &fakeRunner{onRun: func(c remote.Cmd) error {
-		if c.Stdin != nil {
-			sent, _ = io.ReadAll(c.Stdin)
-		}
-		return nil
-	}}
-	op := New(&config.Config{Servers: map[string]*config.Server{"prod": srv}}, Options{Runner: r, Out: io.Discard})
-	if err := op.uploadAppFilesForTest(context.Background(), srv, "app"); err != nil {
-		t.Fatal(err)
-	}
-	tr := tar.NewReader(bytes.NewReader(sent))
-	found := false
-	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		if hdr.Name != "ship-app.yaml" {
-			continue
-		}
-		var buf bytes.Buffer
-		_, _ = io.Copy(&buf, tr)
-		found = true
-		if strings.Contains(buf.String(), "path:") {
-			t.Fatalf("record leaked source.path:\n%s", buf.String())
-		}
-	}
-	if !found {
-		t.Fatal("ship-app.yaml missing from the upload")
-	}
-}
-
-// uploadAppFilesForTest keeps the test independent of the session's dry-run
-// printing.
-func (o *Ops) uploadAppFilesForTest(ctx context.Context, srv *config.Server, name string) error {
-	s, _, err := o.session(ctx, srv.Name)
-	if err != nil {
-		return err
-	}
-	return uploadAppFiles(s, srv, name)
-}
-
 func TestUnifiedDiff(t *testing.T) {
 	if got := UnifiedDiff("a", "b", []byte("same\n"), []byte("same\n")); got != "" {
 		t.Fatalf("identical files produced a diff: %q", got)
@@ -293,7 +230,7 @@ func TestCompareServerApps(t *testing.T) {
 	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(path)
+	cfg, err := config.LoadOld(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +304,7 @@ func TestImportRefusesAndOverwritesWithBackups(t *testing.T) {
 	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(path)
+	cfg, err := config.LoadOld(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +316,7 @@ func TestImportRefusesAndOverwritesWithBackups(t *testing.T) {
 		tarMember{name: "web/Dockerfile", data: []byte("FROM scratch\n")},
 	)
 	runner := &serverExportRunner{export: export}
-	op := New(cfg, Options{
+	op := New(cfg, Options{Agent: testAgent,
 		Runner: runner,
 		Out:    io.Discard,
 		ErrOut: io.Discard,
@@ -406,7 +343,7 @@ func TestImportRefusesAndOverwritesWithBackups(t *testing.T) {
 	if len(summary.Imported) != 1 {
 		t.Fatalf("summary = %+v", summary)
 	}
-	loaded, err := config.Load(path)
+	loaded, err := config.LoadOld(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -465,11 +402,11 @@ func TestServerAppsExplainsOlderAgent(t *testing.T) {
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(path)
+	cfg, err := config.LoadOld(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	op := New(cfg, Options{Runner: &oldAgentRunner{}, Out: io.Discard, ErrOut: io.Discard})
+	op := New(cfg, Options{Agent: testAgent, Runner: &oldAgentRunner{}, Out: io.Discard, ErrOut: io.Discard})
 	_, err = op.ServerApps(context.Background(), "prod")
 	if err == nil {
 		t.Fatal("older agent did not fail")
@@ -491,12 +428,12 @@ func TestServerAppsReadsUnderDryRun(t *testing.T) {
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(path)
+	cfg, err := config.LoadOld(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	export := buildExport(t, tarMember{name: "app/compose.yaml", data: []byte("name: app\n")})
-	op := New(cfg, Options{DryRun: true, Runner: &serverExportRunner{export: export}, Out: io.Discard, ErrOut: io.Discard})
+	op := New(cfg, Options{Agent: testAgent, DryRun: true, Runner: &serverExportRunner{export: export}, Out: io.Discard, ErrOut: io.Discard})
 	apps, err := op.ServerApps(context.Background(), "prod")
 	if err != nil {
 		t.Fatal(err)
@@ -553,7 +490,7 @@ func TestImportSkipsIdenticalFilesAndOnlyConflictsOnDifferentOnes(t *testing.T) 
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(path)
+	cfg, err := config.LoadOld(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -581,7 +518,7 @@ func TestImportSkipsIdenticalFilesAndOnlyConflictsOnDifferentOnes(t *testing.T) 
 		tarMember{name: "diff/ship-app.yaml", data: appRecordYAML(t, "")},
 		tarMember{name: "diff/compose.yaml", data: []byte("name: new\n")},
 	)
-	op := New(cfg, Options{Runner: &serverExportRunner{export: export}, Out: io.Discard, ErrOut: io.Discard})
+	op := New(cfg, Options{Agent: testAgent, Runner: &serverExportRunner{export: export}, Out: io.Discard, ErrOut: io.Discard})
 
 	summary, err := op.Import(context.Background(), ImportRequest{Server: "prod", Apps: []string{"same"}})
 	if err != nil {

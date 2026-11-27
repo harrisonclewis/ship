@@ -58,8 +58,10 @@ The binary embeds `ship-agent`, so there is nothing else to copy to the server. 
 
 | Tool | Why |
 |---|---|
-| OpenSSH client | every server action runs over `ssh`. On Windows, install the [OpenSSH Client](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse) and use Windows Terminal |
-| Docker with buildx | only for [image apps](guides/deploy-an-app.md#image-apps), which are built on your machine |
+| OpenSSH client | every remote server action runs over `ssh`; on Windows, install the [OpenSSH Client](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse) and use Windows Terminal. Not needed when ship runs on the server itself with `connection: local` |
+| Docker with buildx | only for [image apps](guides/deploy-an-app.md#image-apps), which are built on the machine running ship. On the server itself, the user needs access to the Docker daemon (the `docker` group or root) |
 | git | only for image apps, to name the version |
 
 Then [add a server](guides/add-a-server.md) or follow the [quick start](quick-start.md).
+
+You can also install ship on the VPS it manages and use a [local connection](guides/run-on-the-server.md). The same commands and TUI work without SSH from another machine; ship installs its agent locally and applies the sudo rules described in that guide.

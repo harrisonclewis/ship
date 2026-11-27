@@ -9,23 +9,19 @@ servers:
   prod:
     host: root@203.0.113.10   # first setup only
     identity_file: ~/.ssh/prod
-    admin_user: ops
-    arch: linux/amd64
-    caddy_image: caddy:2.10-alpine
-    apps: {}
+    sources:
+      web: ~/code/web          # optional, image apps built on this machine
 ```
 
 - `host` is the ssh destination. Use `root@<ip>` for the very first setup; setup copies root's authorised keys to the admin user.
 - `identity_file` is optional. Without it, ssh uses your ssh config and agent.
-- `admin_user` defaults to `ops`.
-- `arch` defaults to `linux/amd64`.
-- `caddy_image` defaults to `caddy:2.10-alpine`.
+- `sources` maps an app to its local checkout for image builds. It is optional and never uploaded.
 
-All keys are in [ship.yaml](../reference/ship-yaml.md#keys). Server names follow the app name rules and can't be a command name or `all`.
+There are no local `admin_user`, `arch`, `caddy_image` or `apps` keys. `admin_user` and `caddy_image` are desired server settings, and `arch` is detected from `uname -m`.
+
+Local keys are in [ship.yaml](../reference/ship-yaml.md#keys). Server names follow the app name rules and can't be a command name or `all`.
 
 With only one server in `ship.yaml`, you can leave the server name out of commands: `ship setup`, `ship deploy hello`.
-
-From the TUI, press `a` on the Servers tab, fill in the form and press `Enter`. Editing an existing server is `e` on the Servers tab or on the server page.
 
 ## 2. Point DNS at the server
 
@@ -33,11 +29,20 @@ Create A/AAAA records for every app domain and redirect before or shortly after 
 
 ## 3. Prepare the server
 
+Set any non-default server settings first:
+
+```sh
+ship prod server set admin_user <name>
+ship prod server set caddy_image caddy:2.10-alpine
+```
+
+The examples below use the default admin user `ops`. Then:
+
 ```sh
 ship prod setup
 ```
 
-Setup installs packages and Docker, creates the admin user with root's SSH keys and passwordless sudo, creates the `deploy` user for CI and app users for configured `uid`s, adds firewall rules, and creates the Docker network, proxy stack directories and nightly backup timer.
+Setup reads desired server settings, defaulting to `admin_user: ops` and `caddy_image: caddy:2.10-alpine`, and reads the app uid list from the server's desired records. It installs packages and Docker, creates the admin user with root's SSH keys and passwordless sudo, creates the `deploy` user for CI and app users for desired `uid`s, adds firewall rules, and creates the Docker network, proxy stack directories and nightly backup timer.
 
 ## 4. Lock SSH down
 
@@ -53,20 +58,26 @@ Change `host` to `ops@<ip>` in `ship.yaml`, then:
 ship prod lock-ssh
 ```
 
-`lock-ssh` disables root and password logins and allows only `admin_user` and `deploy`. It refuses to run if the admin user has no authorised keys.
+`lock-ssh` disables root and password logins and allows only the desired `admin_user` and `deploy`. It refuses to run if the admin user has no authorised keys.
 
 ## 5. Activate the proxy
 
 ```sh
-ship prod proxy update
+ship prod proxy sync
 ```
 
-This renders the Caddyfile from `ship.yaml`, validates it in a container, swaps it in and reloads Caddy. Run it again after adding or changing domains and apps. Then [deploy](deploy-an-app.md).
+This renders the Caddyfile from the server's desired records, validates it in a container, activates the desired `caddy_image` and reloads Caddy. It does not force a container restart. Run it after deploying a new app. After changing domains or redirects, use `proxy restart` to apply every pending change:
+
+```sh
+ship prod proxy restart
+```
+
+Apps that have never been deployed are left out of the Caddyfile. Then [add an app](add-an-app.md).
 
 ## What setup does
 
 - Installs packages, including Docker from Docker's repository, and runs a full upgrade.
-- Creates `admin_user` (`ops` by default) with root's SSH keys and passwordless sudo, the `deploy` user, and app users for configured `uid`s.
+- Creates the desired `admin_user` with root's SSH keys and passwordless sudo, the `deploy` user, and app users for the desired `uid`s.
 - Adds ufw rules for SSH, 80 and 443, keeping existing rules.
 - Turns on unattended security updates, including an automatic reboot at 04:00 UTC when one is needed.
 - Adds 2 GB swap if the server has none, and caps Docker logs at 10 MB × 3 files.
@@ -74,14 +85,13 @@ This renders the Caddyfile from `ship.yaml`, validates it in a container, swaps 
 
 It is safe to re-run and does not overwrite existing swap, ufw rules or users.
 
-After upgrading ship, run this once per server so the Caddy container has the maintenance mount:
+After changing `admin_user` or an app's `uid`, setup is pending until you run it:
 
 ```sh
 ship prod setup
-ship prod proxy update
 ```
 
-Until then, deploys of apps with maintenance turned on stop early and say so.
+`status` and `diff` say when setup is pending.
 
 ## Server layout
 
@@ -89,27 +99,28 @@ Until then, deploys of apps with maintenance turned on stop early and say so.
 |---|---|
 | `/usr/local/sbin/ship-agent` | the agent, installed and updated by the CLI ([details](update-ship.md#the-server-agent)) |
 | `/opt/proxy/` | Caddy compose file, generated Caddyfile and pinned image |
-| `/opt/apps/<name>/` | the app's compose file and state, see below |
+| `/opt/apps/.ship/server.yaml` | desired `admin_user` and `caddy_image` |
+| `/opt/apps/<name>/.ship/desired/` | desired record, compose file and Dockerfile |
+| `/opt/apps/<name>/` | running files and state, see below |
 | `/opt/apps/ship.yaml` | generated, read-only list of every app's last-deployed config |
 | `/var/backups/ship/<name>/` | archives, root 0600 in 0700 directories |
 | `web` network | external Docker network `172.30.0.0/24`; only Caddy publishes ports |
 
-Each `/opt/apps/<name>/` holds:
+Each desired app directory holds:
 
 | File | What |
 |---|---|
-| `compose.yaml` | uploaded from `apps/<name>/compose.yaml` |
-| `ship-app.yaml` | the app's last-deployed config ([server records](use-from-another-machine.md)) |
+| `ship-app.yaml` | the authoritative app record |
+| `compose.yaml` | the authoritative compose file |
 | `Dockerfile` | release apps only |
-| `.ship-meta` | app metadata |
-| `.ship-env` | uploaded non-secret values from `ship.yaml` |
-| `.ship-deploy.sh` | the app's deploy commands, if any |
-| `.ship.env` | generated by the agent from `IMAGE` and `.ship-env` |
-| `.env` | secrets, root 0600, edited with `ship <server> env edit` |
-| `.ship-state` | current and previous image |
+| `.ship-meta` | metadata generated from the record |
+| `.ship-env` | non-secret `env` values generated from the record |
+| `.ship-deploy.sh` | `deploy.commands` generated from the record |
+
+A successful deploy promotes those files to `/opt/apps/<name>/` as the running configuration. The running directory also holds `.ship.env`, `.env` (secrets, root 0600, edited with `ship <server> env edit`) and `.ship-state` (current and previous image).
 
 ## Next steps
 
 - [Add an app](add-an-app.md)
 - [Deploy an app](deploy-an-app.md)
-- [Use ship from another machine](use-from-another-machine.md) if the server already runs apps
+- [Use ship from another machine](use-from-another-machine.md) — just add the host and key

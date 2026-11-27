@@ -7,7 +7,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/harrisonclewis/ship/internal/config"
+	"github.com/harrisonclewis/ship/internal/ops"
 )
 
 func (m *model) View() string {
@@ -79,6 +79,8 @@ func (m *model) crumbs() []string {
 				name = f.server.OriginalName
 			}
 			return []string{"Servers", name, "Edit"}
+		case formServerSettings:
+			return []string{"Servers", f.serverName, "Settings"}
 		case formAddApp:
 			return []string{"Servers", f.app.Server, "New app"}
 		case formEditApp:
@@ -95,8 +97,6 @@ func (m *model) crumbs() []string {
 			return []string{"Servers", f.serverName, f.appName, "Restore"}
 		case formLogsService:
 			return []string{"Servers", f.serverName, f.appName, "Logs"}
-		case formImportApps:
-			return []string{"Servers", f.serverName, "Import"}
 		}
 	case m.page == pageServer:
 		return []string{"Servers", m.serverName}
@@ -144,7 +144,7 @@ func (m *model) hints() []keyHint {
 	case pageServer:
 		return []keyHint{
 			{"enter", "app"}, {"a", "add app"}, {"m", "actions"}, {"d", "deploy all"},
-			{"b", "backup all"}, {"r", "refresh"}, {"esc", "back"}, {"q", "quit"},
+			{"p", "restart Caddy"}, {"r", "refresh"}, {"esc", "back"}, {"q", "quit"},
 		}
 	case pageServerActions, pageAppActions, pageAppEdit:
 		return []keyHint{{"enter", "run"}, {"esc", "back"}, {"q", "quit"}}
@@ -159,7 +159,7 @@ func (m *model) hints() []keyHint {
 	case pageRestorePick:
 		return []keyHint{{"enter", "restore"}, {"p", "local path"}, {"r", "refresh"}, {"esc", "back"}}
 	case pageCompare:
-		return []keyHint{{"u", "use server version"}, {"k/esc", "keep mine"}, {"↑/↓", "scroll"}}
+		return []keyHint{{"esc", "back"}, {"↑/↓", "scroll"}}
 	default:
 		return []keyHint{{"enter", "open"}, {"a", "add server"}, {"e", "edit ship.yaml"}, {"r", "refresh"}, {"tab", "switch"}, {"q", "quit"}}
 	}
@@ -235,11 +235,17 @@ func (m *model) viewServers() string {
 }
 
 func (m *model) serverRow(name string, nameW, ipW, appsW, statusW int, showIP, showApps, selected bool) string {
-	srv, err := m.backend.Server(name)
 	apps := ""
-	if err == nil {
-		names := srv.AppNames()
-		apps = fmt.Sprintf("%d  %s", len(names), joinLimited(names, appsW-4))
+	var appNames []string
+	if report, ok := m.statuses[name]; ok {
+		for _, st := range report.Apps {
+			appNames = append(appNames, st.App)
+		}
+	} else if state := m.serverConfig(name); state != nil {
+		appNames = state.AppNames()
+	}
+	if len(appNames) > 0 {
+		apps = fmt.Sprintf("%d  %s", len(appNames), joinLimited(appNames, appsW-4))
 	}
 	status, kind := m.statusText(name)
 	ip := m.serverHost(name)
@@ -379,19 +385,47 @@ func (m *model) viewServer() string {
 	if srv == nil {
 		return panel("Server", styleError.Render("This server is no longer in ship.yaml."), m.width, m.bodyHeight(), false)
 	}
-	hostLine := infoRow("Host", srv.Host, 10)
-	archLine := infoRow("Admin", srv.AdminUser, 10) + styleMuted.Render(" · ") + styleText.Render(srv.Arch)
+	lines := []string{}
+	for _, line := range m.syncAlertLines(m.serverName) {
+		lines = append(lines, styleWarning.Render("! "+clip(line, m.width-6)))
+	}
+	if len(lines) > 0 {
+		lines = append(lines, "")
+	}
+	host := srv.Host
+	if srv.IsLocal() {
+		host = "local"
+		if srv.User != "" {
+			host += " (" + srv.User + ")"
+		}
+	}
+	hostLine := infoRow("Host", host, 10)
+	admin, arch, caddy := "…", "…", "…"
+	if state := m.serverConfig(m.serverName); state != nil {
+		admin = state.Settings.AdminUser
+		arch = state.Arch
+		caddy = state.Settings.CaddyImage
+	}
+	adminLine := infoRow("Admin", admin, 10) + styleMuted.Render(" · ") + styleText.Render(arch)
+	caddyLine := infoRow("Caddy", caddy, 10)
 	status, kind := m.statusText(m.serverName)
 	proxyLine := styleMuted.Render(padRight("Proxy", 10)) + colourFor(kind).Render(status)
 	if m.statusLoading[m.serverName] {
 		proxyLine += styleMuted.Render("  " + spinner(m.spinnerFrame) + " loading")
 	}
-	info := strings.Join([]string{hostLine, archLine, proxyLine}, "\n")
-	if report, ok := m.statuses[m.serverName]; ok && report.RebootRequired {
-		info += "\n" + styleWarning.Render("reboot required")
-	} else if errText := m.statusErr[m.serverName]; errText != "" {
-		info += "\n" + styleError.Render(clip(errText, m.width-10))
+	lines = append(lines, hostLine, adminLine, caddyLine, proxyLine)
+	if m.varianceLoading[m.serverName] {
+		lines = append(lines, styleMuted.Render(spinner(m.spinnerFrame)+" loading configuration…"))
 	}
+	if errText := m.varianceErr[m.serverName]; errText != "" {
+		lines = append(lines, styleError.Render(clip(errText, m.width-6)))
+	}
+	if report, ok := m.statuses[m.serverName]; ok && report.RebootRequired {
+		lines = append(lines, styleWarning.Render("reboot required"))
+	} else if errText := m.statusErr[m.serverName]; errText != "" {
+		lines = append(lines, styleError.Render(clip(errText, m.width-6)))
+	}
+	info := strings.Join(lines, "\n")
 	infoHeight := strings.Count(info, "\n") + 3
 	if infoHeight < 5 {
 		infoHeight = 5
@@ -412,15 +446,16 @@ func (m *model) viewApps(height int) string {
 	body := []string{}
 
 	showDomains := inner >= 76
-	showPrevious := inner >= 62
-	showType := inner >= 50
-	showBadge := inner >= 36
+	showPrevious := inner >= 100
+	showType := inner >= 56
+	showBadge := inner >= 40
 	nameW := 14
-	badgeW := 7
+	badgeW := 6
 	typeW := 8
 	currentW := 14
 	previousW := 14
-	healthW := 11
+	healthW := 10
+	configW := 15
 	if !showBadge {
 		badgeW = 0
 	}
@@ -432,16 +467,16 @@ func (m *model) viewApps(height int) string {
 	}
 	domainsW := 0
 	if showDomains {
-		domainsW = inner - 2 - nameW - badgeW - typeW - currentW - previousW - healthW
+		domainsW = inner - 2 - nameW - badgeW - typeW - currentW - previousW - configW - healthW
 		if domainsW < 6 {
 			domainsW = 0
 			showDomains = false
 		}
 	}
 	if !showDomains {
-		currentW = inner - 2 - nameW - badgeW - typeW - previousW - healthW
-		if currentW < 10 {
-			currentW = 10
+		currentW += inner - 2 - nameW - badgeW - typeW - currentW - previousW - configW - healthW
+		if currentW < 8 {
+			currentW = 8
 		}
 	}
 
@@ -456,6 +491,7 @@ func (m *model) viewApps(height int) string {
 	if showPrevious {
 		header += styleMuted.Render(padRight("PREVIOUS", previousW))
 	}
+	header += styleMuted.Render(padRight("CONFIG", configW))
 	header += styleMuted.Render(padRight("HEALTH", healthW))
 	if showDomains {
 		header += styleMuted.Render("DOMAINS")
@@ -463,7 +499,14 @@ func (m *model) viewApps(height int) string {
 	body = append(body, header)
 
 	if len(entries) == 0 {
-		body = append(body, styleMuted.Render("No apps on this server. Press a to add one."))
+		switch {
+		case m.varianceLoading[m.serverName]:
+			body = append(body, styleMuted.Render(spinner(m.spinnerFrame)+" loading configuration…"))
+		case m.varianceErr[m.serverName] != "":
+			body = append(body, styleError.Render(clip(m.varianceErr[m.serverName], inner-2)))
+		default:
+			body = append(body, styleMuted.Render("No apps configured on this server. Press a to add one."))
+		}
 	} else {
 		start := windowStart(m.appCursor, len(entries), rows)
 		loading := m.statusLoading[m.serverName]
@@ -473,65 +516,37 @@ func (m *model) viewApps(height int) string {
 			name := entry.Name
 			st, deployed := m.appStatus(m.serverName, name)
 			current, previous, health := "", "", ""
-			typ, domains := "", ""
 			maintenance := false
-			badge := ""
-
-			if entry.Local {
-				if deployed {
-					current = displayAppValue(st.Current)
-					previous = displayAppValue(st.Previous)
-					health = displayAppValue(st.Health)
-					maintenance = st.Maintenance
-				} else if loading && !haveStatus {
-					current, previous, health = "…", "…", "…"
-				} else if haveStatus {
-					current, health = "not deployed", "—"
-				} else {
-					current, previous, health = "?", "?", "?"
-				}
-				typ = m.appType(name)
-				domains = m.appDomains(name)
+			if deployed {
+				current = displayAppValue(st.Current)
+				previous = displayAppValue(st.Previous)
+				health = displayAppValue(st.Health)
+				maintenance = st.Maintenance
+			} else if loading && !haveStatus {
+				current, previous, health = "…", "…", "…"
 			} else {
-				sa := m.serverApp(name)
-				switch {
-				case sa != nil && sa.RecordErr != "":
-					current, health = "unreadable", "newer ship?"
-				case sa != nil && sa.Record == nil:
-					current, health = "no record", "older ship"
-				case loading && !haveStatus:
-					current, previous, health = "on server", "…", "…"
-				default:
-					current = "on server"
-					if deployed {
-						previous = displayAppValue(st.Previous)
-						health = displayAppValue(st.Health)
-					} else {
-						health = "—"
-					}
-				}
-				if sa != nil && sa.Record != nil {
-					typ = appRecordType(sa.Record)
-					domains = strings.Join(sa.Record.Domains, ", ")
-				}
+				current, health = "—", "—"
+			}
+			typ := m.appType(name)
+			domains := m.appDomains(name)
+
+			configText := "…"
+			if v, ok := m.varianceFor(m.serverName, name); ok {
+				configText = v.State
+			} else if m.varianceErr[m.serverName] != "" {
+				configText = "?"
 			}
 
-			if diff, ok := m.diffFor(m.serverName, name); ok && diff.Changed() {
-				badge = "DIFF"
-			} else if maintenance {
+			badge := ""
+			if maintenance {
 				badge = "MAINT"
 			}
 
-			displayName := name
-			missingCompose := entry.Local && m.composeMissing(name)
-			if missingCompose {
-				displayName = name + "!"
-			}
 			cursor := " "
 			if i == m.appCursor {
 				cursor = "›"
 			}
-			plain := cursor + " " + padRight(clip(displayName, nameW-1), nameW)
+			plain := cursor + " " + padRight(clip(name, nameW-1), nameW)
 			if showBadge {
 				plain += padRight(badge, badgeW)
 			}
@@ -542,6 +557,7 @@ func (m *model) viewApps(height int) string {
 			if showPrevious {
 				plain += padRight(clip(previous, previousW-1), previousW)
 			}
+			plain += padRight(clip(configText, configW-1), configW)
 			plain += padRight(clip(health, healthW-1), healthW)
 			if showDomains {
 				plain += clip(domains, domainsW)
@@ -550,10 +566,7 @@ func (m *model) viewApps(height int) string {
 				body = append(body, styleSelection.Render(fit(plain, inner)))
 				continue
 			}
-			line := styleAccent.Render(cursor+" ") + styleText.Render(padRight(clip(displayName, nameW-1), nameW))
-			if missingCompose {
-				line = styleAccent.Render(cursor+" ") + styleWarning.Render(padRight(clip(displayName, nameW-1), nameW))
-			}
+			line := styleAccent.Render(cursor+" ") + styleText.Render(padRight(clip(name, nameW-1), nameW))
 			if showBadge {
 				if badge != "" {
 					line += badgeStyle(tintWarning, colWarning).Render(padRight(badge, badgeW))
@@ -568,6 +581,7 @@ func (m *model) viewApps(height int) string {
 			if showPrevious {
 				line += styleMuted.Render(padRight(clip(previous, previousW-1), previousW))
 			}
+			line += configStyle(configText).Render(padRight(clip(configText, configW-1), configW))
 			line += colourFor(healthKind(health)).Render(padRight(clip(health, healthW-1), healthW))
 			if showDomains {
 				line += styleMuted.Render(clip(domains, domainsW))
@@ -578,14 +592,15 @@ func (m *model) viewApps(height int) string {
 	return panel(fmt.Sprintf("Applications (%d)", len(entries)), strings.Join(body, "\n"), m.width, height, false)
 }
 
-func appRecordType(record *config.App) string {
-	if record == nil {
-		return ""
+func configStyle(state string) lipgloss.Style {
+	switch state {
+	case ops.VariancePending:
+		return styleWarning
+	case ops.VarianceNotDeployed:
+		return styleMuted
+	default:
+		return styleText
 	}
-	if record.Source.Type == "image" {
-		return "image"
-	}
-	return "release"
 }
 
 func displayAppValue(v string) string {
@@ -621,14 +636,25 @@ func (m *model) viewServerActions() string {
 
 func (m *model) viewAppActions() string {
 	defs := m.appActions()
-	body := make([]string, 0, len(defs))
+	body := make([]string, 0, len(defs)+2)
 	inner := m.width - 2
+	config := m.configState(m.serverName, m.appName)
+	if config == "" {
+		config = "…"
+	}
+	health := "—"
+	if st, ok := m.appStatus(m.serverName, m.appName); ok {
+		health = displayAppValue(st.Health)
+	}
+	header := styleMuted.Render("CONFIG ") + configStyle(config).Render(config) +
+		styleMuted.Render("   HEALTH ") + colourFor(healthKind(health)).Render(health)
+	body = append(body, header, "")
 	for i, def := range defs {
 		line := actionLine(def.key, def.label, def.desc, def.danger, i == m.appActCur, inner)
 		body = append(body, line)
 	}
 	if len(defs) == 0 {
-		body = append(body, styleError.Render("This app is no longer in ship.yaml or on the server."))
+		body = append(body, styleError.Render("This app is no longer configured on the server."))
 	}
 	return panel("App actions · "+m.appName, strings.Join(body, "\n"), m.width, m.bodyHeight(), false)
 }
@@ -708,7 +734,7 @@ func (m *model) viewCompare() string {
 	if strings.TrimSpace(content) == "" {
 		content = styleMuted.Render("No differences.")
 	}
-	return panel("Compare · "+m.appName+" · server "+m.serverName, content, m.width, m.bodyHeight(), true)
+	return panel("Compare · "+m.appName+" · running → desired", content, m.width, m.bodyHeight(), true)
 }
 
 func (m *model) viewRestorePick() string {
@@ -776,6 +802,9 @@ func (m *model) viewForm() string {
 	if f.err != "" {
 		content = styleError.Render(f.err) + "\n\n"
 	}
+	if f.saving {
+		content += styleMuted.Render(spinner(m.spinnerFrame)+" saving…") + "\n\n"
+	}
 	if f.form != nil {
 		content += f.form.View()
 	}
@@ -797,6 +826,8 @@ func (m *model) viewConfirm() string {
 	footer := "Enter/y confirm   ·   Esc/n cancel"
 	if c.ack {
 		footer = "Enter to close"
+	} else if c.scrollable {
+		footer = "↑/↓ scroll   ·   Enter/y approve and deploy   ·   Esc/n cancel"
 	} else if c.yesHint != "" || c.noHint != "" {
 		yes, no := "confirm", "cancel"
 		if c.yesHint != "" {
@@ -807,7 +838,33 @@ func (m *model) viewConfirm() string {
 		}
 		footer = "Enter/y " + yes + "   ·   Esc/n " + no
 	}
-	lines := []string{strings.Join(content, "\n"), "", styleMuted.Render(footer)}
+	lines := append([]string{}, content...)
+	if c.scrollable {
+		script := strings.Split(c.script, "\n")
+		visible := m.bodyHeight() - 4 - len(lines)
+		if visible < 3 {
+			visible = 3
+		}
+		start := c.scroll
+		if start < 0 {
+			start = 0
+		}
+		if start > len(script)-1 {
+			start = len(script) - 1
+		}
+		end := start + visible
+		if end > len(script) {
+			end = len(script)
+		}
+		lines = append(lines, "")
+		for _, line := range script[start:end] {
+			lines = append(lines, styleMuted.Render(clip(line, width-4)))
+		}
+		if start > 0 || end < len(script) {
+			lines = append(lines, styleMuted.Render(fmt.Sprintf("lines %d-%d of %d", start+1, end, len(script))))
+		}
+	}
+	lines = append(lines, "", styleMuted.Render(footer))
 	body := lipgloss.Place(m.width, m.bodyHeight(), lipgloss.Center, lipgloss.Center,
 		panel(c.title, strings.Join(lines, "\n"), width, 0, true))
 	return body

@@ -16,6 +16,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"os/user"
 	"path"
 	"strconv"
 	"strings"
@@ -23,7 +24,7 @@ import (
 
 // AgentProtocol is the ship-agent protocol version embedded in this ship. The
 // CLI refuses to replace a newer agent on a VPS.
-const AgentProtocol = 4
+const AgentProtocol = 5
 
 const agentPath = "/usr/local/sbin/ship-agent"
 
@@ -105,16 +106,23 @@ func (d DryRunner) print(c Cmd) {
 	}
 }
 
-// Session is an ssh connection to one VPS.
+// Session is a connection to one VPS: an ssh connection, or the machine ship
+// itself runs on when LocalMode is set.
 type Session struct {
 	Host string
 	// IdentityFile is an optional private key passed to ssh with -i.
 	IdentityFile string
-	DryRun       bool
-	Out          io.Writer
-	Err          io.Writer
-	Runner       Runner
-	Ctx          context.Context
+	// LocalMode runs agent commands directly on this machine instead of over
+	// ssh. Host and IdentityFile are unused.
+	LocalMode bool
+	// User is the local admin user to act as in LocalMode. Empty means the
+	// current user.
+	User   string
+	DryRun bool
+	Out    io.Writer
+	Err    io.Writer
+	Runner Runner
+	Ctx    context.Context
 }
 
 // NewSession returns a session using the system ssh binary, or a printer in
@@ -126,6 +134,13 @@ func NewSession(host string, dryRun bool, out, errOut io.Writer) *Session {
 // NewSessionContext is NewSession with a context that cancels its commands.
 func NewSessionContext(host string, dryRun bool, out, errOut io.Writer, ctx context.Context) *Session {
 	return newSession(host, dryRun, out, errOut, ctx)
+}
+
+// NewLocalSessionContext returns a session that runs commands on this machine.
+func NewLocalSessionContext(dryRun bool, out, errOut io.Writer, ctx context.Context) *Session {
+	s := newSession("", dryRun, out, errOut, ctx)
+	s.LocalMode = true
+	return s
 }
 
 func newSession(host string, dryRun bool, out, errOut io.Writer, ctx context.Context) *Session {
@@ -183,11 +198,80 @@ func (s *Session) AgentArgv(tty bool, args ...string) []string {
 	return SSHArgv(s.Host, s.IdentityFile, AgentRemote(args...), tty)
 }
 
+// geteuid and currentUser are variables so tests can pin the local identity.
+var (
+	geteuid     = os.Geteuid
+	currentUser = func() string {
+		if u, err := user.Current(); err == nil && u.Username != "" {
+			return u.Username
+		}
+		return os.Getenv("USER")
+	}
+)
+
+// argvWithPrefix combines a command prefix (sudo and options) with a program
+// and its arguments. An empty prefix leaves the command unchanged.
+func argvWithPrefix(prefix []string, program string, args []string) (string, []string) {
+	if len(prefix) == 0 {
+		return program, args
+	}
+	argv := make([]string, 0, len(prefix)-1+1+len(args))
+	argv = append(argv, prefix[1:]...)
+	argv = append(argv, program)
+	argv = append(argv, args...)
+	return prefix[0], argv
+}
+
+// localRootArgv returns the prefix that runs a command as root on this
+// machine. It is empty when ship already runs as root. With a configured user
+// different from the current one, ship first becomes that user and then takes
+// the same sudo path to root.
+func (s *Session) localRootArgv(tty bool) []string {
+	if geteuid() == 0 {
+		return nil
+	}
+	prefix := []string{"sudo"}
+	if !tty {
+		prefix = append(prefix, "-n")
+	}
+	if s.User != "" && s.User != currentUser() {
+		prefix = append(prefix, "-u", s.User, "sudo")
+		if !tty {
+			prefix = append(prefix, "-n")
+		}
+	}
+	return prefix
+}
+
+// localUserArgv returns the prefix that runs a command as the configured local
+// admin user, for commands that elevate on their own (sudoedit).
+func (s *Session) localUserArgv(tty bool) []string {
+	if geteuid() == 0 || s.User == "" || s.User == currentUser() {
+		return nil
+	}
+	prefix := []string{"sudo"}
+	if !tty {
+		prefix = append(prefix, "-n")
+	}
+	return append(prefix, "-u", s.User)
+}
+
+// AgentCommand returns the executable and arguments for an agent action.
+// Remote sessions run ssh; local sessions run the agent directly with the
+// local sudo rules.
+func (s *Session) AgentCommand(tty bool, args ...string) (string, []string) {
+	if s.LocalMode {
+		return argvWithPrefix(s.localRootArgv(tty), agentPath, args)
+	}
+	return "ssh", SSHArgv(s.Host, s.IdentityFile, AgentRemote(args...), tty)
+}
+
 // RunAgent runs an agent action with inherited stdout/stderr.
 func (s *Session) RunAgent(args ...string) error {
+	program, argv := s.AgentCommand(false, args...)
 	return s.Runner.Run(Cmd{
-		Path:   "ssh",
-		Args:   s.AgentArgv(false, args...),
+		Path:   program,
+		Args:   argv,
 		Stdout: s.Out,
 		Stderr: s.Err,
 	})
@@ -195,9 +279,10 @@ func (s *Session) RunAgent(args ...string) error {
 
 // RunAgentTTY runs an agent action with a TTY (log following, interactive).
 func (s *Session) RunAgentTTY(args ...string) error {
+	program, argv := s.AgentCommand(true, args...)
 	return s.Runner.Run(Cmd{
-		Path:   "ssh",
-		Args:   s.AgentArgv(true, args...),
+		Path:   program,
+		Args:   argv,
 		Stdin:  os.Stdin,
 		Stdout: s.Out,
 		Stderr: s.Err,
@@ -207,16 +292,17 @@ func (s *Session) RunAgentTTY(args ...string) error {
 
 // OutputAgent runs an agent action and captures stdout.
 func (s *Session) OutputAgent(args ...string) ([]byte, error) {
-	argv := s.AgentArgv(false, args...)
-	return s.Runner.Output(Cmd{Path: "ssh", Args: argv, Stderr: s.Err})
+	program, argv := s.AgentCommand(false, args...)
+	return s.Runner.Output(Cmd{Path: program, Args: argv, Stderr: s.Err})
 }
 
 // StreamAgent runs an agent action and copies stdout to w without buffering
 // it first. Callers cap the writer when the output comes from the server.
 func (s *Session) StreamAgent(w io.Writer, args ...string) error {
+	program, argv := s.AgentCommand(false, args...)
 	return s.Runner.Run(Cmd{
-		Path:   "ssh",
-		Args:   s.AgentArgv(false, args...),
+		Path:   program,
+		Args:   argv,
 		Stdout: w,
 		Stderr: s.Err,
 	})
@@ -225,14 +311,108 @@ func (s *Session) StreamAgent(w io.Writer, args ...string) error {
 // InputAgent runs an agent action with bytes on stdin (never on the command
 // line).
 func (s *Session) InputAgent(stdin []byte, args ...string) error {
-	argv := s.AgentArgv(false, args...)
+	program, argv := s.AgentCommand(false, args...)
 	return s.Runner.Run(Cmd{
-		Path:      "ssh",
+		Path:      program,
 		Args:      argv,
 		Stdin:     bytes.NewReader(stdin),
 		Stdout:    s.Out,
 		Stderr:    s.Err,
 		StdinSize: len(stdin),
+	})
+}
+
+// InputAgentOutput runs an agent action with bytes on stdin and captures its
+// stdout, for commands that report the new configuration hash.
+func (s *Session) InputAgentOutput(stdin []byte, args ...string) ([]byte, error) {
+	program, argv := s.AgentCommand(false, args...)
+	var buf bytes.Buffer
+	err := s.Runner.Run(Cmd{
+		Path:      program,
+		Args:      argv,
+		Stdin:     bytes.NewReader(stdin),
+		Stdout:    &buf,
+		Stderr:    s.Err,
+		StdinSize: len(stdin),
+	})
+	return buf.Bytes(), err
+}
+
+// ShellCommand returns the executable and arguments that run script through a
+// shell as root. Remote sessions use ssh with sudo; local sessions apply the
+// local sudo rules (none when ship already runs as root).
+func (s *Session) ShellCommand(script string, tty bool) (string, []string) {
+	if s.LocalMode {
+		return argvWithPrefix(s.localRootArgv(tty), "sh", []string{"-c", script})
+	}
+	sudo := "sudo -n"
+	if tty {
+		sudo = "sudo"
+	}
+	return "ssh", SSHArgv(s.Host, s.IdentityFile, sudo+" sh -c "+ShellQuote(script), tty)
+}
+
+// RunElevated runs a shell script as root with inherited output.
+func (s *Session) RunElevated(script string, tty bool) error {
+	program, argv := s.ShellCommand(script, tty)
+	c := Cmd{Path: program, Args: argv, Stdout: s.Out, Stderr: s.Err, TTY: tty}
+	if tty {
+		c.Stdin = os.Stdin
+	}
+	return s.Runner.Run(c)
+}
+
+// OutputElevated runs a shell script as root and captures stdout.
+func (s *Session) OutputElevated(script string) ([]byte, error) {
+	program, argv := s.ShellCommand(script, false)
+	return s.Runner.Output(Cmd{Path: program, Args: argv, Stderr: s.Err})
+}
+
+// StreamElevated runs a shell script as root and copies stdout to w.
+func (s *Session) StreamElevated(script string, w io.Writer) error {
+	program, argv := s.ShellCommand(script, false)
+	return s.Runner.Run(Cmd{Path: program, Args: argv, Stdout: w, Stderr: s.Err})
+}
+
+// DownloadFile copies a root-owned server file to w.
+func (s *Session) DownloadFile(filePath string, w io.Writer) error {
+	return s.StreamElevated("cat "+ShellQuote(filePath), w)
+}
+
+// EnvEditCommand returns the executable and arguments that prepare envPath and
+// open it in an editor with a TTY. Local sessions use sudoedit; remote
+// sessions run sudo -e over ssh.
+func (s *Session) EnvEditCommand(envPath string, tty bool) (string, []string) {
+	if !s.LocalMode {
+		dir := path.Dir(envPath)
+		remoteCmd := fmt.Sprintf("sudo -n install -d -m 0755 %s; sudo -n test -f %s || sudo -n install -m 0600 /dev/null %s; sudo -n chmod 0600 %s; sudo -n -e %s",
+			ShellQuote(dir), ShellQuote(envPath), ShellQuote(envPath), ShellQuote(envPath), ShellQuote(envPath))
+		return "ssh", SSHArgv(s.Host, s.IdentityFile, remoteCmd, tty)
+	}
+	dir := path.Dir(envPath)
+	root := s.localRootArgv(tty)
+	user := s.localUserArgv(tty)
+	line := func(prefix []string, program string, args ...string) string {
+		exe, argv := argvWithPrefix(prefix, program, args)
+		return ShellJoin(append([]string{exe}, argv...))
+	}
+	script := line(root, "install", "-d", "-m", "0755", dir) + "; " +
+		line(root, "test", "-f", envPath) + " || " + line(root, "install", "-m", "0600", "/dev/null", envPath) + "; " +
+		line(root, "chmod", "0600", envPath) + "; " +
+		line(user, "sudoedit", envPath)
+	return "sh", []string{"-c", script}
+}
+
+// RunEnvEdit prepares envPath and hands the terminal to the editor.
+func (s *Session) RunEnvEdit(envPath string) error {
+	program, argv := s.EnvEditCommand(envPath, true)
+	return s.Runner.Run(Cmd{
+		Path:   program,
+		Args:   argv,
+		Stdin:  os.Stdin,
+		Stdout: s.Out,
+		Stderr: s.Err,
+		TTY:    true,
 	})
 }
 
@@ -282,6 +462,19 @@ func (s *Session) UploadStream(remotePath string, mode fs.FileMode, r io.Reader,
 	// data goes to a temp file renamed into place, so a reader (bash running
 	// ship-agent, a compose up) never sees a half-written file.
 	script := `umask 077; t=$(mktemp "$1.XXXXXX") && cat > "$t" && chmod "$2" "$t" && mv -f "$t" "$1" || { rm -f "$t"; exit 1; }`
+	if s.LocalMode {
+		shell := "mkdir -p " + ShellQuote(dir) + " && sh -c " + ShellQuote(script) + " _ " +
+			ShellQuote(remotePath) + " " + ShellQuote(fmt.Sprintf("%04o", mode.Perm()))
+		program, argv := s.ShellCommand(shell, false)
+		return s.Runner.Run(Cmd{
+			Path:      program,
+			Args:      argv,
+			Stdin:     r,
+			Stdout:    s.Out,
+			Stderr:    s.Err,
+			StdinSize: int(size),
+		})
+	}
 	remote := fmt.Sprintf("sudo -n mkdir -p %s && sudo -n sh -c %s _ %s %s",
 		ShellQuote(dir), ShellQuote(script), ShellQuote(remotePath),
 		ShellQuote(fmt.Sprintf("%04o", mode.Perm())))
@@ -314,18 +507,23 @@ func (s *Session) EnsureAgent(agent []byte) error {
 		fmt.Fprintf(s.Out, "# would check the protocol version and sha256 of %s, then install it if needed\n", agentPath)
 		return nil
 	}
-	out, err := s.OutputSSH("sudo -n sh -c " + ShellQuote(agentProbe))
+	// Never replace a working agent with nothing (e.g. an Ops built without
+	// the embedded script).
+	if len(bytes.TrimSpace(agent)) == 0 {
+		return fmt.Errorf("refusing to install ship-agent: the embedded agent script is empty")
+	}
+	out, err := s.OutputElevated(agentProbe)
 	if err != nil {
 		return fmt.Errorf("check ship-agent: %w", err)
 	}
 	version, got := parseAgentProbe(out)
 	if version > AgentProtocol {
-		return fmt.Errorf("the ship-agent on the VPS is newer (protocol %d) than this ship (%d); run `ship update`", version, AgentProtocol)
+		return fmt.Errorf("the ship-agent on this server is newer (protocol %d) than this ship (%d); run `ship update`", version, AgentProtocol)
 	}
 	if version == AgentProtocol && got == want {
 		return nil
 	}
-	fmt.Fprintln(s.Err, "ship: installing/updating ship-agent on the VPS")
+	fmt.Fprintln(s.Err, "ship: installing/updating ship-agent on this server")
 	return s.UploadFile(agentPath, 0o755, agent)
 }
 
@@ -347,6 +545,20 @@ func parseAgentProbe(out []byte) (int, string) {
 // gzip-compressed `docker save` tar on stdin. Compression happens in Go, so
 // no local gzip binary is needed (notably on Windows).
 func (s *Session) ShipImage(ref string, args ...string) error {
+	if s.LocalMode {
+		// The image was built into this machine's Docker daemon, which is the
+		// server's daemon. image-load would resolve the same ref from
+		// .ship-meta, so only verify it is there.
+		if s.DryRun {
+			fmt.Fprintf(s.Out, "$ %s\n", ShellJoin([]string{"docker", "image", "inspect", ref}))
+			fmt.Fprintln(s.Out, "#   (local: image is already in this server's Docker daemon)")
+			return nil
+		}
+		if err := s.Local("docker", "image", "inspect", ref); err != nil {
+			return fmt.Errorf("verify local image %s: %w", ref, err)
+		}
+		return nil
+	}
 	argv := s.AgentArgv(false, args...)
 	if s.DryRun {
 		fmt.Fprintf(s.Out, "$ %s | gzip | %s\n",

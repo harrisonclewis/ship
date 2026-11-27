@@ -23,8 +23,10 @@ var ErrConfigChanged = localedit.ErrChanged
 // ServerValues are the fields the server form edits.
 type ServerValues struct {
 	Name         string
+	Connection   string
 	Host         string
 	IdentityFile string
+	User         string
 	AdminUser    string
 	Arch         string
 	CaddyImage   string
@@ -200,7 +202,7 @@ func (d *Doc) Validate() error {
 	if err != nil {
 		return err
 	}
-	_, err = config.Decode(bytes.NewReader(rendered))
+	_, err = config.DecodeOld(bytes.NewReader(rendered))
 	return err
 }
 
@@ -212,7 +214,7 @@ func (d *Doc) Save() error {
 	if err != nil {
 		return err
 	}
-	if _, err := config.Decode(bytes.NewReader(rendered)); err != nil {
+	if _, err := config.DecodeOld(bytes.NewReader(rendered)); err != nil {
 		return err
 	}
 
@@ -398,12 +400,24 @@ func (d *Doc) ApplyServer(v ServerValues) error {
 		srv.Content = nil
 	}
 
-	if v.Host != "" {
-		setString(srv, "host", v.Host)
+	if v.Connection == config.ConnectionLocal {
+		setString(srv, "connection", config.ConnectionLocal)
+		removeKey(srv, "host")
+		removeKey(srv, "identity_file")
 	} else {
-		setString(srv, "host", "")
+		removeKey(srv, "connection")
+		if v.Host != "" {
+			setString(srv, "host", v.Host)
+		} else {
+			setString(srv, "host", "")
+		}
+		applyIdentityFile(srv, strings.TrimSpace(v.IdentityFile))
 	}
-	applyIdentityFile(srv, strings.TrimSpace(v.IdentityFile))
+	if v.Connection == config.ConnectionLocal && strings.TrimSpace(v.User) != "" {
+		setString(srv, "user", strings.TrimSpace(v.User))
+	} else {
+		removeKey(srv, "user")
+	}
 	if v.AdminUser != "" {
 		setString(srv, "admin_user", v.AdminUser)
 	} else {
@@ -418,9 +432,6 @@ func (d *Doc) ApplyServer(v ServerValues) error {
 		setString(srv, "caddy_image", v.CaddyImage)
 	} else {
 		removeKey(srv, "caddy_image")
-	}
-	if v.IsNew {
-		ensureMap(srv, "apps")
 	}
 	return nil
 }

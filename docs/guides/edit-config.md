@@ -1,10 +1,8 @@
 # Edit config
 
-`ship.yaml` and each app's `compose.yaml` are plain files. ship can open them in your editor, and can make small app changes for you. Every edit is validated before it is saved, and the previous file is kept as `.bak`.
+App configuration lives on the server. ship edits desired config there and runs a deploy to apply it. The only local configuration file is [`ship.yaml`](../reference/ship-yaml.md), which holds server connection details and image app source paths.
 
-These commands only touch local files: they never contact a server and `--dry-run` has no effect.
-
-## Edit ship.yaml
+## Edit the local ship.yaml
 
 ```sh
 ship config edit
@@ -12,37 +10,26 @@ ship config edit
 
 This opens the found [`ship.yaml`](../reference/ship-yaml.md#where-ship-looks) in `$VISUAL`, then `$EDITOR`, then `vi` (`notepad` on Windows). Values such as `code --wait` are allowed.
 
-ship edits a temporary copy. If you leave it unchanged, nothing is written. Otherwise the result is validated with the same rules as a TUI save, then the original is replaced and the previous file is kept as `.bak`.
+ship edits a temporary copy. If you leave it unchanged, nothing is written. Otherwise the result is validated, the original is replaced and the previous file is kept as `.bak`.
 
 An invalid file is not written: ship prints the error and asks `Reopen editor? [Y/n]`, keeping your edits in the temporary copy if you reopen. A save is refused if the real file changed on disk while you were editing.
-
-In the TUI, press `e` on the Servers tab to edit `ship.yaml` the same way.
-
-## Edit a compose file
-
-```sh
-ship config edit <app>
-```
-
-This opens `apps/<app>/compose.yaml` beside the found `ship.yaml`. If it does not exist yet, the editor starts empty and the file is created on save. The result is checked with the [compose rules](../reference/compose.md) before saving, with the same `.bak`, changed-on-disk and reopen/discard behaviour.
-
-In the TUI, choose **Edit compose.yaml** (`f`) from an app's actions.
 
 ## Change one app setting
 
 ```sh
-ship <server> app set <app> <key> <value...>
-ship <server> app add <app> <key> <value...>
-ship <server> app remove <app> <key> <value...>
+ship prod app set <app> <key> <value...>
+ship prod app add <app> <key> <value...>
+ship prod app remove <app> <key> <value...>
 ```
 
-The server name is required because these commands find the app through its server; with exactly one server it is optional.
+The server name is required because the app is stored on that server; with exactly one server it is optional.
 
 `set` replaces a value. Its keys are:
 
 | Key | Value |
 |---|---|
-| `source.path` | image app checkout; empty clears it |
+| `source.type` | `github-release` or `image` |
+| `source.path` | local checkout for an image app; writes local `sources.<app>`, not the server |
 | `source.repo` | GitHub `owner/repo` |
 | `source.asset` | release asset pattern; empty restores the default |
 | `domains` | one or more domains, replacing the list |
@@ -57,42 +44,99 @@ An unknown key lists the valid ones. For `build.commands` and `deploy.commands`,
 ship prod app set hello deploy.commands - < deploy.sh
 ```
 
-`add` and `remove` work only on `domains` and `redirects` and accept one or more values. `add` appends missing values in order; values already present are skipped with a note. `remove` is atomic: if any value is missing it changes nothing and exits non-zero. Removing the last domain is an error; removing the first (canonical) domain is allowed and prints the new canonical domain. Duplicate values in one command are collapsed.
-
-These commands write through the same validated save as the TUI. They never contact a server; the next deploy uploads the changed record.
-
-## Edit one app's YAML
+`source.path` is special: it edits the local `servers.prod.sources.hello` entry and never contacts the server. An empty value clears it:
 
 ```sh
-ship <server> app edit <app>
+ship prod app set web source.path ~/code/web
+ship prod app set web source.path ""
 ```
 
-This opens only that app's mapping in `$VISUAL`, `$EDITOR` or `vi`, with a header naming the app. The app name and server cannot be changed there; use the TUI's **All settings** to rename.
+Every other key updates the desired record on the server immediately.
 
-The edited mapping is spliced back into `ship.yaml` and the whole config is validated before saving, with the same `.bak`, changed-on-disk check and reopen/discard prompt as `ship config edit`.
+`add` and `remove` work only on `domains` and `redirects` and accept one or more values. `add` appends missing values in order; values already present are skipped with a note. `remove` is atomic: if any value is missing it changes nothing and exits non-zero. Removing the last domain is an error; removing the first (canonical) domain is allowed and prints the new canonical domain. Duplicate values in one command are collapsed. Domains and redirects are validated against the other desired apps on that server.
 
-## Edit from the TUI
+Saving prints what to do next:
 
-On a server page, choose the app and then:
+- Domain or redirect changes: `Restart Caddy to apply: ship prod proxy restart`.
+- Other changes: `Deploy to apply: ship prod deploy <app>`.
 
-| Key | Screen | What it does |
-|---|---|---|
-| `i` | app actions | open the **Edit…** submenu |
-| `s` | Edit… | **Source**: image path, or release repo and asset |
-| `d` | Edit… | **Domains & redirects** |
-| `c` | Edit… | **Build & deploy commands** and the maintenance page |
-| `y` | Edit… | **Edit app YAML**: only this app's mapping |
-| `a` | Edit… | **All settings**: the full app form, including the name and source type |
-| `f` | app actions | **Edit compose.yaml** |
+## Edit one app's record
 
-The quick forms are prefilled and save through the same validation as the full form. **Edit app YAML** opens the app's mapping, comments included, with a header naming the server and app. The app name is fixed there; rename it with **All settings**. Invalid YAML shows the editor error and offers to reopen or discard, keeping the temporary copy while you decide.
+```sh
+ship prod app edit <app>
+```
 
-Saving in the TUI:
+This fetches the desired record to a temporary file and opens it in `$VISUAL`, `$EDITOR` or `vi`. The file starts with the full record, including `uid`, `data`, `health`, `backup` and `env`, which have no `app set` keys:
 
-- checks the whole config first and refuses anything invalid,
-- keeps your comments, key order and blank lines,
-- keeps the previous file as `.bak`,
-- refuses if the file changed on disk since the TUI loaded or opened it,
-- creates `~/.config/ship/ship.yaml` if you have no config yet.
+```yaml
+domains: [hello.example.com]
+redirects: [www.hello.example.com]
+upstream: hello:8080
+source:
+  type: github-release
+  repo: example/hello
+  asset: hello_linux_{arch}
+uid: 10001
+data: [/srv/hello]
+health:
+  http_path: /health
+backup:
+  sqlite: [/srv/hello/hello.db]
+env:
+  HELLO_DB: /data/hello.db
+```
 
-Deleting a server or app only removes it from `ship.yaml`; nothing on the server changes. Edits are saved even with `--dry-run`, because they only touch your local files.
+The record is validated against every other desired app on the server before it is saved. A deploy applies it. Changing `domains` or `redirects` here also only updates desired config; run `ship prod proxy restart` to make routing live.
+
+## Create and delete apps
+
+```sh
+ship prod app create blog
+ship prod app delete blog
+```
+
+`app create` opens a template with `domains`, `upstream`, `source` and `backup`, then writes the desired record and a minimal compose file. It fails if the app already exists. Next:
+
+```sh
+ship prod config edit blog compose
+```
+
+`app delete` asks first. It removes the desired configuration and stops the app's stack if it was deployed. Data directories and `/opt/apps/<app>/.env` are kept. Outside a TTY, pass `--yes`. Run `ship prod proxy restart` afterwards to drop its routes from Caddy.
+
+## Edit compose and Dockerfile
+
+```sh
+ship prod config edit blog compose
+ship prod config edit blog Dockerfile
+```
+
+ship fetches the desired file to a temporary copy and opens it in your editor. Compose files are validated with the [compose rules](../reference/compose.md); Dockerfiles are not validated. The previous temporary copy is discarded if you make no changes, and a concurrent change on the server refuses the save.
+
+A save prints `Deploy to apply: ship prod deploy <app>`. Deploy is what applies compose, record and Dockerfile changes.
+
+## Server settings
+
+```sh
+ship prod server set admin_user ops
+ship prod server set caddy_image caddy:2.10-alpine
+```
+
+`admin_user` applies with `ship prod setup`; `caddy_image` applies with `ship prod proxy restart`.
+
+## Migrate an old local file
+
+If `ship.yaml` still has the old full format — local `apps`, `admin_user`, `arch` or `caddy_image` — normal commands reject it with a message pointing at `ship config push` (or `ship <server> config push` when several servers are configured).
+
+Run once per server:
+
+```sh
+ship prod config push
+```
+
+This uploads each app's record and its `apps/<app>/compose.yaml` (and `Dockerfile`) from the old local format, keeps apps applied when they already match the running record, and rewrites that server's block to the new shape with a `.bak`. If the server has no recorded setup state, it also records the pushed admin user and app uids as already applied, so the migration does not force a full re-setup. Only `config push` accepts the old format.
+
+## Concurrent edits
+
+Config commands carry the hash of the desired state they loaded. If another machine changes the same app or server settings first, the save fails with `changed on the server since you loaded it` and nothing is written. Run the command again to reload and retry.
+
+The TUI's configuration screens are being updated for the server-backed model in a later change. Until then, use these commands for app and server settings.

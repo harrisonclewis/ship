@@ -127,6 +127,299 @@ app_export > "$WORK/export2.tar"
 	}
 }
 
+func TestAgentAppPutRejectsStaleHash(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the agent test harness needs bash")
+	}
+	for _, tool := range []string{"bash", "tar", "sha256sum"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s is not installed", tool)
+		}
+	}
+	if err := exec.Command("bash", "-c", "declare -A probe=()").Run(); err != nil {
+		t.Skip("the agent needs bash 4 or newer")
+	}
+	agent, err := filepath.Abs("../../ship-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	writeTar := func(name, compose string) string {
+		p := filepath.Join(work, name)
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		members := map[string]string{
+			"ship-app.yaml": "domains: [app.example.com]\nupstream: app:8080\nsource:\n  type: image\n",
+			"compose.yaml":  compose,
+			".ship-meta":    "app=app\nsource=image\n",
+			".ship-env":     "A=B\n",
+		}
+		for n, data := range members {
+			if err := tw.WriteHeader(&tar.Header{Name: n, Mode: 0o644, Size: int64(len(data)), Typeflag: tar.TypeReg}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tw.Write([]byte(data)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, buf.Bytes(), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	writeTar("one.tar", "name: one\n")
+	writeTar("two.tar", "name: two\n")
+
+	harness := filepath.Join(work, "harness.sh")
+	script := `set -euo pipefail
+source "$AGENT"
+APPS="$WORK/apps"
+STATE="$APPS/.ship"
+PUT_FILE_LIMIT=1048576
+PUT_TOTAL_LIMIT=16777216
+mkdir -p "$APPS"
+hash=$(app_put app "" < "$WORK/one.tar" | sed -n 's/^hash=//p')
+[ -n "$hash" ]
+if ( app_put app deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef 2>"$WORK/err" < "$WORK/two.tar" ); then
+  echo "stale hash was accepted" >&2
+  exit 1
+fi
+grep -q "changed on the server" "$WORK/err"
+app_put app "$hash" < "$WORK/two.tar" >/dev/null
+grep -qx "name: two" "$APPS/app/.ship/desired/compose.yaml"
+if ( app_remove app "$hash" >/dev/null 2>"$WORK/err2" ); then
+  echo "stale remove hash was accepted" >&2
+  exit 1
+fi
+grep -q "changed on the server" "$WORK/err2"
+app_remove app "$(cat "$APPS/app/.ship/desired.hash")" >/dev/null
+[ ! -d "$APPS/app/.ship" ]
+`
+	if err := os.WriteFile(harness, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", harness)
+	cmd.Env = append(os.Environ(), "AGENT="+agent, "WORK="+work)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("agent harness: %v\n%s", err, out)
+	}
+}
+
+func TestAgentConfigExportParses(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the agent test harness needs bash")
+	}
+	for _, tool := range []string{"bash", "tar", "find"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s is not installed", tool)
+		}
+	}
+	if err := exec.Command("bash", "-c", "declare -A probe=()").Run(); err != nil {
+		t.Skip("the agent needs bash 4 or newer")
+	}
+	if err := exec.Command("sh", "-c", "find . -type f -printf '%P\\n' >/dev/null 2>&1").Run(); err != nil {
+		t.Skip("find does not support -printf")
+	}
+	agent, err := filepath.Abs("../../ship-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	apps := filepath.Join(work, "apps")
+	state := filepath.Join(apps, ".ship")
+	proxy := filepath.Join(work, "proxy")
+	desired := filepath.Join(apps, "app", ".ship", "desired")
+	for _, d := range []string{desired, state, proxy} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files := map[string]string{
+		filepath.Join(desired, "ship-app.yaml"):    "domains: [app.example.com]\nupstream: app:8080\nsource:\n  type: image\n",
+		filepath.Join(desired, "compose.yaml"):     "name: app\n",
+		filepath.Join(state, "server.yaml"):        "admin_user: ops\ncaddy_image: caddy:2.10-alpine\n",
+		filepath.Join(state, "server.hash"):        strings.Repeat("a", 64) + "\n",
+		filepath.Join(state, "applied-setup.yaml"): "admin_user=ops\napps=app:1000\n",
+		filepath.Join(proxy, "Caddyfile"):          "# active\n",
+		filepath.Join(proxy, ".env"):               "CADDY_IMAGE=caddy:2.10-alpine\n",
+	}
+	for p, data := range files {
+		if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	harness := filepath.Join(work, "harness.sh")
+	script := `set -euo pipefail
+source "$AGENT"
+APPS="$WORK/apps"
+STATE="$APPS/.ship"
+PROXY="$WORK/proxy"
+config_export > "$WORK/export.tar"
+`
+	if err := os.WriteFile(harness, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", harness)
+	cmd.Env = append(os.Environ(), "AGENT="+agent, "WORK="+work)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("agent harness: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(filepath.Join(work, "export.tar"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateOut, err := parseConfigExport(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateOut.applyDefaults()
+	if stateOut.Settings.AdminUser != "ops" || stateOut.Settings.Hash == "" {
+		t.Fatalf("settings = %+v", stateOut.Settings)
+	}
+	if stateOut.Apps["app"] == nil || stateOut.Apps["app"].Record == nil {
+		t.Fatalf("desired app = %+v", stateOut.Apps["app"])
+	}
+	if !stateOut.AppliedSetup.Present || stateOut.AppliedSetup.Apps != "app:1000" {
+		t.Fatalf("applied setup = %+v", stateOut.AppliedSetup)
+	}
+	if string(stateOut.ActiveCaddyfile) != "# active\n" {
+		t.Fatalf("active Caddyfile = %q", stateOut.ActiveCaddyfile)
+	}
+}
+
+func TestAgentDeployRollbackUsesRunningFiles(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the agent test harness needs bash")
+	}
+	if err := exec.Command("bash", "-c", "declare -A probe=()").Run(); err != nil {
+		t.Skip("the agent needs bash 4 or newer")
+	}
+	agent, err := filepath.Abs("../../ship-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	harness := filepath.Join(work, "harness.sh")
+	script := `set -euo pipefail
+source "$AGENT"
+APPS="$WORK/apps"
+mkdir -p "$APPS/app/.ship/desired"
+printf 'current=v2\nprevious=v1\n' > "$APPS/app/.ship-state"
+printf 'source=image\nmaintenance=off\nimage_repo=ship/app\n' > "$APPS/app/.ship-meta"
+printf 'A=B\n' > "$APPS/app/.ship-env"
+validate_app(){ :; }
+validate_desired_app(){ echo desired-called >> "$WORK/log"; }
+meta_get(){ case "$2" in source) echo image ;; maintenance) echo off ;; image_repo) echo ship/app ;; esac; }
+is_healthy(){ return 0; }
+maintenance_mount(){ :; }
+deploy_image(){ RESOLVED_TAG=$2; DEPLOY_IMAGE="ship/app:$2"; }
+compose_app(){ echo "compose $*" >> "$WORK/log"; }
+ensure_data_dirs(){ :; }
+write_ship_env(){ echo "env $2" >> "$WORK/log"; }
+set_state(){ echo "state $2 $3" >> "$WORK/log"; }
+promote_desired(){ echo PROMOTE >> "$WORK/log"; }
+prune_images(){ :; }
+http_check(){ return 0; }
+maintenance_app(){ :; }
+has_data(){ return 1; }
+deploy_app app v1 no running
+grep -q "env ship/app:v1" "$WORK/log"
+grep -q "state v1 v2" "$WORK/log"
+! grep -q PROMOTE "$WORK/log"
+! grep -q desired-called "$WORK/log"
+`
+	if err := os.WriteFile(harness, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", harness)
+	cmd.Env = append(os.Environ(), "AGENT="+agent, "WORK="+work)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("agent harness: %v\n%s", err, out)
+	}
+}
+
+func TestAgentDeployShortCircuitsWhenDesiredMatchesRunning(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the agent test harness needs bash")
+	}
+	if err := exec.Command("bash", "-c", "declare -A probe=()").Run(); err != nil {
+		t.Skip("the agent needs bash 4 or newer")
+	}
+	agent, err := filepath.Abs("../../ship-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	harness := filepath.Join(work, "harness.sh")
+	script := `set -euo pipefail
+source "$AGENT"
+APPS="$WORK/apps"
+STATE="$APPS/.ship"
+mkdir -p "$APPS/app/.ship/desired"
+printf 'current=v1\nprevious=v0\n' > "$APPS/app/.ship-state"
+printf 'source=image\nmaintenance=off\nimage_repo=ship/app\n' > "$APPS/app/.ship-meta"
+validate_desired_app(){ :; }
+meta_get(){ case "$2" in source) echo image ;; maintenance) echo off ;; esac; }
+is_healthy(){ return 0; }
+desired_matches_running(){ return 0; }
+maintenance_mount(){ echo MOUNT >> "$WORK/log"; }
+deploy_image(){ echo DEPLOY >> "$WORK/log"; }
+take_backup(){ echo BACKUP >> "$WORK/log"; }
+maintenance_app(){ echo MAINT >> "$WORK/log"; }
+promote_desired(){ echo PROMOTE >> "$WORK/log"; }
+deploy_app app v1 yes
+[ ! -e "$WORK/log" ]
+`
+	if err := os.WriteFile(harness, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", harness)
+	cmd.Env = append(os.Environ(), "AGENT="+agent, "WORK="+work)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("agent harness: %v\n%s", err, out)
+	}
+}
+
+func TestAgentRestorePreviousImageReupsRunningConfig(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the agent test harness needs bash")
+	}
+	if err := exec.Command("bash", "-c", "declare -A probe=()").Run(); err != nil {
+		t.Skip("the agent needs bash 4 or newer")
+	}
+	agent, err := filepath.Abs("../../ship-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	harness := filepath.Join(work, "harness.sh")
+	script := `set -euo pipefail
+source "$AGENT"
+write_ship_env(){ echo "env $2" >> "$WORK/log"; }
+image_for(){ echo "ship/app:$2"; }
+compose_app(){ echo "compose $*" >> "$WORK/log"; return 0; }
+is_healthy(){ return 0; }
+META_DIR=/desired
+APP_COMPOSE_FILE=/desired/compose.yaml
+restore_previous_image app v1 v0 v1
+grep -q "env ship/app:v1" "$WORK/log"
+grep -q "compose .* up -d" "$WORK/log"
+[ -z "$META_DIR" ]
+[ -z "$APP_COMPOSE_FILE" ]
+`
+	if err := os.WriteFile(harness, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", harness)
+	cmd.Env = append(os.Environ(), "AGENT="+agent, "WORK="+work)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("agent harness: %v\n%s", err, out)
+	}
+}
+
 func tarNames(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {

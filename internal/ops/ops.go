@@ -14,7 +14,6 @@ import (
 
 	"github.com/harrisonclewis/ship/internal/config"
 	"github.com/harrisonclewis/ship/internal/remote"
-	"github.com/harrisonclewis/ship/internal/render"
 )
 
 // Options configures an Ops.
@@ -26,6 +25,9 @@ type Options struct {
 	Agent  []byte
 	// Runner overrides the command runner (tests).
 	Runner remote.Runner
+	// ApproveBuild asks the user to approve an unapproved build script. When
+	// nil, deploy returns *BuildApprovalError instead of prompting.
+	ApproveBuild func(*BuildApprovalError) error
 }
 
 // Ops runs ship operations for one loaded config.
@@ -86,14 +88,15 @@ func (o *Ops) session(ctx context.Context, server string) (*remote.Session, *con
 	if err != nil {
 		return nil, nil, err
 	}
-	if !o.opts.DryRun {
+	if !o.opts.DryRun && !srv.IsLocal() {
 		if err := remote.CheckIdentityFile(srv.IdentityFile); err != nil {
 			return nil, nil, fmt.Errorf("servers.%s.%w", srv.Name, err)
 		}
 	}
-	s := remote.NewSessionContext(srv.Host, o.opts.DryRun, o.opts.Out, o.opts.ErrOut, ctx)
-	s.IdentityFile = srv.IdentityFile
-	if o.opts.Runner != nil {
+	s := o.configureSession(ctx, srv, o.opts.DryRun)
+	// A dry run always prints commands; a runner seam only replaces the real
+	// executor.
+	if o.opts.Runner != nil && !o.opts.DryRun {
 		s.Runner = o.opts.Runner
 	}
 	return s, srv, nil
@@ -110,43 +113,89 @@ func (o *Ops) readSession(ctx context.Context, server string) (*remote.Session, 
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := remote.CheckIdentityFile(srv.IdentityFile); err != nil {
-		return nil, nil, fmt.Errorf("servers.%s.%w", srv.Name, err)
+	if !srv.IsLocal() {
+		if err := remote.CheckIdentityFile(srv.IdentityFile); err != nil {
+			return nil, nil, fmt.Errorf("servers.%s.%w", srv.Name, err)
+		}
 	}
-	s := remote.NewSessionContext(srv.Host, false, o.opts.Out, o.opts.ErrOut, ctx)
-	s.IdentityFile = srv.IdentityFile
+	s := o.configureSession(ctx, srv, false)
 	if o.opts.Runner != nil {
 		s.Runner = o.opts.Runner
 	}
 	return s, srv, nil
 }
 
+// configureSession builds an ssh session or a local one for srv.
+func (o *Ops) configureSession(ctx context.Context, srv *config.Server, dryRun bool) *remote.Session {
+	if srv.IsLocal() {
+		s := remote.NewLocalSessionContext(dryRun, o.opts.Out, o.opts.ErrOut, ctx)
+		s.User = srv.User
+		return s
+	}
+	s := remote.NewSessionContext(srv.Host, dryRun, o.opts.Out, o.opts.ErrOut, ctx)
+	s.IdentityFile = srv.IdentityFile
+	return s
+}
+
 func (o *Ops) ensureAgent(s *remote.Session) error {
 	return s.EnsureAgent(o.opts.Agent)
 }
 
-// Setup prepares or re-runs the server.
+// Setup prepares or re-runs the server using its desired settings and app
+// records.
 func (o *Ops) Setup(ctx context.Context, server string) error {
-	s, srv, err := o.session(ctx, server)
+	state, err := o.FetchConfig(ctx, server)
+	if err != nil {
+		return err
+	}
+	records, err := state.DesiredRecords()
+	if err != nil {
+		return err
+	}
+	s, _, err := o.session(ctx, server)
 	if err != nil {
 		return err
 	}
 	if err := o.ensureAgent(s); err != nil {
 		return err
 	}
-	return s.RunAgent("setup", srv.AdminUser, srv.CaddyImage, srv.AppsSpec())
+	return s.RunAgent("setup", state.Settings.AdminUser, state.Settings.CaddyImage, AppsSpecFor(records))
+}
+
+// RecordSetup marks the current desired admin user and app:uid list as already
+// applied, without running setup. config push uses it for legacy servers.
+func (o *Ops) RecordSetup(ctx context.Context, server, adminUser, appsSpec string) error {
+	if err := config.ValidateServerSettings(adminUser, config.DefaultCaddyImage); err != nil {
+		return err
+	}
+	if o.opts.DryRun {
+		fmt.Fprintf(o.opts.Out, "# would record setup as applied for %s\n", adminUser)
+		return nil
+	}
+	s, _, err := o.session(ctx, server)
+	if err != nil {
+		return err
+	}
+	if err := o.ensureAgent(s); err != nil {
+		return err
+	}
+	return s.RunAgent("setup-record", adminUser, appsSpec)
 }
 
 // LockSSH disables password and root SSH logins.
 func (o *Ops) LockSSH(ctx context.Context, server string) error {
-	s, srv, err := o.session(ctx, server)
+	state, err := o.FetchConfig(ctx, server)
+	if err != nil {
+		return err
+	}
+	s, _, err := o.session(ctx, server)
 	if err != nil {
 		return err
 	}
 	if err := o.ensureAgent(s); err != nil {
 		return err
 	}
-	return s.RunAgent("lock-ssh", srv.AdminUser)
+	return s.RunAgent("lock-ssh", state.Settings.AdminUser)
 }
 
 // VPSUpdate upgrades packages and reports whether a reboot is required.
@@ -185,29 +234,83 @@ func (o *Ops) VPSReboot(ctx context.Context, server string) error {
 	return s.RunAgent("reboot")
 }
 
-// ProxyUpdate renders this server's Caddyfile and activates it.
+// ProxySync renders the Caddyfile from server records and reloads Caddy.
+func (o *Ops) ProxySync(ctx context.Context, server string) error {
+	return o.proxyApply(ctx, server, false)
+}
+
+// ProxyRestart renders the Caddyfile from server records, activates it with
+// the desired image and recreates the Caddy container so pending changes apply.
+func (o *Ops) ProxyRestart(ctx context.Context, server string) error {
+	return o.proxyApply(ctx, server, true)
+}
+
+// ProxyUpdate is the old name for ProxySync, kept for the TUI.
 func (o *Ops) ProxyUpdate(ctx context.Context, server string) error {
-	s, srv, err := o.session(ctx, server)
+	return o.ProxySync(ctx, server)
+}
+
+func (o *Ops) proxyApply(ctx context.Context, server string, restart bool) error {
+	state, err := o.FetchConfig(ctx, server)
+	if err != nil {
+		return err
+	}
+	if missing := state.RunningWithoutDesired(); len(missing) > 0 {
+		return fmt.Errorf("%s run on this server but have no desired config; run `ship %s config push` first", strings.Join(missing, ", "), server)
+	}
+	s, _, err := o.session(ctx, server)
 	if err != nil {
 		return err
 	}
 	if err := o.ensureAgent(s); err != nil {
 		return err
 	}
-	caddyfile := render.Caddyfile(srv)
+	caddyfile := state.CaddyfileFor()
 	if strings.TrimSpace(caddyfile) == "" {
 		return fmt.Errorf("rendered Caddyfile is empty")
 	}
-	return s.InputAgent([]byte(caddyfile), "proxy-update", srv.CaddyImage)
+	action := "proxy-sync"
+	if restart {
+		action = "proxy-restart"
+	}
+	return s.InputAgent([]byte(caddyfile), action, state.Settings.CaddyImage)
+}
+
+// ServerSet writes one desired server-wide setting.
+func (o *Ops) ServerSet(ctx context.Context, server, key, value string) error {
+	state, err := o.FetchConfig(ctx, server)
+	if err != nil {
+		return err
+	}
+	admin, caddy := state.Settings.AdminUser, state.Settings.CaddyImage
+	switch key {
+	case "admin_user":
+		admin = value
+	case "caddy_image":
+		caddy = value
+	default:
+		return fmt.Errorf("unknown server setting %q (want admin_user or caddy_image)", key)
+	}
+	newHash, err := o.PutServerSettings(ctx, server, admin, caddy, state.Settings.Hash)
+	if err != nil {
+		return err
+	}
+	state.Settings.Hash = newHash
+	if key == "caddy_image" {
+		fmt.Fprintf(o.opts.Out, "Saved caddy_image. Run `ship %s proxy restart` to apply it.\n", server)
+	} else {
+		fmt.Fprintf(o.opts.Out, "Saved admin_user. Run `ship %s setup` to apply it.\n", server)
+	}
+	return nil
 }
 
 // Rollback switches an app back to its previous image.
 func (o *Ops) Rollback(ctx context.Context, server, app string) error {
-	s, srv, err := o.session(ctx, server)
+	s, _, err := o.session(ctx, server)
 	if err != nil {
 		return err
 	}
-	if _, err := srv.App(app); err != nil {
+	if err := config.ValidateAppName(app); err != nil {
 		return err
 	}
 	if err := o.ensureAgent(s); err != nil {
@@ -218,11 +321,11 @@ func (o *Ops) Rollback(ctx context.Context, server, app string) error {
 
 // Restart recreates an app's containers and waits for health.
 func (o *Ops) Restart(ctx context.Context, server, app string) error {
-	s, srv, err := o.session(ctx, server)
+	s, _, err := o.session(ctx, server)
 	if err != nil {
 		return err
 	}
-	if _, err := srv.App(app); err != nil {
+	if err := config.ValidateAppName(app); err != nil {
 		return err
 	}
 	if err := o.ensureAgent(s); err != nil {
@@ -233,11 +336,11 @@ func (o *Ops) Restart(ctx context.Context, server, app string) error {
 
 // Maintenance turns an app's maintenance page on or off.
 func (o *Ops) Maintenance(ctx context.Context, server, app string, on bool) error {
-	s, srv, err := o.session(ctx, server)
+	s, _, err := o.session(ctx, server)
 	if err != nil {
 		return err
 	}
-	if _, err := srv.App(app); err != nil {
+	if err := config.ValidateAppName(app); err != nil {
 		return err
 	}
 	if err := o.ensureAgent(s); err != nil {
@@ -252,11 +355,11 @@ func (o *Ops) Maintenance(ctx context.Context, server, app string, on bool) erro
 
 // Logs follows an app's logs on a TTY.
 func (o *Ops) Logs(ctx context.Context, server, app, service string) error {
-	s, srv, err := o.session(ctx, server)
+	s, _, err := o.session(ctx, server)
 	if err != nil {
 		return err
 	}
-	if _, err := srv.App(app); err != nil {
+	if err := config.ValidateAppName(app); err != nil {
 		return err
 	}
 	if service != "" {
@@ -276,27 +379,30 @@ func (o *Ops) Logs(ctx context.Context, server, app, service string) error {
 
 // EnvEdit opens the app's secret .env in sudoedit.
 func (o *Ops) EnvEdit(ctx context.Context, server, app string) error {
-	s, srv, err := o.session(ctx, server)
+	s, _, err := o.session(ctx, server)
 	if err != nil {
 		return err
 	}
-	if _, err := srv.App(app); err != nil {
+	if err := config.ValidateAppName(app); err != nil {
 		return err
 	}
 	env := "/opt/apps/" + app + "/.env"
-	dir := "/opt/apps/" + app
-	remoteCmd := fmt.Sprintf("sudo -n install -d -m 0755 %s; sudo -n test -f %s || sudo -n install -m 0600 /dev/null %s; sudo -n chmod 0600 %s; sudo -n -e %s && echo 'Saved. Run: ship %s restart %s'",
-		remote.ShellQuote(dir), remote.ShellQuote(env), remote.ShellQuote(env), remote.ShellQuote(env), remote.ShellQuote(env), srv.Name, app)
-	return s.RunSSH(remoteCmd, true)
+	if err := s.RunEnvEdit(env); err != nil {
+		return err
+	}
+	if !o.opts.DryRun {
+		fmt.Fprintf(o.opts.Out, "Saved. Run: ship %s restart %s\n", server, app)
+	}
+	return nil
 }
 
 // Backups lists an app's archives on the server.
 func (o *Ops) Backups(ctx context.Context, server, app string) error {
-	s, srv, err := o.session(ctx, server)
+	s, _, err := o.session(ctx, server)
 	if err != nil {
 		return err
 	}
-	if _, err := srv.App(app); err != nil {
+	if err := config.ValidateAppName(app); err != nil {
 		return err
 	}
 	if err := o.ensureAgent(s); err != nil {

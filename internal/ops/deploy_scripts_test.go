@@ -53,11 +53,12 @@ func buildTestApp(t *testing.T, commands string) (*config.Server, string) {
 		t.Fatal(err)
 	}
 	srv := &config.Server{
-		Name: "prod",
-		Arch: "linux/amd64",
+		Name:    "prod",
+		Arch:    "linux/amd64",
+		Sources: map[string]string{"app": dir},
 		Apps: map[string]*config.App{
 			"app": {
-				Source: config.Source{Type: "image", Path: dir},
+				Source: config.Source{Type: "image"},
 				Build:  config.BuildSpec{Commands: commands},
 			},
 		},
@@ -78,8 +79,9 @@ func TestBuildCommandsRunBeforeBuildx(t *testing.T) {
 	}}
 	var out bytes.Buffer
 	s := &remote.Session{Host: "ops@host", Out: &out, Err: io.Discard, Runner: r}
+	op := New(&config.Config{Dir: t.TempDir()}, Options{Agent: testAgent, Out: &out, ErrOut: io.Discard, ApproveBuild: func(*BuildApprovalError) error { return nil }})
 
-	if _, err := buildImage(context.Background(), s, srv, "app", false); err != nil {
+	if _, err := op.buildImage(context.Background(), s, srv, "app", false); err != nil {
 		t.Fatal(err)
 	}
 	shAt, buildxAt := -1, -1
@@ -122,8 +124,9 @@ func TestBuildCommandsFailureStopsBeforeBuildx(t *testing.T) {
 		},
 	}
 	s := &remote.Session{Host: "ops@host", Out: io.Discard, Err: io.Discard, Runner: r}
+	op := New(&config.Config{Dir: t.TempDir()}, Options{Agent: testAgent, Out: io.Discard, ErrOut: io.Discard, ApproveBuild: func(*BuildApprovalError) error { return nil }})
 
-	_, err := buildImage(context.Background(), s, srv, "app", false)
+	_, err := op.buildImage(context.Background(), s, srv, "app", false)
 	if err == nil || !strings.Contains(err.Error(), "build commands") {
 		t.Fatalf("err = %v", err)
 	}
@@ -139,45 +142,30 @@ func TestDeployDryRunShowsBothScripts(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(imageDir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "apps", "app"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "apps", "app", "compose.yaml"), []byte("name: app\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	doc := `servers:
-  prod:
-    host: ops@203.0.113.10
-    apps:
-      app:
-        domains: [app.example.com]
-        upstream: app:8080
-        source:
-          type: image
-          path: ` + imageDir + `
-        build:
-          commands: |
-            npm ci
-            npm run build
-        deploy:
-          maintenance: true
-          commands: |
-            # migrate first
-            ./migrate
-        backup: {}
-        env: {}
+	record := `domains: [app.example.com]
+upstream: app:8080
+source:
+  type: image
+build:
+  commands: |
+    npm ci
+    npm run build
+deploy:
+  maintenance: true
+  commands: |
+    # migrate first
+    ./migrate
 `
-	cfgPath := filepath.Join(dir, "ship.yaml")
-	if err := os.WriteFile(cfgPath, []byte(doc), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	export := buildConfigExport(t, map[string]string{
+		"config/arch":               "x86_64\n",
+		"desired/app/ship-app.yaml": record,
+		"desired/app/compose.yaml":  "name: app\n",
+	})
 	var out bytes.Buffer
-	op := New(cfg, Options{DryRun: true, Out: &out, ErrOut: io.Discard})
+	cfg := &config.Config{Dir: t.TempDir(), Servers: map[string]*config.Server{
+		"prod": {Name: "prod", Host: "ops@203.0.113.10", Sources: map[string]string{"app": imageDir}},
+	}}
+	op := New(cfg, Options{Agent: testAgent, DryRun: true, Out: &out, ErrOut: io.Discard, Runner: &configExportRunner{export: export}})
 	if err := op.Deploy(context.Background(), "prod", "app", "", false); err != nil {
 		t.Fatal(err)
 	}
@@ -224,5 +212,62 @@ func TestAppFilesTarAllowsDeployScript(t *testing.T) {
 	}
 	if got[".ship-deploy.sh"] != "# migrate\n./migrate\n" {
 		t.Fatalf("deploy script member = %q (all %#v)", got[".ship-deploy.sh"], got)
+	}
+}
+
+func TestUnapprovedBuildCommandsReturnTypedError(t *testing.T) {
+	srv, _ := buildTestApp(t, "echo new\n")
+	r := &fakeRunner{onOutput: func(c remote.Cmd) ([]byte, error) {
+		if hasArg(c.Args, "--porcelain") {
+			return nil, nil
+		}
+		return []byte("v1.2.3\n"), nil
+	}}
+	op := New(&config.Config{Dir: t.TempDir()}, Options{Agent: testAgent, Out: io.Discard, ErrOut: io.Discard, Runner: r})
+	s := &remote.Session{Host: "ops@host", Out: io.Discard, Err: io.Discard, Runner: r}
+	_, err := op.buildImage(context.Background(), s, srv, "app", false)
+	var approval *BuildApprovalError
+	if !errors.As(err, &approval) {
+		t.Fatalf("err = %v, want *BuildApprovalError", err)
+	}
+	if approval.App != "app" || approval.Server != "prod" || !strings.Contains(approval.Script, "echo new") {
+		t.Fatalf("approval error = %+v", approval)
+	}
+	for _, c := range r.cmds {
+		if c.Path == "sh" {
+			t.Fatal("unapproved script ran")
+		}
+	}
+}
+
+func TestApprovedBuildCommandsAreRemembered(t *testing.T) {
+	srv, _ := buildTestApp(t, "echo approved\n")
+	dir := t.TempDir()
+	r := &fakeRunner{onOutput: func(c remote.Cmd) ([]byte, error) {
+		if hasArg(c.Args, "--porcelain") {
+			return nil, nil
+		}
+		return []byte("v1.2.3\n"), nil
+	}}
+	op := New(&config.Config{Dir: dir}, Options{Agent: testAgent, Out: io.Discard, ErrOut: io.Discard, Runner: r})
+	s := &remote.Session{Host: "ops@host", Out: io.Discard, Err: io.Discard, Runner: r}
+	if _, err := op.buildImage(context.Background(), s, srv, "app", false); err == nil {
+		t.Fatal("unapproved build ran")
+	}
+	if err := op.RecordBuildApproval("prod", "app", "echo approved\n"); err != nil {
+		t.Fatal(err)
+	}
+	ran := false
+	r.onRun = func(c remote.Cmd) error {
+		if c.Path == "sh" {
+			ran = true
+		}
+		return nil
+	}
+	if _, err := op.buildImage(context.Background(), s, srv, "app", false); err != nil {
+		t.Fatal(err)
+	}
+	if !ran {
+		t.Fatal("approved build script did not run")
 	}
 }

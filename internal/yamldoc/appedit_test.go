@@ -71,7 +71,7 @@ func TestAppFieldSettersSaveAndKeepComments(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg, err := config.Load(path)
+	cfg, err := config.LoadOld(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestAppYAMLRoundTripSplicesOnlyThatApp(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg, err := config.Load(path)
+	cfg, err := config.LoadOld(path)
 	if err != nil {
 		t.Fatal(err)
 	}

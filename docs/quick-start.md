@@ -19,32 +19,37 @@ Windows and manual installs are in [Install](install.md).
 
 ## 2. Add the server
 
-In the TUI:
-
-```sh
-ship
-```
-
-Press `a` on the Servers tab. Name it `prod`, set the host to `root@<ip>`, and press `Enter`. This creates `~/.config/ship/ship.yaml`.
-
-Or create `~/.config/ship/ship.yaml` with your editor:
+Create `~/.config/ship/ship.yaml` with your editor:
 
 ```yaml
 servers:
   prod:
     host: root@<ip>
-    apps: {}
 ```
 
 Add `identity_file: ~/.ssh/<key>` if your ssh config and agent don't already offer the key. Once the file exists, `ship config edit` opens it. See [where ship looks](reference/ship-yaml.md#where-ship-looks).
 
+That is the whole local server entry. App records, compose files and Dockerfiles live on the server. If you have an older full-format file with local `apps`, migrate it first:
+
+```sh
+ship prod config push
+```
+
 ## 3. Prepare the server and lock SSH
+
+To use a different admin user, set it before setup:
+
+```sh
+ship prod server set admin_user <name>
+```
+
+The rest of this guide uses the default `ops`. Then:
 
 ```sh
 ship prod setup
 ```
 
-Setup installs packages and Docker, creates the Caddy stack files, the `ops` admin user with root's SSH keys, the firewall rules and the backup timer.
+Setup reads the desired server settings, defaulting to admin user `ops` and `caddy:2.10-alpine`, and installs packages and Docker, creates the Caddy stack files, the admin user with root's SSH keys, the firewall rules and the backup timer.
 
 Check the admin login:
 
@@ -52,7 +57,7 @@ Check the admin login:
 ssh ops@<ip> sudo true
 ```
 
-Change `prod`'s host to `ops@<ip>`: open the server in the TUI and press `e`, or run `ship config edit`. Then:
+Change `prod`'s host to `ops@<ip>` with `ship config edit`. Then:
 
 ```sh
 ship prod lock-ssh
@@ -68,39 +73,47 @@ git clone https://github.com/docker/welcome-to-docker ~/src/welcome-to-docker
 
 It is a Node app with a `Dockerfile`; `serve` listens on port 3000.
 
-In the TUI, open `prod`, press `a`, and fill in:
+Create the desired app on the server:
 
-| Field | Value |
-|---|---|
-| Name | `welcome` |
-| Domains | `hello.<yourdomain>` |
-| Upstream | `welcome:3000` |
-| Source type | `Local image` |
-| Local image source path | `~/src/welcome-to-docker` |
+```sh
+ship prod app create welcome
+```
 
-In `ship.yaml`, the same app is:
+The editor opens a template. Fill it in:
+
+```yaml
+domains: [hello.<yourdomain>]
+upstream: welcome:3000
+source:
+  type: image
+backup: {}
+```
+
+Then point this machine at the checkout:
+
+```sh
+ship prod app set welcome source.path ~/src/welcome-to-docker
+```
+
+`source.path` is local only. `ship.yaml` now holds the source:
 
 ```yaml
 servers:
   prod:
-    apps:
-      welcome:
-        domains: [hello.<yourdomain>]
-        upstream: welcome:3000
-        source:
-          type: image
-          path: ~/src/welcome-to-docker
+    host: ops@<ip>
+    sources:
+      welcome: ~/src/welcome-to-docker
 ```
 
-To change the path later, run `ship prod app set welcome source.path <path>`.
+Change the record later with `ship prod app edit welcome` or `ship prod app set welcome <key> <value>`.
 
 ## 5. Add the compose file
 
 ```sh
-ship config edit welcome
+ship prod config edit welcome compose
 ```
 
-This opens an empty `apps/welcome/compose.yaml`. Use:
+The editor opens the app's desired compose file on the server. Use:
 
 ```yaml
 name: welcome
@@ -152,16 +165,18 @@ DNS changes can take time to propagate. Caddy cannot get a certificate until DNS
 ## 7. Deploy
 
 ```sh
-ship prod proxy update
 ship prod deploy welcome
+ship prod proxy sync
 ship prod status welcome
 ```
 
-The first deploy builds the image on your machine, sends it over SSH, starts it and waits for health. Then open `https://hello.<yourdomain>`.
+The first deploy builds the image on your machine from `sources.welcome`, sends it over SSH, starts it and waits for health. The proxy picks up the app's route when you run `proxy sync`. Then open `https://hello.<yourdomain>`.
+
+Later domain or redirect changes need `ship prod proxy restart`; a deploy only applies the app's config, compose and image.
 
 ## Next steps
 
 - [Manage domains](guides/manage-domains.md) — add domains, redirects and DNS
-- [Edit config](guides/edit-config.md) — change the app from the CLI or TUI
+- [Edit config](guides/edit-config.md) — change the app from the CLI
 - [Back up and restore](guides/back-up-and-restore.md)
 - [Use ship from another machine](guides/use-from-another-machine.md)

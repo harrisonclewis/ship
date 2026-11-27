@@ -45,8 +45,13 @@ func (s DeploySummary) summaryError() error {
 }
 
 // Deploy deploys one app on a server. An empty version builds the current git
-// tree for image apps, or means latest for release apps.
+// tree for image apps, or means latest for release apps. The app's record and
+// files are read from the server, never from the local file.
 func (o *Ops) Deploy(ctx context.Context, server, app, version string, allowDirty bool) error {
+	state, err := o.FetchConfig(ctx, server)
+	if err != nil {
+		return err
+	}
 	s, srv, err := o.session(ctx, server)
 	if err != nil {
 		return err
@@ -54,13 +59,17 @@ func (o *Ops) Deploy(ctx context.Context, server, app, version string, allowDirt
 	if err := o.ensureAgent(s); err != nil {
 		return err
 	}
-	return o.deployApp(ctx, s, srv, app, version, allowDirty)
+	o.applyServerConfig(srv, state)
+	return o.deployApp(ctx, s, srv, state, app, version, allowDirty)
 }
 
-// DeployAll deploys every app on a server in name order. A failed app is
-// recorded and the remaining apps still run. It prints a summary and returns
-// an error when anything failed.
+// DeployAll deploys every desired app on a server in name order. A failed app
+// is recorded and the remaining apps still run.
 func (o *Ops) DeployAll(ctx context.Context, server string, allowDirty bool) (DeploySummary, error) {
+	state, err := o.FetchConfig(ctx, server)
+	if err != nil {
+		return DeploySummary{Server: server}, err
+	}
 	s, srv, err := o.session(ctx, server)
 	if err != nil {
 		return DeploySummary{Server: server}, err
@@ -69,13 +78,14 @@ func (o *Ops) DeployAll(ctx context.Context, server string, allowDirty bool) (De
 	if err := o.ensureAgent(s); err != nil {
 		return summary, err
 	}
-	for _, name := range srv.AppNames() {
+	o.applyServerConfig(srv, state)
+	for _, name := range state.AppNames() {
 		if err := ctx.Err(); err != nil {
 			summary.Failed = append(summary.Failed, DeployFailure{App: name, Err: err})
 			return summary, err
 		}
 		fmt.Fprintf(o.opts.Out, "\n== deploy %s\n", name)
-		if err := o.deployApp(ctx, s, srv, name, "", allowDirty); err != nil {
+		if err := o.deployApp(ctx, s, srv, state, name, "", allowDirty); err != nil {
 			summary.Failed = append(summary.Failed, DeployFailure{App: name, Err: err})
 			continue
 		}
@@ -89,11 +99,36 @@ func (o *Ops) DeployAll(ctx context.Context, server string, allowDirty bool) (De
 	return summary, summary.summaryError()
 }
 
-func (o *Ops) deployApp(ctx context.Context, s *remote.Session, srv *config.Server, name, version string, allowDirty bool) error {
-	app, err := srv.App(name)
-	if err != nil {
-		return err
+// applyServerConfig copies desired records and the detected architecture onto
+// the runtime server value so the existing meta/image helpers keep working.
+func (o *Ops) applyServerConfig(srv *config.Server, state *ServerConfig) {
+	apps := make(map[string]*config.App, len(state.Apps))
+	for name, da := range state.Apps {
+		if da.Record != nil {
+			apps[name] = da.Record
+		}
 	}
+	srv.Apps = apps
+	arch, err := config.NormalizeArch(state.Arch)
+	if err != nil {
+		arch = config.DefaultArch
+	}
+	srv.Arch = arch
+}
+
+func (o *Ops) deployApp(ctx context.Context, s *remote.Session, srv *config.Server, state *ServerConfig, name, version string, allowDirty bool) error {
+	da := state.Apps[name]
+	if da == nil {
+		return fmt.Errorf("app %q is not configured on %s; run `ship %s config push` or `ship %s app create %s`", name, srv.Name, srv.Name, srv.Name, name)
+	}
+	if da.Record == nil {
+		reason := "the record is missing"
+		if da.RecordErr != "" {
+			reason = da.RecordErr
+		}
+		return fmt.Errorf("app %s on %s cannot be deployed: %s", name, srv.Name, reason)
+	}
+	app := da.Record
 	if app.MaintenanceEnabled() {
 		if err := checkMaintenanceSupport(s, srv); err != nil {
 			return err
@@ -110,25 +145,25 @@ func (o *Ops) deployApp(ctx context.Context, s *remote.Session, srv *config.Serv
 		}
 	case "image":
 		if version == "" {
-			version, err = buildImage(ctx, s, srv, name, allowDirty)
+			builtVersion, err := o.buildImage(ctx, s, srv, name, allowDirty)
 			if err != nil {
 				return err
 			}
+			version = builtVersion
 			built = true
 		} else if err := config.ValidateImageVersion(version); err != nil {
 			return err
 		}
+	default:
+		return fmt.Errorf("app %s has unsupported source type %q", name, app.Source.Type)
 	}
 
-	// Load the image first so a failed transfer leaves the app's files alone.
+	// Load the image first so a failed transfer leaves the running app alone.
 	if built {
 		ref := srv.ImageRef(name, version)
 		if err := s.ShipImage(ref, "image-load", name, version); err != nil {
 			return err
 		}
-	}
-	if err := uploadAppFiles(s, srv, name); err != nil {
-		return err
 	}
 	if s.DryRun && strings.TrimSpace(app.Deploy.Commands) != "" {
 		service := app.Upstream[:strings.LastIndex(app.Upstream, ":")]
@@ -150,23 +185,31 @@ func checkMaintenanceSupport(s *remote.Session, srv *config.Server) error {
 		return err
 	}
 	if strings.TrimSpace(string(out)) != "maintenance=ok" {
-		return fmt.Errorf("the proxy on %s has no maintenance mount; run `ship %s setup` and `ship %s proxy update` first",
+		return fmt.Errorf("the proxy on %s has no maintenance mount; run `ship %s setup` and `ship %s proxy sync` first",
 			srv.Name, srv.Name, srv.Name)
 	}
 	return nil
 }
 
-func buildImage(ctx context.Context, s *remote.Session, srv *config.Server, name string, allowDirty bool) (string, error) {
+func (o *Ops) buildImage(ctx context.Context, s *remote.Session, srv *config.Server, name string, allowDirty bool) (string, error) {
 	app := srv.Apps[name]
-	dir := app.Source.Path
+	dir := srv.Sources[name]
 	if strings.TrimSpace(dir) == "" {
-		return "", fmt.Errorf("set source.path for %s to build it", name)
+		return "", fmt.Errorf("set sources.%s in ship.yaml to build it", name)
 	}
 	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
-		return "", fmt.Errorf("%s.source.path: %q is not a directory", name, dir)
+		return "", fmt.Errorf("sources.%s: %q is not a directory", name, dir)
 	}
 	if fi, err := os.Stat(filepath.Join(dir, "Dockerfile")); err != nil || fi.IsDir() {
 		return "", fmt.Errorf("image app %s has no Dockerfile in %s (see docs/guides/deploy-an-app.md)", name, dir)
+	}
+	if s.LocalMode {
+		// Building on the server needs Docker access as well as CPU and memory
+		// that the running apps share.
+		if _, err := s.OutputLocal("docker", "info"); err != nil {
+			return "", fmt.Errorf("cannot reach the local Docker daemon; add your user to the docker group or run ship as root: %w", err)
+		}
+		fmt.Fprintf(s.Out, "warning: building %s uses this server's CPU and memory\n", name)
 	}
 
 	version := "dry-run"
@@ -194,11 +237,15 @@ func buildImage(ctx context.Context, s *remote.Session, srv *config.Server, name
 			return "", err
 		}
 	}
-	if err := runBuildCommands(s, app); err != nil {
+	if err := o.runBuildCommands(s, srv, name, app, dir); err != nil {
 		return "", err
 	}
 	ref := srv.ImageRef(name, version)
-	if err := s.Local("docker", "buildx", "build", "--platform", srv.Arch, "--tag", ref, "--load", dir); err != nil {
+	arch := srv.Arch
+	if arch == "" {
+		arch = config.DefaultArch
+	}
+	if err := s.Local("docker", "buildx", "build", "--platform", arch, "--tag", ref, "--load", dir); err != nil {
 		return "", fmt.Errorf("docker buildx: %w", err)
 	}
 	fmt.Fprintf(s.Out, "built %s\n", ref)
@@ -206,18 +253,23 @@ func buildImage(ctx context.Context, s *remote.Session, srv *config.Server, name
 }
 
 // runBuildCommands runs an image app's build script locally in its source
-// directory, as one `sh` process with set -e, before docker buildx runs.
-func runBuildCommands(s *remote.Session, app *config.App) error {
+// directory, as one `sh` process with set -e, before docker buildx runs. The
+// script comes from the server, so a new or changed one needs this machine's
+// approval first.
+func (o *Ops) runBuildCommands(s *remote.Session, srv *config.Server, name string, app *config.App, dir string) error {
 	if strings.TrimSpace(app.Build.Commands) == "" {
 		return nil
+	}
+	if err := o.ensureBuildApproval(srv.Name, name, app.Build.Commands); err != nil {
+		return err
 	}
 	if runtime.GOOS == "windows" && !s.DryRun {
 		if _, err := exec.LookPath("sh"); err != nil {
 			return fmt.Errorf("build commands need sh on PATH; install Git for Windows and run ship from Git Bash")
 		}
 	}
-	script := "set -e\ncd " + remote.ShellQuote(app.Source.Path) + "\n" + app.Build.Commands
-	fmt.Fprintf(s.Out, "running build commands in %s\n", app.Source.Path)
+	script := "set -e\ncd " + remote.ShellQuote(dir) + "\n" + app.Build.Commands
+	fmt.Fprintf(s.Out, "running build commands in %s\n", dir)
 	if err := s.Local("sh", "-c", script); err != nil {
 		return fmt.Errorf("build commands: %w", err)
 	}
@@ -280,39 +332,4 @@ func appFilesTar(files []appFile) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
-}
-
-func uploadAppFiles(s *remote.Session, srv *config.Server, name string) error {
-	app := srv.Apps[name]
-	composePath := srv.ComposePath(name)
-	compose, err := os.ReadFile(composePath)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", composePath, err)
-	}
-	record, err := app.RecordYAML()
-	if err != nil {
-		return fmt.Errorf("render ship-app.yaml for %s: %w", name, err)
-	}
-	files := []appFile{
-		{Name: "compose.yaml", Mode: 0o644, Data: compose},
-		{Name: "ship-app.yaml", Mode: 0o644, Data: record},
-	}
-	if app.Source.Type == "github-release" {
-		dockerfilePath := srv.DockerfilePath(name)
-		dockerfile, err := os.ReadFile(dockerfilePath)
-		if err != nil {
-			return fmt.Errorf("read %s: %w", dockerfilePath, err)
-		}
-		files = append(files, appFile{Name: "Dockerfile", Mode: 0o644, Data: dockerfile})
-	}
-	files = append(files,
-		appFile{Name: ".ship-meta", Mode: 0o644, Data: []byte(srv.Meta(name))},
-		appFile{Name: ".ship-env", Mode: 0o644, Data: []byte(srv.ShipEnv(name))},
-		appFile{Name: ".ship-deploy.sh", Mode: 0o644, Data: []byte(app.Deploy.Commands)},
-	)
-	blob, err := appFilesTar(files)
-	if err != nil {
-		return err
-	}
-	return s.InputAgent(blob, "app-files", name)
 }

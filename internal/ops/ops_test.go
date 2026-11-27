@@ -30,7 +30,7 @@ func TestListsServersAndApps(t *testing.T) {
         source: {type: github-release, repo: example/app}
         backup: {}
 `
-	op := New(loadConfig(t, doc), Options{Out: io.Discard})
+	op := New(loadConfig(t, doc), Options{Agent: testAgent, Out: io.Discard})
 	if got := strings.Join(op.Servers(), ","); got != "prod,staging" {
 		t.Fatalf("Servers = %q", got)
 	}

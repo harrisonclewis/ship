@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -18,6 +19,7 @@ type formPurpose int
 const (
 	formAddServer formPurpose = iota
 	formEditServer
+	formServerSettings
 	formAddApp
 	formEditApp
 	formEditAppSource
@@ -26,7 +28,6 @@ const (
 	formDeployVersion
 	formRestorePath
 	formLogsService
-	formImportApps
 )
 
 type formHost struct {
@@ -34,6 +35,8 @@ type formHost struct {
 	title   string
 	form    *huh.Form
 	err     string
+	// saving is set while a server write is in flight.
+	saving bool
 	// initialised is the form Init was last run for.
 	initialised *huh.Form
 
@@ -41,10 +44,8 @@ type formHost struct {
 	app    *appFormValues
 	text   string
 
-	serverName     string
-	appName        string
-	importNames    []string
-	importSelected []string
+	serverName string
+	appName    string
 }
 
 func formText(s string) string {
@@ -76,18 +77,44 @@ func envLines(env map[string]string) string {
 	return strings.TrimRight(srv.ShipEnv("x"), "\n")
 }
 
+func parseEnvLines(text string) (map[string]string, error) {
+	values := map[string]string{}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		k, val, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(k) == "" {
+			return nil, fmt.Errorf("env: %q is not KEY=VALUE", line)
+		}
+		values[strings.TrimSpace(k)] = strings.TrimSpace(val)
+	}
+	return values, nil
+}
+
 func newServerFormValues(srv *config.Server, isNew bool) *serverFormValues {
-	v := &serverFormValues{IsNew: isNew, Arch: config.DefaultArch, AdminUser: config.DefaultAdminUser, CaddyImage: config.DefaultCaddyImage}
+	v := &serverFormValues{IsNew: isNew, Connection: config.ConnectionRemote}
 	if srv != nil {
 		v.Name = srv.Name
 		v.OriginalName = srv.Name
+		v.Connection = srv.Connection
+		if v.Connection == "" {
+			v.Connection = config.ConnectionRemote
+		}
 		v.Host = srv.Host
 		v.IdentityFile = srv.IdentityFile
-		v.AdminUser = srv.AdminUser
-		v.Arch = srv.Arch
-		v.CaddyImage = srv.CaddyImage
+		v.User = srv.User
 	}
 	return v
+}
+
+func serverRemoteHidden(v *serverFormValues) bool {
+	return v.Connection == config.ConnectionLocal
+}
+
+func serverLocalHidden(v *serverFormValues) bool {
+	return v.Connection != config.ConnectionLocal
 }
 
 func (m *model) newAppFormValues(server, app string, isNew bool) *appFormValues {
@@ -102,41 +129,91 @@ func (m *model) newAppFormValues(server, app string, isNew bool) *appFormValues 
 	if isNew {
 		return v
 	}
-	srv, err := m.backend.Server(server)
-	if err != nil {
+	rec := m.recordFor(server, app)
+	if rec == nil {
 		return v
 	}
-	def, err := srv.App(app)
-	if err != nil {
-		return v
+	v.DomainsText = joinCSV(rec.Domains)
+	v.RedirectsText = joinCSV(rec.Redirects)
+	v.Upstream = rec.Upstream
+	v.SourceType = rec.Source.Type
+	v.SourceRepo = rec.Source.Repo
+	v.SourceAsset = rec.Source.Asset
+	if srv, err := m.backend.Server(server); err == nil && srv.Sources != nil {
+		v.SourcePath = srv.Sources[app]
 	}
-	v.DomainsText = joinCSV(def.Domains)
-	v.RedirectsText = joinCSV(def.Redirects)
-	v.Upstream = def.Upstream
-	v.SourceType = def.Source.Type
-	v.SourceRepo = def.Source.Repo
-	asset, sourcePath := m.doc.AppSourceRaw(server, app)
-	v.SourceAsset = asset
-	if sourcePath != "" {
-		v.SourcePath = sourcePath
-	} else {
-		v.SourcePath = def.Source.Path
+	v.SourcePath = firstNonEmpty(v.SourcePath, rec.Source.Path)
+	if rec.UID != nil {
+		v.UID = strconv.Itoa(*rec.UID)
 	}
-	if def.UID != nil {
-		v.UID = strconv.Itoa(*def.UID)
+	v.DataText = joinCSV(rec.Data)
+	v.HealthPath = rec.Health.HTTPPath
+	v.BackupSQLite = joinCSV(rec.Backup.SQLite)
+	v.BackupFiles = joinCSV(rec.Backup.Files)
+	if rec.Backup.Postgres != nil {
+		v.PostgresService = rec.Backup.Postgres.Service
+		v.PostgresDB = rec.Backup.Postgres.DB
+		v.PostgresUser = rec.Backup.Postgres.User
 	}
-	v.DataText = joinCSV(def.Data)
-	v.HealthPath = def.Health.HTTPPath
-	v.BackupSQLite = joinCSV(def.Backup.SQLite)
-	v.BackupFiles = joinCSV(def.Backup.Files)
-	if def.Backup.Postgres != nil {
-		v.PostgresService = def.Backup.Postgres.Service
-		v.PostgresDB = def.Backup.Postgres.DB
-		v.PostgresUser = def.Backup.Postgres.User
-	}
-	v.Env = envLines(def.Env)
-	v.BuildCommands, v.DeployCommands, v.DeployMaintenance = m.doc.AppExtras(server, app)
+	v.Env = envLines(rec.Env)
+	v.BuildCommands = rec.Build.Commands
+	v.DeployCommands = rec.Deploy.Commands
+	v.DeployMaintenance = rec.MaintenanceEnabled()
 	return v
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// appFromForm builds a desired record from the form. source.path is deliberately
+// omitted: it belongs only to this machine's local ship.yaml.
+func appFromForm(v *appFormValues) (*config.App, error) {
+	app := &config.App{
+		Domains:   splitCSV(v.DomainsText),
+		Redirects: splitCSV(v.RedirectsText),
+		Upstream:  strings.TrimSpace(v.Upstream),
+		Source: config.Source{
+			Type:  strings.TrimSpace(v.SourceType),
+			Repo:  strings.TrimSpace(v.SourceRepo),
+			Asset: strings.TrimSpace(v.SourceAsset),
+		},
+		Data:   splitCSV(v.DataText),
+		Health: config.Health{HTTPPath: strings.TrimSpace(v.HealthPath)},
+		Backup: config.BackupSpec{
+			SQLite: splitCSV(v.BackupSQLite),
+			Files:  splitCSV(v.BackupFiles),
+		},
+		Build:  config.BuildSpec{Commands: v.BuildCommands},
+		Deploy: config.DeploySpec{Commands: v.DeployCommands, Maintenance: &v.DeployMaintenance},
+	}
+	if v.UID != "" {
+		uid, err := strconv.Atoi(strings.TrimSpace(v.UID))
+		if err != nil {
+			return nil, fmt.Errorf("uid: %q is not a number", v.UID)
+		}
+		app.UID = &uid
+	}
+	if v.PostgresService != "" || v.PostgresDB != "" || v.PostgresUser != "" {
+		app.Backup.Postgres = &config.PostgresSpec{
+			Service: strings.TrimSpace(v.PostgresService),
+			DB:      strings.TrimSpace(v.PostgresDB),
+			User:    strings.TrimSpace(v.PostgresUser),
+		}
+	}
+	env, err := parseEnvLines(v.Env)
+	if err != nil {
+		return nil, err
+	}
+	if len(env) > 0 {
+		app.Env = env
+	}
+	return app, nil
 }
 
 func appRoutingFields(v *appFormValues) []huh.Field {
@@ -155,7 +232,9 @@ func appSourceReleaseFields(v *appFormValues) []huh.Field {
 
 func appSourceImageFields(v *appFormValues) []huh.Field {
 	return []huh.Field{
-		huh.NewInput().Title("Local image source path").Value(&v.SourcePath),
+		huh.NewInput().Title("Local source path").
+			Description("Stored only in this machine's ship.yaml, never on the server.").
+			Value(&v.SourcePath),
 	}
 }
 
@@ -183,31 +262,47 @@ func (m *model) buildForm(f *formHost) *huh.Form {
 	switch f.purpose {
 	case formAddServer, formEditServer:
 		v := f.server
-		title := "Name"
-		if !v.IsNew {
-			title = "Name (rename)"
-		}
 		f.title = "Server"
-		return huh.NewForm(huh.NewGroup(
-			huh.NewInput().Title(title).Value(&v.Name),
+		remoteFields := huh.NewGroup(
 			huh.NewInput().Title("Host (user@host)").Value(&v.Host),
 			huh.NewInput().Title("SSH private key (optional)").
 				Description("Path to the key for this server, e.g. ~/.ssh/id_ed25519. Empty uses your ssh config and agent.").
 				Value(&v.IdentityFile),
+		).WithHideFunc(func() bool { return serverRemoteHidden(v) })
+		localFields := huh.NewGroup(
+			huh.NewInput().Title("Admin user (optional)").
+				Description("The user to act as on this machine, e.g. ops. Empty uses the current user; ship uses sudo to act as root.").
+				Value(&v.User),
+		).WithHideFunc(func() bool { return serverLocalHidden(v) })
+		return huh.NewForm(
+			huh.NewGroup(
+				huh.NewInput().Title("Name").Value(&v.Name),
+				huh.NewSelect[string]().Title("Connection").
+					Options(
+						huh.NewOption("Remote (SSH)", config.ConnectionRemote),
+						huh.NewOption("Local (this server)", config.ConnectionLocal),
+					).
+					Value(&v.Connection),
+			),
+			remoteFields,
+			localFields,
+		).WithWidth(width)
+	case formServerSettings:
+		v := f.server
+		f.title = "Server settings · " + f.serverName
+		return huh.NewForm(huh.NewGroup(
 			huh.NewInput().Title("Admin user").Value(&v.AdminUser),
-			huh.NewSelect[string]().Title("Architecture").
-				Options(huh.NewOption("linux/amd64", "linux/amd64"), huh.NewOption("linux/arm64", "linux/arm64")).
-				Value(&v.Arch),
 			huh.NewInput().Title("Caddy image").Value(&v.CaddyImage),
 		)).WithWidth(width)
 	case formAddApp, formEditApp:
 		v := f.app
 		f.title = "Application"
 		nameTitle := "Name"
+		nameDescription := ""
 		if !v.IsNew {
-			nameTitle = "Name (rename)"
+			nameDescription = "Names cannot be changed; create a new app and delete the old one."
 		}
-		basicsFields := []huh.Field{huh.NewInput().Title(nameTitle).Value(&v.Name)}
+		basicsFields := []huh.Field{huh.NewInput().Title(nameTitle).Description(nameDescription).Value(&v.Name)}
 		basicsFields = append(basicsFields, appRoutingFields(v)...)
 		basicsFields = append(basicsFields, huh.NewInput().Title("Upstream (service:port)").Value(&v.Upstream))
 		basics := huh.NewGroup(basicsFields...)
@@ -259,31 +354,15 @@ func (m *model) buildForm(f *formHost) *huh.Form {
 			fields = append(fields, appDeployFields(v)...)
 			return huh.NewForm(huh.NewGroup(fields...)).WithWidth(width)
 		}
-	case formImportApps:
-		f.title = "Import apps from " + f.serverName
-		opts := make([]huh.Option[string], 0, len(f.importNames))
-		for _, name := range f.importNames {
-			opts = append(opts, huh.NewOption(name, name))
-		}
-		return huh.NewForm(huh.NewGroup(
-			huh.NewMultiSelect[string]().
-				Title("Apps to import").
-				Description("Selected apps are copied into ship.yaml and apps/<name>.").
-				Options(opts...).
-				Value(&f.importSelected),
-		)).WithWidth(width)
 	case formDeployVersion, formRestorePath, formLogsService:
 		input := huh.NewInput().Value(&f.text)
 		switch f.purpose {
 		case formDeployVersion:
 			f.title = "Deploy version"
-			srv, _ := m.backend.Server(f.serverName)
-			if srv != nil {
-				if app, err := srv.App(f.appName); err == nil && app.Source.Type == "image" {
-					input.Title("Version").Description("Blank builds the current git tree; otherwise an already loaded tag.")
-				} else {
-					input.Title("Release tag").Description("Blank deploys the latest release, e.g. v1.2.3.")
-				}
+			if rec := m.recordFor(f.serverName, f.appName); rec != nil && rec.Source.Type == "image" {
+				input.Title("Version").Description("Blank builds the current git tree; otherwise an already loaded tag.")
+			} else {
+				input.Title("Release tag").Description("Blank deploys the latest release, e.g. v1.2.3.")
 			}
 		case formRestorePath:
 			f.title = "Restore from local path"

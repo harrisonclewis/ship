@@ -57,7 +57,7 @@ eval "$(ssh-agent -s)"
 ssh-add ~/.ssh/prod
 ```
 
-Now run [setup](add-a-server.md#3-prepare-the-server). It copies root's keys to the admin user (`ops`), so the same key logs in as `ops` afterwards.
+Now run [setup](add-a-server.md#3-prepare-the-server). It copies root's keys to the admin user (`ops` by default), so the same key logs in as that user afterwards.
 
 ## Add another machine or person
 
@@ -76,7 +76,7 @@ After `lock-ssh`, root can't log in. Add new keys to the admin user instead.
    ssh -i ~/.ssh/prod -o IdentitiesOnly=yes ops@<ip> 'sudo -n true && echo ok'
    ```
 
-Then set `host: ops@<ip>` and `identity_file` in that machine's `ship.yaml`, and [import the apps](use-from-another-machine.md).
+Then set `host: ops@<ip>` and `identity_file` in that machine's `ship.yaml`. Apps come from the server; add `sources` entries only for image apps you build on that machine. See [Use ship from another machine](use-from-another-machine.md).
 
 ## Remove access
 

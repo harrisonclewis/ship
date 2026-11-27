@@ -6,7 +6,7 @@ ship prod backups <app>                   # list server archives
 ship prod restore <app> <archive>         # restore one
 ```
 
-`backup` without an app backs up every app. In the TUI, choose **Backup** (`b`), **Backups** (`L`) or **Restore** (`t`) from an app's actions.
+`backup` without an app backs up every running app. In the TUI, choose **Backup** (`b`), **Backups** (`L`) or **Restore** (`t`) from an app's actions.
 
 ## What an archive holds
 
@@ -56,4 +56,4 @@ Before stopping the app, the agent makes sure the archived version's image exist
 
 Postgres dumps are in the archive but are not replayed automatically. Restore them with `psql` after inspecting the dump.
 
-See [ship.yaml](../reference/ship-yaml.md#keys) for the backup keys.
+See [ship.yaml](../reference/ship-yaml.md#app-record-keys) for the backup keys in the app's desired record.

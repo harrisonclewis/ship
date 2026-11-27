@@ -1,6 +1,12 @@
 # Compose files reference
 
-Each app has a hand-written `apps/<name>/compose.yaml` beside `ship.yaml`. Apps with the same name on different servers share that folder.
+Each app has a hand-written compose file in its desired configuration on the server:
+
+```text
+/opt/apps/<app>/.ship/desired/compose.yaml
+```
+
+Edit it with `ship <server> config edit <app> compose`; a deploy reads it from there. There is no local `apps/<name>/compose.yaml`.
 
 ```yaml
 services:
@@ -21,29 +27,27 @@ networks:
 
 | Rule | Why |
 |---|---|
-| At least one service uses `image: ${IMAGE…}` | ship writes the app's image to `/opt/apps/<name>/.ship.env` as `IMAGE` |
+| At least one service uses `image: ${IMAGE…}` | ship writes the app's deploy image to `/opt/apps/<name>/.ship.env` as `IMAGE` |
 | The service named in `upstream` listens on that port | Caddy proxies to it, and deploy commands and health checks use it |
 | The `upstream` service on the external `web` network | Caddy can only reach services there; Docker's published ports bypass ufw |
 | A `healthcheck` | a deploy fails if the container has none or never becomes healthy |
 | No `ports:` | apps are reached through Caddy only |
 | A `mem_limit` | keeps one app from consuming the server |
 
-ship validates that the file decodes, has services, and has a service using `${IMAGE` before it saves or uploads it. The rest is enforced when the app deploys.
+ship validates that the file decodes, has services, and has a service using `${IMAGE` before it saves the desired file. The rest is enforced when the app deploys.
 
-## Files ship uploads
+## Server-side files
 
-For every deploy, ship uploads only:
+A deploy sends only the app name and version, plus the image for an image app. The app's files are already part of its configuration on the server.
 
-| File | Source |
+| Desired file | Source |
 |---|---|
-| `compose.yaml` | `apps/<name>/compose.yaml` |
-| `ship-app.yaml` | generated from the app's `ship.yaml` block |
-| `.ship-meta` | generated app metadata |
-| `.ship-env` | the app's non-secret `env` values |
-| `.ship-deploy.sh` | `deploy.commands` |
-| `Dockerfile` | `apps/<name>/Dockerfile`, release apps only |
+| `ship-app.yaml` | the app record, edited with `app create`, `app edit` or `app set` |
+| `compose.yaml` | edited with `config edit <app> compose` |
+| `Dockerfile` | edited with `config edit <app> Dockerfile`, release apps only |
+| `.ship-meta`, `.ship-env`, `.ship-deploy.sh` | generated from the record when it is saved |
 
-Other files in `apps/<name>/` are not uploaded. For image apps the Docker build context is `source.path`, not this folder; that checkout must contain its own `Dockerfile`.
+A successful deploy promotes these to the running files at `/opt/apps/<app>/`. The running `compose.yaml`, `Dockerfile`, `ship-app.yaml`, `.ship-meta`, `.ship-env` and `.ship-deploy.sh` are what the app last deployed with. `restart` and backup use the running files; a new deploy reads desired config.
 
 ## Environment
 
@@ -60,9 +64,18 @@ Other files in `apps/<name>/` are not uploaded. For image apps the Docker build 
 ## Editing
 
 ```sh
-ship config edit <app>
+ship prod config edit <app> compose
+ship prod config edit <app> Dockerfile
 ```
 
-or **Edit compose.yaml** (`f`) in the TUI. A missing file opens empty and is created on save. ship checks the compose rules and keeps the previous file as `.bak`.
+ship fetches the desired file to a temporary copy, opens it in `$VISUAL`, `$EDITOR` or `vi`, validates compose files and puts the result back. A missing compose file opens empty; a missing Dockerfile can be created the same way. Other changes on the server are detected and the save is refused.
 
-See [Add an app](../guides/add-an-app.md) for the full checklist, and [ship.yaml](ship-yaml.md) for app keys.
+Deploy to apply the change:
+
+```sh
+ship prod deploy <app>
+```
+
+`app create` seeds a minimal compose file, so you can create an app and edit its compose file straight away.
+
+See [Add an app](../guides/add-an-app.md) for the full checklist, and [ship.yaml](ship-yaml.md) for the app record keys.

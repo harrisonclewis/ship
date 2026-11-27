@@ -5,17 +5,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/charmbracelet/x/ansi"
-	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/harrisonclewis/ship/internal/config"
 	"github.com/harrisonclewis/ship/internal/localedit"
@@ -42,8 +40,10 @@ type serverAction int
 const (
 	saDeployAll serverAction = iota
 	saBackupAll
-	saProxyUpdate
+	saProxyRestart
+	saProxySync
 	saSetup
+	saServerSettings
 	saLockSSH
 	saVPSUpdate
 	saReboot
@@ -63,13 +63,15 @@ type serverActionDef struct {
 var serverActionDefs = []serverActionDef{
 	{"d", "Deploy all", "Deploy every app in name order", saDeployAll, false},
 	{"b", "Backup all", "Archive and download every app", saBackupAll, false},
-	{"p", "Proxy update", "Render and activate the Caddyfile", saProxyUpdate, false},
+	{"p", "Restart Caddy", "Render the Caddyfile and recreate Caddy so routing and image changes apply", saProxyRestart, false},
+	{"P", "Sync Caddy (reload)", "Render the Caddyfile and reload Caddy without recreating it", saProxySync, false},
 	{"s", "Setup", "Prepare packages, users, Docker and the backup timer", saSetup, false},
+	{"g", "Server settings", "Change admin_user and caddy_image on the server", saServerSettings, false},
 	{"l", "Lock SSH", "Disable password and root SSH logins", saLockSSH, true},
 	{"u", "VPS update", "apt update, full upgrade and autoremove", saVPSUpdate, false},
 	{"R", "Reboot", "Reboot the server", saReboot, true},
-	{"a", "Add app", "Add an application to ship.yaml", saAddApp, false},
-	{"e", "Edit server", "Change host, admin user, arch or Caddy image", saEditServer, false},
+	{"a", "Add app", "Add an application to this server", saAddApp, false},
+	{"e", "Edit server", "Change host or identity file in ship.yaml", saEditServer, false},
 	{"x", "Delete server", "Remove it from ship.yaml only", saDeleteServer, true},
 }
 
@@ -88,9 +90,9 @@ const (
 	aaEnvEdit
 	aaEdit
 	aaEditCompose
+	aaEditDockerfile
 	aaDelete
 	aaCompare
-	aaImport
 )
 
 type appActionDef struct {
@@ -113,9 +115,12 @@ var appActionDefs = []appActionDef{
 	{"g", "Logs", "Follow logs in the terminal", aaLogs, false},
 	{"e", "Edit env", "sudoedit the app's secret .env", aaEnvEdit, false},
 	{"i", "Edit…", "Source, domains, commands, YAML or all settings", aaEdit, false},
-	{"f", "Edit compose.yaml", "Open apps/<app>/compose.yaml in your editor", aaEditCompose, false},
-	{"x", "Delete app", "Remove it from ship.yaml only", aaDelete, true},
+	{"f", "Edit compose.yaml", "Open the server's desired compose file", aaEditCompose, false},
+	{"x", "Delete app", "Remove its desired configuration and stop its stack", aaDelete, true},
+	{"c", "Compare with running", "Show the diff from running to desired", aaCompare, false},
 }
+
+var dockerfileAppAction = appActionDef{"F", "Edit Dockerfile", "Open the server's desired Dockerfile", aaEditDockerfile, false}
 
 type appEditAction int
 
@@ -142,27 +147,28 @@ var appEditActionDefs = []appEditActionDef{
 	{"a", "All settings", "Open the full app form", eaAll},
 }
 
-var compareAppAction = appActionDef{"c", "Compare with server", "Show record and file differences; use the server version", aaCompare, false}
-var importAppAction = appActionDef{"i", "Import app", "Copy this app's record and files from the server", aaImport, false}
-var importComposeAction = appActionDef{"i", "Import compose file", "No record (older ship); copy only its compose files", aaImport, false}
-var importUnreadableAction = appActionDef{"i", "Import compose file", "Record unreadable (newer ship?); copy only its compose files", aaImport, false}
+var compareAppAction = appActionDef{"c", "Compare with running", "Show the diff from running to desired", aaCompare, false}
 
 type confirmDialog struct {
-	title   string
-	body    string
-	yes     func() tea.Cmd
-	no      func() tea.Cmd
-	ack     bool
-	yesHint string
-	noHint  string
+	title      string
+	body       string
+	script     string
+	scroll     int
+	scrollable bool
+	yes        func() tea.Cmd
+	no         func() tea.Cmd
+	ack        bool
+	yesHint    string
+	noHint     string
 }
 
 type editKind int
 
 const (
 	editShipConfig editKind = iota
-	editCompose
-	editAppYAML
+	editDesiredCompose
+	editDesiredDockerfile
+	editDesiredRecord
 )
 
 type editTarget struct {
@@ -170,6 +176,7 @@ type editTarget struct {
 	label     string
 	validator localedit.Validator
 	kind      editKind
+	server    string
 }
 
 type editBuffer interface {
@@ -221,12 +228,11 @@ type model struct {
 	statusErr     map[string]string
 	statusLoading map[string]bool
 
-	serverApps        map[string][]ops.ServerApp
-	serverAppsErr     map[string]string
-	serverAppsLoading map[string]bool
-	appDiffs          map[string]map[string]ops.AppDiff
+	variances       map[string]ops.VarianceReport
+	varianceErr     map[string]string
+	varianceLoading map[string]bool
 
-	compare     ops.AppDiff
+	compareApp  string
 	compareText string
 
 	backups        []BackupEntry
@@ -260,25 +266,32 @@ type backupsMsg struct {
 	err    error
 }
 
-type serverAppsMsg struct {
-	server    string
-	apps      []ops.ServerApp
-	err       error
-	forImport bool
+type varianceMsg struct {
+	server string
+	report ops.VarianceReport
+	err    error
 }
 
-type importDoneMsg struct {
-	server  string
-	summary ops.ImportSummary
+type saveDoneMsg struct {
+	form    *formHost
 	err     error
+	warning string
 }
 
-// appEntry is one row on the server page: a local app, a server-only app, or
-// both.
+type deleteDoneMsg struct {
+	server string
+	app    string
+	err    error
+}
+
+type buildApprovedMsg struct {
+	req Request
+	err error
+}
+
+// appEntry is one desired app shown on the server page.
 type appEntry struct {
-	Name   string
-	Local  bool
-	Server bool
+	Name string
 }
 
 type terminalReadyMsg struct {
@@ -294,24 +307,23 @@ type editDoneMsg struct {
 
 func newModel(cfg *config.Config, backend Backend, doc *yamldoc.Doc, path string, dryRun bool) *model {
 	m := &model{
-		width:             80,
-		height:            24,
-		dryRun:            dryRun,
-		backend:           backend,
-		cfg:               cfg,
-		doc:               doc,
-		path:              path,
-		page:              pageServers,
-		activityCur:       0,
-		byID:              map[int]*activity{},
-		runs:              map[string]int{},
-		statuses:          map[string]ops.StatusReport{},
-		statusErr:         map[string]string{},
-		statusLoading:     map[string]bool{},
-		serverApps:        map[string][]ops.ServerApp{},
-		serverAppsErr:     map[string]string{},
-		serverAppsLoading: map[string]bool{},
-		appDiffs:          map[string]map[string]ops.AppDiff{},
+		width:           80,
+		height:          24,
+		dryRun:          dryRun,
+		backend:         backend,
+		cfg:             cfg,
+		doc:             doc,
+		path:            path,
+		page:            pageServers,
+		activityCur:     0,
+		byID:            map[int]*activity{},
+		runs:            map[string]int{},
+		statuses:        map[string]ops.StatusReport{},
+		statusErr:       map[string]string{},
+		statusLoading:   map[string]bool{},
+		variances:       map[string]ops.VarianceReport{},
+		varianceErr:     map[string]string{},
+		varianceLoading: map[string]bool{},
 	}
 	m.vp = viewport.New(76, 16)
 	m.resizeViewport()
@@ -403,26 +415,25 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		delete(m.statusErr, msg.server)
 		m.statuses[msg.server] = msg.report
 		return m, nil
-	case serverAppsMsg:
-		delete(m.serverAppsLoading, msg.server)
+	case varianceMsg:
+		delete(m.varianceLoading, msg.server)
 		if msg.err != nil {
-			m.serverAppsErr[msg.server] = msg.err.Error()
-			delete(m.serverApps, msg.server)
-			delete(m.appDiffs, msg.server)
-			if msg.forImport {
-				m.showToast(toastWarning, msg.err.Error())
-			}
+			m.varianceErr[msg.server] = msg.err.Error()
 			return m, nil
 		}
-		delete(m.serverAppsErr, msg.server)
-		m.serverApps[msg.server] = msg.apps
-		m.recomputeDiffs(msg.server)
-		if msg.forImport {
-			return m, m.offerImport(msg.server)
-		}
+		delete(m.varianceErr, msg.server)
+		m.variances[msg.server] = msg.report
 		return m, nil
-	case importDoneMsg:
-		return m, m.finishImport(msg)
+	case saveDoneMsg:
+		return m, m.finishSave(msg)
+	case deleteDoneMsg:
+		return m, m.finishDelete(msg)
+	case buildApprovedMsg:
+		if msg.err != nil {
+			m.showToast(toastError, msg.err.Error())
+			return m, nil
+		}
+		return m, m.startRun(msg.req)
 	case backupsMsg:
 		if m.page != pageRestorePick || msg.server != m.backupsServer || msg.app != m.backupsApp {
 			return m, nil
@@ -494,6 +505,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
 	if m.form != nil {
+		if m.form.saving {
+			return m, nil
+		}
 		if key == "esc" {
 			m.cancelForm()
 			return m, nil
@@ -509,6 +523,33 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.offerPendingReboot()
 			}
 			return m, nil
+		}
+		if m.confirm.scrollable {
+			lines := strings.Split(m.confirm.script, "\n")
+			switch key {
+			case "up", "k":
+				if m.confirm.scroll > 0 {
+					m.confirm.scroll--
+				}
+				return m, nil
+			case "down", "j":
+				if m.confirm.scroll < len(lines)-1 {
+					m.confirm.scroll++
+				}
+				return m, nil
+			case "pgup":
+				m.confirm.scroll -= 5
+				if m.confirm.scroll < 0 {
+					m.confirm.scroll = 0
+				}
+				return m, nil
+			case "pgdown":
+				m.confirm.scroll += 5
+				if m.confirm.scroll > len(lines)-1 {
+					m.confirm.scroll = len(lines) - 1
+				}
+				return m, nil
+			}
 		}
 		switch key {
 		case "y", "enter":
@@ -655,9 +696,13 @@ func (m *model) handleServerKey(key string) (tea.Model, tea.Cmd) {
 	case "b":
 		return m, m.runServerAction(saBackupAll)
 	case "p":
-		return m, m.runServerAction(saProxyUpdate)
+		return m, m.runServerAction(saProxyRestart)
+	case "P":
+		return m, m.runServerAction(saProxySync)
 	case "s":
 		return m, m.runServerAction(saSetup)
+	case "g":
+		return m, m.runServerAction(saServerSettings)
 	case "l":
 		return m, m.runServerAction(saLockSSH)
 	case "u":
@@ -667,7 +712,7 @@ func (m *model) handleServerKey(key string) (tea.Model, tea.Cmd) {
 	case "x":
 		return m, m.runServerAction(saDeleteServer)
 	case "r":
-		return m, tea.Batch(m.loadStatus(m.serverName), m.loadServerApps(m.serverName, false))
+		return m, m.refreshServer(m.serverName)
 	}
 	return m, nil
 }
@@ -807,34 +852,13 @@ func (m *model) handleRestoreKey(key string) (tea.Model, tea.Cmd) {
 
 func (m *model) handleCompareKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) {
 	switch key {
-	case "esc", "k":
-		m.keepMine()
-		return m, nil
-	case "u":
-		server, app := m.compareServer(), m.compare.App
-		filesOnly := !m.compare.HasRecord
-		body := "Replace " + app + " in ship.yaml and its files with the server copy? Your local source.path is kept and each overwritten file gets a .bak."
-		if filesOnly {
-			body = "No record exists on the server (older ship), so ship.yaml is kept. Replace " + app + "'s compose file and Dockerfile with the server copies? Each overwritten file gets a .bak."
-		}
-		m.openConfirm("Use server version", body, func() tea.Cmd {
-			m.page = pageServer
-			return m.startImport(server, []string{app}, true, filesOnly)
-		})
+	case "esc":
+		m.page = pageServer
 		return m, nil
 	}
 	var cmd tea.Cmd
 	m.vp, cmd = m.vp.Update(msg)
 	return m, cmd
-}
-
-func (m *model) compareServer() string {
-	return m.serverName
-}
-
-func (m *model) keepMine() {
-	m.page = pageServer
-	m.showToast(toastInfo, "Keeping your local version of "+m.compare.App+"; the next deploy uploads it.")
 }
 
 func clampIndex(i, n int) int {
@@ -859,12 +883,12 @@ func (m *model) selectedServerName() string {
 	return names[m.serverCursor]
 }
 
-func (m *model) appNames() []string {
-	srv, err := m.backend.Server(m.serverName)
-	if err != nil {
+func (m *model) serverConfig(server string) *ops.ServerConfig {
+	report, ok := m.variances[server]
+	if !ok {
 		return nil
 	}
-	return srv.AppNames()
+	return report.State
 }
 
 func (m *model) currentServer() *config.Server {
@@ -875,247 +899,120 @@ func (m *model) currentServer() *config.Server {
 	return srv
 }
 
+func (m *model) desiredApp(server, app string) *ops.DesiredApp {
+	state := m.serverConfig(server)
+	if state == nil {
+		return nil
+	}
+	return state.Apps[app]
+}
+
+func (m *model) recordFor(server, app string) *config.App {
+	da := m.desiredApp(server, app)
+	if da == nil {
+		return nil
+	}
+	return da.Record
+}
+
 func (m *model) currentApp() *config.App {
-	srv := m.currentServer()
-	if srv == nil {
-		return nil
-	}
-	app, err := srv.App(m.appName)
-	if err != nil {
-		return nil
-	}
-	return app
+	return m.recordFor(m.serverName, m.appName)
 }
 
-func (m *model) serverApp(name string) *ops.ServerApp {
-	apps := m.serverApps[m.serverName]
-	for i := range apps {
-		if apps[i].Name == name {
-			return &apps[i]
-		}
-	}
-	return nil
-}
-
-func (m *model) currentServerApp() *ops.ServerApp {
-	return m.serverApp(m.appName)
-}
-
-// appEntries is the union of local apps and apps the server reports, sorted by
-// name. Server-only apps are listed so they can be imported.
+// appEntries lists the apps in the server's desired configuration.
 func (m *model) appEntries() []appEntry {
-	srv := m.currentServer()
-	if srv == nil {
+	state := m.serverConfig(m.serverName)
+	if state == nil {
 		return nil
 	}
-	entries := map[string]appEntry{}
-	for _, name := range srv.AppNames() {
-		entries[name] = appEntry{Name: name, Local: true}
-	}
-	for _, sa := range m.serverApps[m.serverName] {
-		e := entries[sa.Name]
-		e.Name = sa.Name
-		e.Server = true
-		entries[sa.Name] = e
-	}
-	names := make([]string, 0, len(entries))
-	for name := range entries {
-		names = append(names, name)
-	}
-	sort.Strings(names)
+	names := state.AppNames()
 	out := make([]appEntry, 0, len(names))
 	for _, name := range names {
-		out = append(out, entries[name])
+		out = append(out, appEntry{Name: name})
 	}
 	return out
 }
 
-func (m *model) diffFor(server, app string) (ops.AppDiff, bool) {
-	byApp, ok := m.appDiffs[server]
+func (m *model) varianceFor(server, app string) (ops.AppVariance, bool) {
+	report, ok := m.variances[server]
 	if !ok {
-		return ops.AppDiff{}, false
+		return ops.AppVariance{}, false
 	}
-	d, ok := byApp[app]
-	return d, ok
+	for _, v := range report.Apps {
+		if v.App == app {
+			return v, true
+		}
+	}
+	return ops.AppVariance{}, false
 }
 
-func (m *model) recomputeDiffs(server string) {
-	srv, err := m.backend.Server(server)
-	if err != nil {
-		delete(m.appDiffs, server)
-		return
+func (m *model) configState(server, app string) string {
+	if v, ok := m.varianceFor(server, app); ok {
+		return v.State
 	}
-	diffs, err := ops.CompareServerApps(srv, m.serverApps[server])
-	if err != nil {
-		delete(m.appDiffs, server)
-		return
-	}
-	byApp := make(map[string]ops.AppDiff, len(diffs))
-	for _, d := range diffs {
-		byApp[d.App] = d
-	}
-	m.appDiffs[server] = byApp
+	return ""
 }
 
-func (m *model) recomputeAllDiffs() {
-	for server := range m.serverApps {
-		m.recomputeDiffs(server)
+func (m *model) recordsFor(state *ops.ServerConfig, name string, record *config.App) (map[string]*config.App, error) {
+	if state == nil {
+		return nil, errors.New("server configuration is still loading; try again")
 	}
-}
-
-func (m *model) loadServerApps(server string, forImport bool) tea.Cmd {
-	if server == "" || m.serverAppsLoading[server] {
-		return nil
-	}
-	m.serverAppsLoading[server] = true
-	backend := m.backend
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		apps, err := backend.ServerApps(ctx, server)
-		return serverAppsMsg{server: server, apps: apps, err: err, forImport: forImport}
-	}
-}
-
-// offerImport opens a multi-select dialog for server apps that are not local.
-// It is triggered after a server is added, so the common case (adding a
-// machine that already runs apps) needs one more keypress, not a hunt.
-func (m *model) offerImport(server string) tea.Cmd {
-	if m.form != nil || m.confirm != nil || m.page == pageCompare {
-		return nil
-	}
-	srv, err := m.backend.Server(server)
-	if err != nil || srv == nil {
-		return nil
-	}
-	var names []string
-	for _, sa := range m.serverApps[server] {
-		if sa.Record == nil {
+	records := make(map[string]*config.App, len(state.Apps)+1)
+	for n, da := range state.Apps {
+		if n == name {
 			continue
 		}
-		if srv.Apps[sa.Name] == nil {
-			names = append(names, sa.Name)
+		if da.Record != nil {
+			records[n] = da.Record
 		}
 	}
-	if len(names) == 0 {
+	records[name] = record
+	if err := config.ValidateRecords(records); err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+func (m *model) loadVariances(server string) tea.Cmd {
+	if server == "" || m.varianceLoading[server] {
 		return nil
 	}
-	m.serverName = server
-	m.page = pageServers
-	f := &formHost{purpose: formImportApps, serverName: server, importNames: names}
-	f.importSelected = append([]string(nil), names...)
-	f.form = m.buildForm(f)
-	m.form = f
-	return nil
-}
-
-// beginImport imports apps, first asking about any local files whose contents
-// differ. Identical files are not conflicts and are skipped by ops.Import.
-func (m *model) beginImport(server string, apps []string, overwrite, filesOnly bool) tea.Cmd {
-	if !overwrite {
-		if files := m.differingImportFiles(server, apps); len(files) > 0 {
-			body := files[0] + " differs from the server's; overwrite? A .bak is kept."
-			if len(files) > 1 {
-				body = "These files differ from the server's: " + strings.Join(files, ", ") + ". Overwrite them? A .bak is kept."
-			}
-			m.openConfirm("Overwrite local files?", body, func() tea.Cmd {
-				return m.startImport(server, apps, true, filesOnly)
-			})
-			return nil
-		}
-	}
-	return m.startImport(server, apps, overwrite, filesOnly)
-}
-
-func (m *model) differingImportFiles(server string, apps []string) []string {
-	srv, err := m.backend.Server(server)
-	if err != nil {
-		return nil
-	}
-	byName := make(map[string]ops.ServerApp, len(m.serverApps[server]))
-	for _, sa := range m.serverApps[server] {
-		byName[sa.Name] = sa
-	}
-	var out []string
-	for _, name := range apps {
-		sa, ok := byName[name]
-		if !ok {
-			continue
-		}
-		if len(sa.Compose) > 0 && fileDiffers(srv.ComposePath(name), sa.Compose) {
-			out = append(out, "apps/"+name+"/compose.yaml")
-		}
-		if sa.HasDockerfile && fileDiffers(srv.DockerfilePath(name), sa.Dockerfile) {
-			out = append(out, "apps/"+name+"/Dockerfile")
-		}
-	}
-	return out
-}
-
-func fileDiffers(path string, server []byte) bool {
-	local, err := os.ReadFile(path)
-	return err == nil && !bytes.Equal(local, server)
-}
-
-func (m *model) startImport(server string, apps []string, overwrite, filesOnly bool) tea.Cmd {
+	m.varianceLoading[server] = true
 	backend := m.backend
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		summary, err := backend.Import(ctx, ops.ImportRequest{
-			Server:    server,
-			Apps:      apps,
-			Overwrite: overwrite,
-			FilesOnly: filesOnly,
-		})
-		return importDoneMsg{server: server, summary: summary, err: err}
+		report, err := backend.Variances(ctx, server)
+		return varianceMsg{server: server, report: report, err: err}
 	}
 }
 
-func (m *model) finishImport(msg importDoneMsg) tea.Cmd {
-	if msg.err != nil {
-		m.showToast(toastError, msg.err.Error())
+func (m *model) refreshServer(server string) tea.Cmd {
+	if server == "" {
 		return nil
 	}
-	if err := m.reloadConfig(); err != nil {
-		m.showToast(toastError, err.Error())
-		return nil
-	}
-	m.form = nil
-	m.page = pageServer
-	m.serverName = msg.server
-	m.compare = ops.AppDiff{}
-	m.appCursor = 0
-	for i, e := range m.appEntries() {
-		if e.Name == m.appName {
-			m.appCursor = i
-			break
-		}
-	}
-	if len(msg.summary.Imported) == 0 {
-		m.showToast(toastInfo, "Nothing imported.")
-		return nil
-	}
-	m.showToast(toastSuccess, "Imported "+strings.Join(msg.summary.Imported, ", ")+".")
-	return tea.Batch(m.loadStatus(msg.server), m.loadServerApps(msg.server, false))
+	return tea.Batch(m.loadStatus(server), m.loadVariances(server))
 }
 
 func (m *model) openCompare() {
-	d, ok := m.diffFor(m.serverName, m.appName)
+	v, ok := m.varianceFor(m.serverName, m.appName)
 	if !ok {
-		m.showToast(toastWarning, "No server record for "+m.appName+" yet; deploy it once.")
+		m.showToast(toastWarning, "Configuration is still loading; try again.")
 		return
 	}
-	m.compare = d
+	m.compareApp = m.appName
 	m.page = pageCompare
-	m.compareText = d.Diff
-	if d.RecordErr != "" {
-		m.compareText = "The server record is unreadable (newer ship?): " + d.RecordErr + "\n\n" + m.compareText
-	} else if !d.HasRecord {
-		m.compareText = "No record on the server (deployed by an older ship).\n\n" + m.compareText
+	switch v.State {
+	case ops.VarianceNotDeployed:
+		m.compareText = "Not deployed yet; deploying applies this configuration.\n\n"
+	case ops.VarianceApplied:
+		m.compareText = "Running matches desired.\n\n"
+	default:
+		m.compareText = "Running differs from desired. Deploy to apply it.\n\n"
 	}
-	if strings.TrimSpace(d.Diff) == "" {
-		m.compareText = strings.TrimRight(m.compareText, "\n") + "\nNo differences in the files."
+	m.compareText += v.Diff
+	if strings.TrimSpace(v.Diff) == "" && v.State == ops.VariancePending {
+		m.compareText += "The record differs from the running record."
 	}
 	m.showCompare()
 }
@@ -1130,7 +1027,7 @@ func (m *model) openServer(name string) tea.Cmd {
 	m.serverName = name
 	m.appCursor = 0
 	m.toast = nil
-	return tea.Batch(m.loadStatus(name), m.loadServerApps(name, false))
+	return m.refreshServer(name)
 }
 
 func (m *model) openSelectedActivity() tea.Cmd {
@@ -1272,10 +1169,14 @@ func (m *model) finishRun(msg runDoneMsg) tea.Cmd {
 	entry.err = msg.err
 	entry.endTime = time.Now()
 	entry.cancel()
+	var approval *ops.BuildApprovalError
 	if msg.err != nil {
 		entry.state = runFailed
 		if errors.Is(msg.err, context.Canceled) {
 			m.showToast(toastWarning, entry.label+" on "+entry.req.Server+" was cancelled.")
+		} else if errors.As(msg.err, &approval) {
+			m.showToast(toastWarning, entry.label+" needs build approval.")
+			m.openBuildApproval(approval, entry.req)
 		} else {
 			m.showToast(toastError, entry.label+" on "+entry.req.Server+" failed: "+msg.err.Error())
 		}
@@ -1294,8 +1195,9 @@ func (m *model) finishRun(msg runDoneMsg) tea.Cmd {
 	if cmd := m.loadStatus(entry.req.Server); cmd != nil {
 		cmds = append(cmds, cmd)
 	}
-	if entry.req.Action == ActDeploy || entry.req.Action == ActDeployAll {
-		if cmd := m.loadServerApps(entry.req.Server, false); cmd != nil {
+	switch entry.req.Action {
+	case ActDeploy, ActDeployAll, ActProxySync, ActProxyRestart, ActSetup:
+		if cmd := m.loadVariances(entry.req.Server); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
 	}
@@ -1366,6 +1268,30 @@ func (m *model) openNotice(title, body string) {
 	m.confirm = &confirmDialog{title: title, body: body, ack: true}
 }
 
+func (m *model) openBuildApproval(e *ops.BuildApprovalError, req Request) {
+	m.confirm = &confirmDialog{
+		title:      "Approve build script",
+		body:       "The build script for " + e.App + " on " + e.Server + " comes from the server and is not approved on this machine.",
+		script:     e.Script,
+		scrollable: true,
+		yesHint:    "approve and deploy",
+		noHint:     "cancel",
+		yes: func() tea.Cmd {
+			return m.approveBuild(e, req)
+		},
+	}
+}
+
+func (m *model) approveBuild(e *ops.BuildApprovalError, req Request) tea.Cmd {
+	backend := m.backend
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		err := backend.RecordBuildApproval(ctx, e.Server, e.App, e.Script)
+		return buildApprovedMsg{req: req, err: err}
+	}
+}
+
 func (m *model) showToast(kind toastKind, msg string) {
 	m.toast = &toast{kind: kind, msg: msg}
 	m.resizeViewport()
@@ -1391,10 +1317,15 @@ func (m *model) runServerAction(action serverAction) tea.Cmd {
 		})
 	case saBackupAll:
 		return m.startRun(Request{Action: ActBackup, Server: m.serverName, App: "all", Pull: true})
-	case saProxyUpdate:
-		return m.startRun(Request{Action: ActProxyUpdate, Server: m.serverName})
+	case saProxyRestart:
+		return m.startRun(Request{Action: ActProxyRestart, Server: m.serverName})
+	case saProxySync:
+		return m.startRun(Request{Action: ActProxySync, Server: m.serverName})
 	case saSetup:
 		return m.startRun(Request{Action: ActSetup, Server: m.serverName})
+	case saServerSettings:
+		m.openServerSettingsForm(m.serverName)
+		return nil
 	case saLockSSH:
 		server := m.serverName
 		m.openConfirm("Lock SSH", "Disable password and root SSH logins on "+server+"? Make sure the admin user can log in with a key first.", func() tea.Cmd {
@@ -1425,22 +1356,17 @@ func (m *model) runServerAction(action serverAction) tea.Cmd {
 }
 
 func (m *model) appActions() []appActionDef {
-	if m.currentApp() == nil {
-		sa := m.currentServerApp()
-		if sa == nil {
-			return nil
-		}
-		if sa.Record != nil {
-			return []appActionDef{importAppAction}
-		}
-		if sa.RecordErr != "" {
-			return []appActionDef{importUnreadableAction}
-		}
-		return []appActionDef{importComposeAction}
-	}
 	defs := append([]appActionDef(nil), appActionDefs...)
-	if m.currentServerApp() != nil {
-		defs = append(defs, compareAppAction)
+	if rec := m.currentApp(); rec != nil && rec.Source.Type != "image" {
+		// Keep the Dockerfile action next to the compose action.
+		out := make([]appActionDef, 0, len(defs)+1)
+		for _, def := range defs {
+			out = append(out, def)
+			if def.action == aaEditCompose {
+				out = append(out, dockerfileAppAction)
+			}
+		}
+		return out
 	}
 	return defs
 }
@@ -1487,30 +1413,15 @@ func (m *model) runAppAction(action appAction) tea.Cmd {
 		m.page = pageAppEdit
 		m.appEditCur = 0
 	case aaEditCompose:
-		srv, err := m.backend.Server(server)
-		if err != nil {
-			m.showToast(toastError, err.Error())
-			return nil
-		}
-		return m.beginLocalEdit(editTarget{
-			path:      srv.ComposePath(app),
-			label:     "apps/" + app + "/compose.yaml",
-			validator: localedit.ValidateCompose,
-			kind:      editCompose,
-		})
+		return m.beginDesiredFileEdit(server, app, "compose")
+	case aaEditDockerfile:
+		return m.beginDesiredFileEdit(server, app, "Dockerfile")
 	case aaDelete:
-		m.openConfirm("Delete app", "Remove "+app+" from ship.yaml? This only edits the file; the app's compose files, data and deployed containers are not changed.", func() tea.Cmd {
+		m.openConfirm("Delete app", "Remove "+app+"'s desired configuration from "+server+"? Its stack is stopped; data directories and .env are kept.", func() tea.Cmd {
 			return m.deleteApp(server, app)
 		})
 	case aaCompare:
 		m.openCompare()
-	case aaImport:
-		sa := m.currentServerApp()
-		if sa == nil {
-			m.showToast(toastWarning, "No server record for "+app+" yet.")
-			return nil
-		}
-		return m.beginImport(server, []string{app}, false, sa.Record == nil)
 	}
 	return nil
 }
@@ -1586,13 +1497,87 @@ func (m *model) beginLocalEdit(target editTarget) tea.Cmd {
 }
 
 func (m *model) beginAppYAMLEdit(server, app string) tea.Cmd {
-	if m.edit != nil {
-		m.showToast(toastWarning, "Finish the open editor first.")
+	da := m.desiredApp(server, app)
+	if da == nil {
+		m.showToast(toastWarning, "Configuration is still loading; try again.")
 		return nil
 	}
-	data, err := m.doc.AppYAML(server, app)
+	if da.Record == nil {
+		reason := da.RecordErr
+		if reason == "" {
+			reason = "the record is missing"
+		}
+		m.showToast(toastError, "The record for "+app+" is unreadable: "+reason)
+		return nil
+	}
+	data, err := da.Record.RecordYAML()
 	if err != nil {
 		m.showToast(toastError, err.Error())
+		return nil
+	}
+	state := m.serverConfig(server)
+	validate := func(data []byte) error {
+		record, err := config.DecodeAppRecord(bytes.NewReader(data))
+		if err != nil {
+			return err
+		}
+		_, err = m.recordsFor(state, app, record)
+		return err
+	}
+	commit := func(data []byte) error {
+		record, err := config.DecodeAppRecord(bytes.NewReader(data))
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err = m.backend.PutDesiredApp(ctx, server, app, record, da.Compose, da.Dockerfile, state.Arch, da.Hash)
+		return err
+	}
+	return m.beginBufferEdit(server, app+".yaml", "server "+server+"/"+app+" record", data, validate, editDesiredRecord, commit)
+}
+
+func (m *model) beginDesiredFileEdit(server, app, file string) tea.Cmd {
+	da := m.desiredApp(server, app)
+	if da == nil {
+		m.showToast(toastWarning, "Configuration is still loading; try again.")
+		return nil
+	}
+	if da.Record == nil {
+		m.showToast(toastError, "The record for "+app+" is unreadable; edit the app record first.")
+		return nil
+	}
+	state := m.serverConfig(server)
+	data := da.Compose
+	label := "apps/" + app + "/compose.yaml"
+	name := "compose.yaml"
+	var validator localedit.Validator = localedit.ValidateCompose
+	kind := editDesiredCompose
+	if file == "Dockerfile" {
+		data = da.Dockerfile
+		label = "apps/" + app + "/Dockerfile"
+		name = "Dockerfile"
+		validator = nil
+		kind = editDesiredDockerfile
+	}
+	commit := func(edited []byte) error {
+		compose, dockerfile := da.Compose, da.Dockerfile
+		if file == "compose" {
+			compose = edited
+		} else {
+			dockerfile = edited
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err := m.backend.PutDesiredApp(ctx, server, app, da.Record, compose, dockerfile, state.Arch, da.Hash)
+		return err
+	}
+	return m.beginBufferEdit(server, name, label, data, validator, kind, commit)
+}
+
+func (m *model) beginBufferEdit(server, name, label string, data []byte, validator localedit.Validator, kind editKind, commit func([]byte) error) tea.Cmd {
+	if m.edit != nil {
+		m.showToast(toastWarning, "Finish the open editor first.")
 		return nil
 	}
 	editor, err := localedit.Resolve()
@@ -1600,36 +1585,13 @@ func (m *model) beginAppYAMLEdit(server, app string) tea.Cmd {
 		m.showToast(toastError, err.Error())
 		return nil
 	}
-	buffer, err := localedit.BeginBuffer(app+".yaml", data)
+	buffer, err := localedit.BeginBuffer(name, data)
 	if err != nil {
 		m.showToast(toastError, err.Error())
 		return nil
 	}
-	doc := m.doc
-	apply := func(data []byte) (*yamldoc.Doc, error) {
-		tmp := doc.Clone()
-		if err := tmp.ReplaceAppYAML(server, app, data); err != nil {
-			return nil, err
-		}
-		return tmp, nil
-	}
-	validate := func(data []byte) error {
-		tmp, err := apply(data)
-		if err != nil {
-			return err
-		}
-		return tmp.Validate()
-	}
-	commit := func(data []byte) error {
-		tmp, err := apply(data)
-		if err != nil {
-			return err
-		}
-		return tmp.Save()
-	}
-	label := "ship.yaml (app " + server + "/" + app + ")"
 	m.edit = &editSession{
-		target:  editTarget{label: label, validator: validate, kind: editAppYAML},
+		target:  editTarget{label: label, validator: validator, kind: kind, server: server},
 		session: buffer,
 		editor:  editor,
 		commit:  commit,
@@ -1693,27 +1655,28 @@ func (m *model) finishLocalEdit(msg editDoneMsg) tea.Cmd {
 		m.edit = nil
 		if errors.Is(err, localedit.ErrChanged) {
 			m.openNotice("Not saved", fmt.Sprintf("%s changed on disk while you were editing; not saved.\n\nYour edits are in %s", e.target.label, e.session.TempPath()))
-		} else {
-			m.openNotice("Could not save", fmt.Sprintf("%v\n\nYour edits are in %s", err, e.session.TempPath()))
+			return nil
 		}
+		if errors.Is(err, ops.ErrConfigConflict) {
+			_ = e.session.Close()
+			m.openNotice("Changed on the server", "This configuration changed on the server since you loaded it. Nothing was saved; reloading the latest version.")
+			return m.refreshServer(e.target.server)
+		}
+		m.openNotice("Could not save", fmt.Sprintf("%v\n\nYour edits are in %s", err, e.session.TempPath()))
 		return nil
 	}
 	_ = e.session.Close()
 	m.edit = nil
-	if e.target.kind == editShipConfig || e.target.kind == editAppYAML {
+	if e.target.kind == editShipConfig {
 		if err := m.reloadConfig(); err != nil {
 			m.showToast(toastError, err.Error())
 			return nil
 		}
 		m.showToast(toastSuccess, "Saved "+e.target.label+".")
-		if e.target.kind == editShipConfig {
-			return m.refreshAllStatuses()
-		}
-		return nil
+		return m.refreshAllStatuses()
 	}
-	m.recomputeAllDiffs()
 	m.showToast(toastSuccess, "Saved "+e.target.label+".")
-	return nil
+	return m.refreshServer(e.target.server)
 }
 
 func (m *model) loadBackups(server, app string) tea.Cmd {
@@ -1761,7 +1724,7 @@ func (m *model) openServerForm(name string, isNew bool) {
 
 func (m *model) openAppQuickForm(action appEditAction) {
 	if m.currentApp() == nil {
-		m.showToast(toastWarning, "This app is no longer in ship.yaml.")
+		m.showToast(toastWarning, "This app's configuration is not loaded yet.")
 		return
 	}
 	v := m.newAppFormValues(m.serverName, m.appName, false)
@@ -1779,9 +1742,29 @@ func (m *model) openAppQuickForm(action appEditAction) {
 	m.form = f
 }
 
+func (m *model) openServerSettingsForm(server string) {
+	state := m.serverConfig(server)
+	if state == nil {
+		m.showToast(toastWarning, "Server settings are still loading; try again.")
+		return
+	}
+	v := &serverFormValues{
+		Name:       server,
+		AdminUser:  state.Settings.AdminUser,
+		CaddyImage: state.Settings.CaddyImage,
+	}
+	f := &formHost{purpose: formServerSettings, server: v, serverName: server}
+	f.form = m.buildForm(f)
+	m.form = f
+}
+
 func (m *model) openAppForm(name string, isNew bool) {
 	if m.serverName == "" {
 		m.showToast(toastWarning, "Open a server first.")
+		return
+	}
+	if !isNew && m.recordFor(m.serverName, name) == nil {
+		m.showToast(toastWarning, "This app's configuration is not loaded or its record is unreadable.")
 		return
 	}
 	v := m.newAppFormValues(m.serverName, name, isNew)
@@ -1806,141 +1789,46 @@ func (m *model) cancelForm() {
 
 func (m *model) submitForm() tea.Cmd {
 	f := m.form
-	if f == nil {
+	if f == nil || f.saving {
 		return nil
 	}
 	switch f.purpose {
 	case formAddServer, formEditServer:
-		tmp := m.doc.Clone()
-		if err := tmp.ApplyServer(*f.server); err != nil {
-			f.err = err.Error()
-			f.form = m.buildForm(f)
+		return m.submitServerForm(f)
+	case formServerSettings:
+		if m.serverConfig(f.serverName) == nil {
+			m.showToast(toastWarning, "Server settings are still loading; try again.")
 			return nil
 		}
-		if err := tmp.Save(); err != nil {
-			f.err = err.Error()
-			f.form = m.buildForm(f)
-			return nil
-		}
-		m.doc = tmp
-		if err := m.reloadConfig(); err != nil {
-			f.err = err.Error()
-			f.form = m.buildForm(f)
-			return nil
-		}
-		name := f.server.Name
-		m.form = nil
-		m.page = pageServers
-		for i, n := range m.backend.Servers() {
-			if n == name {
-				m.serverCursor = i
-				break
-			}
-		}
-		m.showToast(toastSuccess, "Saved "+name+".")
-		if f.purpose == formAddServer {
-			return tea.Batch(m.refreshAllStatuses(), m.loadServerApps(name, true))
-		}
-		return m.refreshAllStatuses()
+		f.saving = true
+		return m.saveServerSettingsCmd(f)
 	case formAddApp, formEditApp:
 		f.submitValues()
-		tmp := m.doc.Clone()
-		if err := tmp.ApplyApp(*f.app); err != nil {
-			f.err = err.Error()
-			f.form = m.buildForm(f)
+		if m.serverConfig(f.app.Server) == nil {
+			m.showToast(toastWarning, "Configuration is still loading; try again.")
 			return nil
 		}
-		if err := tmp.Save(); err != nil {
-			f.err = err.Error()
-			f.form = m.buildForm(f)
-			return nil
-		}
-		m.doc = tmp
-		if err := m.reloadConfig(); err != nil {
-			f.err = err.Error()
-			f.form = m.buildForm(f)
-			return nil
-		}
-		name := f.app.Name
-		m.form = nil
-		m.page = pageServer
-		m.serverName = f.app.Server
-		for i, e := range m.appEntries() {
-			if e.Name == name {
-				m.appCursor = i
-				break
-			}
-		}
-		m.showToast(toastSuccess, "Saved "+name+".")
-		return m.loadStatus(m.serverName)
+		f.saving = true
+		return m.saveAppFormCmd(f)
 	case formEditAppSource, formEditAppDomains, formEditAppCommands:
-		tmp := m.doc.Clone()
-		var err error
-		switch f.purpose {
-		case formEditAppSource:
-			if f.app.SourceType == "image" {
-				err = tmp.SetAppSourcePath(f.app.Server, f.app.Name, f.app.SourcePath)
-			} else {
-				err = tmp.SetAppSourceRepo(f.app.Server, f.app.Name, f.app.SourceRepo)
-				if err == nil {
-					err = tmp.SetAppSourceAsset(f.app.Server, f.app.Name, f.app.SourceAsset)
-				}
-			}
-		case formEditAppDomains:
-			f.submitValues()
-			err = tmp.SetAppDomains(f.app.Server, f.app.Name, f.app.Domains)
-			if err == nil {
-				err = tmp.SetAppRedirects(f.app.Server, f.app.Name, f.app.Redirects)
-			}
-		case formEditAppCommands:
-			if f.app.SourceType == "image" {
-				err = tmp.SetAppBuildCommands(f.app.Server, f.app.Name, f.app.BuildCommands)
-			}
-			if err == nil {
-				err = tmp.SetAppDeployCommands(f.app.Server, f.app.Name, f.app.DeployCommands)
-			}
-			if err == nil {
-				err = tmp.SetAppDeployMaintenance(f.app.Server, f.app.Name, &f.app.DeployMaintenance)
-			}
-		}
-		if err != nil {
-			f.err = err.Error()
-			f.form = m.buildForm(f)
+		f.submitValues()
+		if m.serverConfig(f.app.Server) == nil {
+			m.showToast(toastWarning, "Configuration is still loading; try again.")
 			return nil
 		}
-		if err := tmp.Save(); err != nil {
-			f.err = err.Error()
-			f.form = m.buildForm(f)
-			return nil
-		}
-		m.doc = tmp
-		if err := m.reloadConfig(); err != nil {
-			f.err = err.Error()
-			f.form = m.buildForm(f)
-			return nil
-		}
-		name := f.app.Name
-		m.form = nil
-		m.page = pageAppEdit
-		m.showToast(toastSuccess, "Saved "+name+".")
-		return nil
+		f.saving = true
+		return m.saveQuickAppCmd(f)
 	case formDeployVersion:
 		version := formText(f.text)
 		if version != "" {
-			srv, err := m.backend.Server(f.serverName)
-			if err != nil {
-				f.err = err.Error()
-				f.form = m.buildForm(f)
-				return nil
-			}
-			app, err := srv.App(f.appName)
-			if err != nil {
-				f.err = err.Error()
+			rec := m.recordFor(f.serverName, f.appName)
+			if rec == nil {
+				f.err = "This app's configuration is not loaded."
 				f.form = m.buildForm(f)
 				return nil
 			}
 			var verify error
-			if app.Source.Type == "image" {
+			if rec.Source.Type == "image" {
 				verify = config.ValidateImageVersion(version)
 			} else {
 				verify = config.ValidateReleaseTag(version)
@@ -1967,14 +1855,6 @@ func (m *model) submitForm() tea.Cmd {
 			return m.startRun(Request{Action: ActRestore, Server: server, App: app, Archive: archive})
 		})
 		return nil
-	case formImportApps:
-		selected := append([]string(nil), f.importSelected...)
-		server := f.serverName
-		m.form = nil
-		if len(selected) == 0 {
-			return nil
-		}
-		return m.beginImport(server, selected, false, false)
 	case formLogsService:
 		service := formText(f.text)
 		if service != "" {
@@ -1990,6 +1870,242 @@ func (m *model) submitForm() tea.Cmd {
 		return m.prepareTerminal(TerminalRequest{Kind: TerminalLogs, Server: server, App: app, Service: service})
 	}
 	return nil
+}
+
+func (m *model) submitServerForm(f *formHost) tea.Cmd {
+	v := *f.server
+	v.Name = strings.TrimSpace(v.Name)
+	v.Host = strings.TrimSpace(v.Host)
+	v.IdentityFile = strings.TrimSpace(v.IdentityFile)
+	v.User = strings.TrimSpace(v.User)
+	if v.Connection == "" {
+		v.Connection = config.ConnectionRemote
+	}
+	if v.Connection == config.ConnectionLocal {
+		v.Host, v.IdentityFile = "", ""
+	} else {
+		v.User = ""
+	}
+	// Server-wide settings live on the server, not in the local file.
+	v.AdminUser, v.Arch, v.CaddyImage = "", "", ""
+	tmp := m.doc.Clone()
+	if err := tmp.ApplyServer(v); err != nil {
+		f.err = err.Error()
+		f.form = m.buildForm(f)
+		return nil
+	}
+	if err := tmp.Save(); err != nil {
+		f.err = err.Error()
+		f.form = m.buildForm(f)
+		return nil
+	}
+	m.doc = tmp
+	if err := m.reloadConfig(); err != nil {
+		f.err = err.Error()
+		f.form = m.buildForm(f)
+		return nil
+	}
+	name := v.Name
+	m.form = nil
+	m.page = pageServers
+	for i, n := range m.backend.Servers() {
+		if n == name {
+			m.serverCursor = i
+			break
+		}
+	}
+	m.showToast(toastSuccess, "Saved "+name+".")
+	return m.refreshAllStatuses()
+}
+
+func (m *model) saveServerSettingsCmd(f *formHost) tea.Cmd {
+	server := f.serverName
+	state := m.serverConfig(server)
+	expected := ""
+	if state != nil {
+		expected = state.Settings.Hash
+	}
+	admin := strings.TrimSpace(f.server.AdminUser)
+	caddy := strings.TrimSpace(f.server.CaddyImage)
+	if admin == "" {
+		admin = config.DefaultAdminUser
+	}
+	if caddy == "" {
+		caddy = config.DefaultCaddyImage
+	}
+	backend := m.backend
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err := backend.PutServerSettings(ctx, server, admin, caddy, expected)
+		return saveDoneMsg{form: f, err: err}
+	}
+}
+
+func (m *model) saveAppFormCmd(f *formHost) tea.Cmd {
+	v := *f.app
+	v.Name = strings.TrimSpace(v.Name)
+	v.Server = strings.TrimSpace(v.Server)
+	server, name := v.Server, v.Name
+	state := m.serverConfig(server)
+	backend := m.backend
+	path := m.path
+	isNew := f.purpose == formAddApp
+	var expected string
+	var compose, dockerfile []byte
+	if !isNew {
+		da := m.desiredApp(server, v.OriginalName)
+		if da == nil {
+			return func() tea.Msg {
+				return saveDoneMsg{form: f, err: fmt.Errorf("app %q is no longer configured on %s", v.OriginalName, server)}
+			}
+		}
+		if name != v.OriginalName {
+			return func() tea.Msg {
+				return saveDoneMsg{form: f, err: errors.New("app names cannot be changed; create the new app and delete the old one")}
+			}
+		}
+		expected = da.Hash
+		compose = da.Compose
+		dockerfile = da.Dockerfile
+	} else {
+		if state != nil && state.Apps[name] != nil {
+			return func() tea.Msg {
+				return saveDoneMsg{form: f, err: fmt.Errorf("app %q already exists on %s", name, server)}
+			}
+		}
+		compose = []byte("name: " + name + "\nservices:\n  " + name + ":\n    image: \"${IMAGE:?IMAGE is set by ship}\"\n")
+	}
+	arch := config.DefaultArch
+	if state != nil && state.Arch != "" {
+		arch = state.Arch
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		record, err := appFromForm(&v)
+		if err != nil {
+			return saveDoneMsg{form: f, err: err}
+		}
+		if _, err := m.recordsFor(state, name, record); err != nil {
+			return saveDoneMsg{form: f, err: err}
+		}
+		if _, err := backend.PutDesiredApp(ctx, server, name, record, compose, dockerfile, arch, expected); err != nil {
+			return saveDoneMsg{form: f, err: err}
+		}
+		var warning string
+		if record.Source.Type == "image" {
+			sourcePath := strings.TrimSpace(v.SourcePath)
+			if err := config.SetLocalSource(path, server, name, sourcePath, sourcePath == ""); err != nil {
+				warning = "Saved on the server, but could not update the local source path: " + err.Error()
+			}
+		}
+		return saveDoneMsg{form: f, warning: warning}
+	}
+}
+
+func (m *model) saveQuickAppCmd(f *formHost) tea.Cmd {
+	v := *f.app
+	server, app := v.Server, v.Name
+	state := m.serverConfig(server)
+	backend := m.backend
+	path := m.path
+	if f.purpose == formEditAppSource && v.SourceType == "image" {
+		sourcePath := strings.TrimSpace(v.SourcePath)
+		return func() tea.Msg {
+			if err := config.SetLocalSource(path, server, app, sourcePath, sourcePath == ""); err != nil {
+				return saveDoneMsg{form: f, err: err}
+			}
+			if _, err := config.Load(path); err != nil {
+				return saveDoneMsg{form: f, err: err}
+			}
+			return saveDoneMsg{form: f}
+		}
+	}
+	da := m.desiredApp(server, app)
+	if da == nil {
+		return func() tea.Msg {
+			return saveDoneMsg{form: f, err: fmt.Errorf("app %q is no longer configured on %s", app, server)}
+		}
+	}
+	arch := config.DefaultArch
+	if state != nil && state.Arch != "" {
+		arch = state.Arch
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		record, err := appFromForm(&v)
+		if err != nil {
+			return saveDoneMsg{form: f, err: err}
+		}
+		if _, err := m.recordsFor(state, app, record); err != nil {
+			return saveDoneMsg{form: f, err: err}
+		}
+		_, err = backend.PutDesiredApp(ctx, server, app, record, da.Compose, da.Dockerfile, arch, da.Hash)
+		return saveDoneMsg{form: f, err: err}
+	}
+}
+
+func (m *model) finishSave(msg saveDoneMsg) tea.Cmd {
+	f := msg.form
+	if f == nil || m.form != f {
+		return nil
+	}
+	f.saving = false
+	server := f.serverName
+	if f.app != nil && f.app.Server != "" {
+		server = f.app.Server
+	}
+	if msg.err != nil {
+		if errors.Is(msg.err, ops.ErrConfigConflict) {
+			m.form = nil
+			m.openNotice("Changed on the server", "This configuration changed on the server since you loaded it. Nothing was saved; reloading the latest version.")
+			return m.refreshServer(server)
+		}
+		f.err = msg.err.Error()
+		f.form = m.buildForm(f)
+		return nil
+	}
+	m.form = nil
+	label := "Saved."
+	if f.app != nil && f.app.Name != "" {
+		label = "Saved " + f.app.Name + "."
+	}
+	if msg.warning != "" {
+		m.showToast(toastWarning, msg.warning)
+	} else {
+		m.showToast(toastSuccess, label)
+	}
+	switch f.purpose {
+	case formAddApp, formEditApp:
+		if err := m.reloadConfig(); err != nil {
+			m.showToast(toastError, err.Error())
+		}
+		m.page = pageServer
+		m.serverName = server
+		m.appName = f.app.Name
+		for i, e := range m.appEntries() {
+			if e.Name == m.appName {
+				m.appCursor = i
+				break
+			}
+		}
+		return m.refreshServer(server)
+	case formEditAppSource, formEditAppDomains, formEditAppCommands:
+		if err := m.reloadConfig(); err != nil {
+			m.showToast(toastError, err.Error())
+		}
+		m.page = pageAppEdit
+		return m.refreshServer(server)
+	case formServerSettings:
+		m.page = pageServer
+		if msg.warning == "" {
+			m.showToast(toastSuccess, "Saved server settings.")
+		}
+		return m.refreshServer(server)
+	}
+	return m.refreshServer(server)
 }
 
 func (m *model) deleteServer(name string) tea.Cmd {
@@ -2014,25 +2130,36 @@ func (m *model) deleteServer(name string) tea.Cmd {
 }
 
 func (m *model) deleteApp(server, app string) tea.Cmd {
-	tmp := m.doc.Clone()
-	if err := tmp.DeleteApp(server, app); err != nil {
-		m.showToast(toastError, err.Error())
+	da := m.desiredApp(server, app)
+	if da == nil {
+		m.showToast(toastWarning, "Configuration is still loading; try again.")
 		return nil
 	}
-	if err := tmp.Save(); err != nil {
-		m.showToast(toastError, err.Error())
-		return nil
+	expected := da.Hash
+	backend := m.backend
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		err := backend.RemoveDesiredApp(ctx, server, app, expected)
+		return deleteDoneMsg{server: server, app: app, err: err}
 	}
-	m.doc = tmp
-	if err := m.reloadConfig(); err != nil {
-		m.showToast(toastError, err.Error())
+}
+
+func (m *model) finishDelete(msg deleteDoneMsg) tea.Cmd {
+	if msg.err != nil {
+		if errors.Is(msg.err, ops.ErrConfigConflict) {
+			m.openNotice("Changed on the server", "This app changed on the server since you loaded it. Nothing was deleted; reloading the latest version.")
+			return m.refreshServer(msg.server)
+		}
+		m.showToast(toastError, msg.err.Error())
 		return nil
 	}
 	m.page = pageServer
-	m.serverName = server
+	m.serverName = msg.server
+	m.appName = ""
 	m.appCursor = clampIndex(m.appCursor, len(m.appEntries()))
-	m.showToast(toastSuccess, "Removed "+app+" from ship.yaml.")
-	return m.loadStatus(server)
+	m.showToast(toastSuccess, "Deleted "+msg.app+"; data directories and .env were kept.")
+	return m.refreshServer(msg.server)
 }
 
 func (m *model) reloadConfig() error {
@@ -2048,7 +2175,16 @@ func (m *model) reloadConfig() error {
 	m.doc = doc
 	m.backend.SetConfig(cfg)
 	m.serverCursor = clampIndex(m.serverCursor, len(cfg.ServerNames()))
-	m.recomputeAllDiffs()
+	for name := range m.variances {
+		if _, err := cfg.Server(name); err != nil {
+			delete(m.variances, name)
+			delete(m.varianceErr, name)
+			delete(m.varianceLoading, name)
+			delete(m.statuses, name)
+			delete(m.statusErr, name)
+			delete(m.statusLoading, name)
+		}
+	}
 	return nil
 }
 
@@ -2068,15 +2204,6 @@ func (m *model) configPathLabel() string {
 		return ""
 	}
 	return filepath.Base(m.path)
-}
-
-func (m *model) composeMissing(name string) bool {
-	srv := m.currentServer()
-	if srv == nil {
-		return false
-	}
-	fi, err := os.Stat(srv.ComposePath(name))
-	return err != nil || fi.IsDir()
 }
 
 func (m *model) appStatus(server, app string) (ops.AppStatus, bool) {
@@ -2128,6 +2255,9 @@ func (m *model) serverHost(server string) string {
 	if err != nil {
 		return server
 	}
+	if srv.IsLocal() {
+		return "local"
+	}
 	if i := strings.LastIndex(srv.Host, "@"); i >= 0 {
 		return srv.Host[i+1:]
 	}
@@ -2145,24 +2275,16 @@ func (m *model) selectedActivity() *activity {
 }
 
 func (m *model) appDomains(name string) string {
-	srv := m.currentServer()
-	if srv == nil {
-		return ""
-	}
-	app, err := srv.App(name)
-	if err != nil {
+	app := m.recordFor(m.serverName, name)
+	if app == nil {
 		return ""
 	}
 	return strings.Join(app.Domains, ", ")
 }
 
 func (m *model) appType(name string) string {
-	srv := m.currentServer()
-	if srv == nil {
-		return ""
-	}
-	app, err := srv.App(name)
-	if err != nil {
+	app := m.recordFor(m.serverName, name)
+	if app == nil {
 		return ""
 	}
 	if app.Source.Type == "image" {
@@ -2171,13 +2293,56 @@ func (m *model) appType(name string) string {
 	return "release"
 }
 
+// syncAlertLines lists everything on a server that is out of sync with its
+// desired configuration, one user-facing line per item.
+func (m *model) syncAlertLines(server string) []string {
+	report, ok := m.variances[server]
+	if !ok {
+		return nil
+	}
+	var lines []string
+	for _, v := range report.Apps {
+		switch v.State {
+		case ops.VariancePending:
+			lines = append(lines, v.App+": config changed, pending deploy")
+		case ops.VarianceNotDeployed:
+			lines = append(lines, v.App+": not deployed, deploy it")
+		}
+	}
+	if report.ProxyOutOfSync {
+		lines = append(lines, "Caddy: "+proxyAlertReason(report.ProxyReason)+", restart Caddy to apply (p)")
+	}
+	if report.SetupPending {
+		lines = append(lines, "Server: "+setupAlertReason(report.SetupReason)+", run setup (s)")
+	}
+	return lines
+}
+
+func proxyAlertReason(reason string) string {
+	switch {
+	case strings.Contains(reason, "caddy_image"):
+		return "caddy_image changed"
+	case strings.Contains(reason, "not running"):
+		return "proxy is not running"
+	default:
+		return "domains changed"
+	}
+}
+
+func setupAlertReason(reason string) string {
+	switch {
+	case strings.Contains(reason, "admin_user"):
+		return "admin_user changed"
+	case strings.Contains(reason, "app uids"):
+		return "app uids changed"
+	default:
+		return "setup has not run"
+	}
+}
+
 func (m *model) activityTime(a *activity) string {
 	if a == nil {
 		return ""
 	}
 	return a.start.Format("15:04:05")
-}
-
-func (m *model) summaryLine() string {
-	return fmt.Sprintf("%d servers · %s", len(m.backend.Servers()), m.configPathLabel())
 }

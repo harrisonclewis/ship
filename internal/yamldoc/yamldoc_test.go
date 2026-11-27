@@ -71,7 +71,7 @@ func TestYAMLEditKeepsCommentsAndWritesBuildDeployFields(t *testing.T) {
 		t.Fatal("ship.yaml.bak does not contain the previous file")
 	}
 
-	cfg, err := config.Load(path)
+	cfg, err := config.LoadOld(path)
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestYAMLSaveCreatesPrivateConfigAndEmptyServer(t *testing.T) {
 		t.Fatalf("directory mode = %o, want 700", di.Mode().Perm())
 	}
 
-	cfg, err := config.Load(path)
+	cfg, err := config.LoadOld(path)
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
@@ -212,6 +212,56 @@ func TestYAMLSaveCreatesPrivateConfigAndEmptyServer(t *testing.T) {
 	}
 	if _, err := os.Stat(path + ".bak"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("a .bak file was written for a brand new config")
+	}
+}
+
+func TestApplyLocalServerWritesConnectionAndRemovesSSH(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ship.yaml")
+	if err := os.WriteFile(path, []byte("servers:\n  prod:\n    host: ops@203.0.113.10\n    identity_file: ~/.ssh/prod\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := ServerValues{
+		Name:         "prod",
+		OriginalName: "prod",
+		Connection:   config.ConnectionLocal,
+		User:         "ops",
+	}
+	tmp := doc.Clone()
+	if err := tmp.ApplyServer(v); err != nil {
+		t.Fatalf("applyServer: %v", err)
+	}
+	if err := tmp.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	srv, err := cfg.Server("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !srv.IsLocal() || srv.Host != "" || srv.IdentityFile != "" || srv.User != "ops" {
+		t.Fatalf("saved local server = %+v", srv)
+	}
+	text, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"connection: local", "user: ops"} {
+		if !strings.Contains(string(text), want) {
+			t.Errorf("saved YAML missing %q:\n%s", want, text)
+		}
+	}
+	for _, bad := range []string{"host:", "identity_file:"} {
+		if strings.Contains(string(text), bad) {
+			t.Errorf("saved YAML kept %q:\n%s", bad, text)
+		}
 	}
 }
 
@@ -232,7 +282,7 @@ func TestYAMLServerRenameKeepsAppsAndComments(t *testing.T) {
 	if err := tmp.Save(); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	cfg, err := config.Load(path)
+	cfg, err := config.LoadOld(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +346,7 @@ func writeTestConfig(t *testing.T) (string, *config.Config, *Doc) {
 	if err := os.WriteFile(path, []byte(testConfig), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(path)
+	cfg, err := config.LoadOld(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +406,7 @@ source:
 	if strings.Contains(text, "web.example.com") {
 		t.Errorf("old app definition survived:\n%s", text)
 	}
-	cfg, err := config.Load(path)
+	cfg, err := config.LoadOld(path)
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
@@ -432,7 +482,7 @@ env:
 			t.Errorf("saved YAML still contains %q:\n%s", gone, text)
 		}
 	}
-	cfg, err := config.Load(path)
+	cfg, err := config.LoadOld(path)
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}

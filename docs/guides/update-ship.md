@@ -20,10 +20,12 @@ Maintenance pages need a mount in the Caddy container that older setups don't ha
 
 ```sh
 ship prod setup
-ship prod proxy update
+ship prod proxy sync
 ```
 
 Until then, deploys of apps with maintenance turned on stop early and say so. See [Maintenance mode](maintenance-mode.md).
+
+If your local `ship.yaml` is still in the old full-configuration format, run `ship <server> config push` once per server before the commands above. See [Edit config](edit-config.md#migrate-an-old-local-file).
 
 ## The server agent
 
