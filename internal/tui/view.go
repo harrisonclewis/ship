@@ -800,7 +800,7 @@ func (m *model) viewDeployPick() string {
 		for i := start; i < len(m.pickCommits) && i < start+rows; i++ {
 			c := m.pickCommits[i]
 			marker := ""
-			if st.Current == c.SHA {
+			if ops.GitVersionCommit(st.Current) == c.SHA {
 				marker = "  current"
 			}
 			subject := strings.Join(strings.Fields(ansi.Strip(c.Subject)), " ")

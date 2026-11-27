@@ -132,3 +132,44 @@ func TestSourcesAcceptsGitURLAndKeepsTransport(t *testing.T) {
 		t.Fatalf("sources.web = %q", got)
 	}
 }
+
+func TestNormalizeBuildDir(t *testing.T) {
+	good := map[string]string{
+		"":            "",
+		"   ":         "",
+		".":           "",
+		"docs":        "docs",
+		"docs/":       "docs",
+		"./docs":      "docs",
+		"docs/site":   "docs/site",
+		"docs//site/": "docs/site",
+	}
+	for in, want := range good {
+		got, err := NormalizeBuildDir(in)
+		if err != nil {
+			t.Errorf("%q: %v", in, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("%q -> %q, want %q", in, got, want)
+		}
+	}
+	bad := []string{
+		"/docs",
+		"../docs",
+		"docs/../other",
+		"docs/..",
+		"docs/../../etc",
+		"..",
+		`docs\site`,
+		"C:/docs",
+		"docs:site",
+		"docs\nsite",
+		"docs\x00site",
+	}
+	for _, in := range bad {
+		if got, err := NormalizeBuildDir(in); err == nil {
+			t.Errorf("%q was accepted as %q", in, got)
+		}
+	}
+}

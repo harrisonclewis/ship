@@ -103,7 +103,7 @@ The app list, app forms, quick Edit… menu, compose/Dockerfile editor and delet
 
 - **Server form** (`a` on Servers, or `e` on a server) edits the connection in the local `ship.yaml`. Choose **Remote** for `host` and `identity_file`, or **Local** for an optional admin `user`; the other fields are hidden.
 - **Server settings** (`g` on a server) edits `admin_user` and `caddy_image` on the server. Saving may leave setup or Caddy pending; the alert says which key applies it.
-- **App form** (`a` or Edit… → All settings) edits the desired record. Source offers **Source directory**, **Git repository URL** and **GitHub release asset**. The directory or URL is written only to this machine's `servers.<server>.sources.<app>`; the server record stays `source.type: image`.
+- **App form** (`a` or Edit… → All settings) edits the desired record. Source offers **Source directory**, **Git repository URL** and **GitHub release asset**. The directory or URL is written only to this machine's `servers.<server>.sources.<app>`; the server record stays `source.type: image`. A Git URL has an optional **Build directory** field for a relative directory inside the checkout. Both Git source forms save the URL and directory together.
 - **App YAML** (Edit… → Edit app YAML) edits the full server-side record in `$VISUAL`, `$EDITOR` or `vi`.
 - **Commits/Releases picker** (Git URL source, `v`) lazy-loads the default branch's recent commits or published GitHub releases. Selecting a release then offers **Build source** or one of its downloadable assets; checksum files are hidden. Press `r` to refresh the open tab.
 - **compose.yaml / Dockerfile** (`f`, `F`) edit the desired files on the server.

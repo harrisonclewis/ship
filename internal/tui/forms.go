@@ -144,13 +144,20 @@ func (m *model) newAppFormValues(server, app string, isNew bool) *appFormValues 
 	if rec.Source.Type == "image" {
 		v.SourceKind = "dir"
 		var localSource string
-		if srv, err := m.backend.Server(server); err == nil && srv.Sources != nil {
-			localSource = srv.Sources[app]
+		var srv *config.Server
+		if loaded, err := m.backend.Server(server); err == nil {
+			srv = loaded
+			if srv.Sources != nil {
+				localSource = srv.Sources[app]
+			}
 		}
 		localSource = firstNonEmpty(localSource, rec.Source.Path)
 		if repo, ok := config.GitSource(localSource); ok {
 			v.SourceKind = "git"
 			v.SourceURL = repo.Transport
+			if srv != nil {
+				v.SourceBuildDir = srv.BuildDirs[app]
+			}
 		} else {
 			v.SourcePath = localSource
 		}
@@ -175,37 +182,42 @@ func (m *model) newAppFormValues(server, app string, isNew bool) *appFormValues 
 }
 
 // localSourceFromForm returns the value to write to
-// servers.<server>.sources.<app> and whether the entry should be kept.
-func localSourceFromForm(v *appFormValues) (string, bool, error) {
+// servers.<server>.sources.<app>, the relative build directory, and whether
+// the entry should be kept.
+func localSourceFromForm(v *appFormValues) (string, string, bool, error) {
 	switch v.SourceKind {
 	case "git":
 		value := strings.TrimSpace(v.SourceURL)
 		if value == "" {
-			return "", false, fmt.Errorf("a Git repository URL is required")
+			return "", "", false, fmt.Errorf("a Git repository URL is required")
 		}
 		source, err := config.ParseLocalSource(value)
 		if err != nil {
-			return "", false, err
+			return "", "", false, err
 		}
 		if !source.IsGit {
-			return "", false, fmt.Errorf("want a Git repository URL, not a directory")
+			return "", "", false, fmt.Errorf("want a Git repository URL, not a directory")
 		}
-		return value, true, nil
+		buildDir, err := config.NormalizeBuildDir(v.SourceBuildDir)
+		if err != nil {
+			return "", "", false, fmt.Errorf("build directory: %w", err)
+		}
+		return value, buildDir, true, nil
 	case "dir":
 		value := strings.TrimSpace(v.SourcePath)
 		if value == "" {
-			return "", false, nil
+			return "", "", false, nil
 		}
 		source, err := config.ParseLocalSource(value)
 		if err != nil {
-			return "", false, err
+			return "", "", false, err
 		}
 		if source.IsGit {
-			return "", false, fmt.Errorf("want a source directory, not a Git repository URL")
+			return "", "", false, fmt.Errorf("want a source directory, not a Git repository URL")
 		}
-		return value, true, nil
+		return value, "", true, nil
 	default:
-		return "", false, nil
+		return "", "", false, nil
 	}
 }
 
@@ -317,6 +329,9 @@ func appSourceGitFields(v *appFormValues) []huh.Field {
 		huh.NewInput().Title("Git repository URL").
 			Description("https://, ssh:// or git@host:path. Stored only in this machine's ship.yaml, never on the server.").
 			Value(&v.SourceURL),
+		huh.NewInput().Title("Build directory (optional)").
+			Description("A relative directory inside the checkout, e.g. docs. Blank uses the repository root.").
+			Value(&v.SourceBuildDir),
 	}
 }
 

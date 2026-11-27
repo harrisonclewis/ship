@@ -107,6 +107,7 @@ Only these commands change local files without contacting a server:
 
 - `ship config edit` edits the local `ship.yaml`.
 - `ship <server> app set <app> source.path <directory|git-url>` writes `servers.<name>.sources.<app>` in the local `ship.yaml`; an empty value clears it.
+- `ship <server> app set <app> source.build_dir <directory>` writes `servers.<name>.build_dirs.<app>` for an existing Git URL source; an empty value clears it and a relative directory inside the checkout is required.
 
 Every other app and server command works against the server. `--dry-run` prints the steps instead of changing anything. See [Edit config](../guides/edit-config.md).
 

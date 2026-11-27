@@ -712,6 +712,7 @@ func TestGitSourceURLOnlyWritesLocalFile(t *testing.T) {
 	m.form.app.SourceKind = "git"
 	m.form.app.SourceURL = "https://github.com/acme/web.git"
 	m.form.app.SourcePath = ""
+	m.form.app.SourceBuildDir = "docs/"
 	runCmd(t, m, m.submitForm())
 	if len(fake.putCalls) != 0 {
 		t.Fatalf("local Git URL wrote to the server: %+v", fake.putCalls)
@@ -722,6 +723,55 @@ func TestGitSourceURLOnlyWritesLocalFile(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "web: https://github.com/acme/web.git") {
 		t.Fatalf("local sources not updated:\n%s", data)
+	}
+	cfg, err := config.Load(m.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := cfg.Server("staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.BuildDirs["web"]; got != "docs" {
+		t.Fatalf("build_dirs.web = %q", got)
+	}
+}
+
+func TestGitSourceBuildDirClearsWhenSwitchingToDirectory(t *testing.T) {
+	doc := strings.Replace(tuiTestDoc, "web: ~/web", "web: https://github.com/acme/web.git\n    build_dirs:\n      web: docs", 1)
+	m, fake := testModel(t, doc)
+	state := testState("staging", map[string]*config.App{
+		"web": decodedRecord(t, "domains: [web.example.com]\nupstream: web:8080\nsource: {type: image}\n"),
+	})
+	setVariances(m, fake, "staging", ops.VarianceReport{
+		Server: "staging",
+		State:  state,
+		Apps:   []ops.AppVariance{{App: "web", State: ops.VarianceApplied}},
+	})
+	m.serverName = "staging"
+	m.appName = "web"
+	m.page = pageAppEdit
+	m.openAppQuickForm(eaSource)
+	if m.form == nil || m.form.app.SourceBuildDir != "docs" {
+		t.Fatalf("form build dir = %#v", m.form)
+	}
+	m.form.app.SourceKind = "dir"
+	m.form.app.SourcePath = "~/code/web"
+	runCmd(t, m, m.submitForm())
+	cfg, err := config.Load(m.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := cfg.Server("staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := srv.BuildDirs["web"]; ok {
+		t.Fatal("build directory survived switching to a local directory")
+	}
+	home, _ := os.UserHomeDir()
+	if got := srv.Sources["web"]; got != filepath.Join(home, "code", "web") {
+		t.Fatalf("sources.web = %q", got)
 	}
 }
 

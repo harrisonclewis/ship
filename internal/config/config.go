@@ -123,6 +123,9 @@ type Server struct {
 	User string `yaml:"user,omitempty"`
 	// Sources maps an app name to its local checkout for image apps.
 	Sources map[string]string `yaml:"sources,omitempty"`
+	// BuildDirs maps an app name with a Git URL source to a relative directory
+	// inside its checkout where builds run. It is never uploaded.
+	BuildDirs map[string]string `yaml:"build_dirs,omitempty"`
 
 	// Old-format fields are decoded only so Validate can point at the
 	// migration. Server-side data (AdminUser, CaddyImage, Apps) is loaded from
@@ -550,6 +553,29 @@ func (s *Server) validate() error {
 		} else {
 			s.Sources[name] = source.Path
 		}
+	}
+
+	buildNames := make([]string, 0, len(s.BuildDirs))
+	for name := range s.BuildDirs {
+		buildNames = append(buildNames, name)
+	}
+	sort.Strings(buildNames)
+	for _, name := range buildNames {
+		if err := checkAppName(p+".build_dirs", name); err != nil {
+			return err
+		}
+		dir, err := NormalizeBuildDir(s.BuildDirs[name])
+		if err != nil {
+			return fmt.Errorf("%s.build_dirs.%s: %w", p, name, err)
+		}
+		if dir == "" {
+			delete(s.BuildDirs, name)
+			continue
+		}
+		s.BuildDirs[name] = dir
+	}
+	if len(s.BuildDirs) == 0 {
+		s.BuildDirs = nil
 	}
 	return nil
 }

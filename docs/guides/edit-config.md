@@ -30,6 +30,7 @@ The server name is required because the app is stored on that server; with exact
 |---|---|
 | `source.type` | `github-release` or `image` |
 | `source.path` | local directory or Git repository URL for an image app; writes local `sources.<app>`, not the server |
+| `source.build_dir` | relative build directory inside a Git URL checkout; writes local `build_dirs.<app>`, not the server |
 | `source.repo` | GitHub `owner/repo` |
 | `source.asset` | release asset pattern; empty restores the default |
 | `domains` | one or more domains, replacing the list |
@@ -44,12 +45,19 @@ An unknown key lists the valid ones. For `build.commands` and `deploy.commands`,
 ship prod app set hello deploy.commands - < deploy.sh
 ```
 
-`source.path` is special: it edits the local `servers.prod.sources.hello` entry and never contacts the server. It accepts a directory or a supported Git URL. An empty value clears it:
+`source.path` is special: it edits the local `servers.prod.sources.hello` entry and never contacts the server. It accepts a directory or a supported Git URL. An empty value clears it. Switching to a directory also clears its build directory:
 
 ```sh
 ship prod app set web source.path ~/code/web
 ship prod app set api source.path https://github.com/acme/api.git
 ship prod app set web source.path ""
+```
+
+`source.build_dir` edits only the local `servers.prod.build_dirs.hello` entry. It requires an existing Git URL source and accepts a portable relative directory such as `docs`; an empty value clears it and uses the checkout root:
+
+```sh
+ship prod app set api source.build_dir docs
+ship prod app set api source.build_dir ""
 ```
 
 Every other key updates the desired record on the server immediately.

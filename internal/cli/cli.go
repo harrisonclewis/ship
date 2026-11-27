@@ -677,7 +677,7 @@ func cmdEnv(o *options, cfg *config.Config, server string, args []string) error 
 }
 
 var appSetKeys = []string{
-	"source.type", "source.path", "source.repo", "source.asset", "domains", "redirects",
+	"source.type", "source.path", "source.build_dir", "source.repo", "source.asset", "domains", "redirects",
 	"build.commands", "deploy.commands", "deploy.maintenance",
 }
 
@@ -689,6 +689,13 @@ func validAppSetKey(key string) bool { return slices.Contains(appSetKeys, key) }
 
 func appUsage(server string) error {
 	return usageErr("usage: ship %s app set|add|remove <app> <key> <value...> | app edit|create|delete <app>", server)
+}
+
+func localConfigPath(cfg *config.Config) (string, error) {
+	if cfg.Path != "" {
+		return cfg.Path, nil
+	}
+	return config.Find()
 }
 
 func cmdApp(o *options, cfg *config.Config, server string, args []string) error {
@@ -734,27 +741,77 @@ func cmdAppSet(o *options, cfg *config.Config, server, sub, app, key string, val
 			return usageErr("source.path is local; use `ship %s app set %s source.path <directory|git-url>`", server, app)
 		}
 		value := strings.Join(values, " ")
-		path := cfg.Path
-		if path == "" {
-			p, err := config.Find()
-			if err != nil {
-				return err
-			}
-			path = p
+		path, err := localConfigPath(cfg)
+		if err != nil {
+			return err
 		}
 		if strings.TrimSpace(value) == "" {
-			if err := config.SetLocalSource(path, server, app, "", true); err != nil {
+			if err := config.SetLocalSourceEntry(path, server, app, "", "", true); err != nil {
 				return err
 			}
 			fmt.Fprintf(o.out, "sources.%s cleared.\n", app)
 		} else {
-			if err := config.ValidateLocalSourceValue(value); err != nil {
+			source, err := config.ParseLocalSource(value)
+			if err != nil {
 				return fmt.Errorf("source.path: %w", err)
 			}
-			if err := config.SetLocalSource(path, server, app, value, false); err != nil {
+			// A Git URL keeps an existing build directory; switching to a
+			// local directory clears it so it cannot be used by accident.
+			buildDir := ""
+			if source.IsGit {
+				current, err := config.Load(path)
+				if err != nil {
+					return err
+				}
+				srv, err := current.Server(server)
+				if err != nil {
+					return err
+				}
+				buildDir = srv.BuildDirs[app]
+			}
+			if err := config.SetLocalSourceEntry(path, server, app, value, buildDir, false); err != nil {
 				return err
 			}
 			fmt.Fprintf(o.out, "sources.%s = %s.\n", app, value)
+		}
+		if _, err := config.Load(path); err != nil {
+			return err
+		}
+		return nil
+	}
+	if key == "source.build_dir" {
+		if sub != "set" {
+			return usageErr("source.build_dir is local; use `ship %s app set %s source.build_dir <directory>`", server, app)
+		}
+		value := strings.Join(values, " ")
+		dir, err := config.NormalizeBuildDir(value)
+		if err != nil {
+			return fmt.Errorf("source.build_dir: %w", err)
+		}
+		path, err := localConfigPath(cfg)
+		if err != nil {
+			return err
+		}
+		current, err := config.Load(path)
+		if err != nil {
+			return err
+		}
+		srv, err := current.Server(server)
+		if err != nil {
+			return err
+		}
+		if dir != "" {
+			if _, ok := config.GitSource(srv.Sources[app]); !ok {
+				return fmt.Errorf("source.build_dir: sources.%s is not a Git repository URL; set source.path to a Git URL first", app)
+			}
+		}
+		if err := config.SetLocalBuildDir(path, server, app, dir); err != nil {
+			return err
+		}
+		if dir == "" {
+			fmt.Fprintf(o.out, "build_dirs.%s cleared.\n", app)
+		} else {
+			fmt.Fprintf(o.out, "build_dirs.%s = %s.\n", app, dir)
 		}
 		if _, err := config.Load(path); err != nil {
 			return err

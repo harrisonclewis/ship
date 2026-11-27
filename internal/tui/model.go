@@ -2234,13 +2234,16 @@ func (m *model) saveAppFormCmd(f *formHost) tea.Cmd {
 		}
 		compose = []byte("name: " + name + "\nservices:\n  " + name + ":\n    image: \"${IMAGE:?IMAGE is set by ship}\"\n")
 	}
-	localValue, keepLocal, localErr := localSourceFromForm(&v)
+	localValue, localBuildDir, keepLocal, localErr := localSourceFromForm(&v)
 	if localErr != nil {
 		return func() tea.Msg { return saveDoneMsg{form: f, err: localErr} }
 	}
 	hadLocal := false
 	if srv, err := m.backend.Server(server); err == nil {
 		_, hadLocal = srv.Sources[name]
+		if !hadLocal {
+			_, hadLocal = srv.BuildDirs[name]
+		}
 	}
 	arch := config.DefaultArch
 	if state != nil && state.Arch != "" {
@@ -2261,7 +2264,7 @@ func (m *model) saveAppFormCmd(f *formHost) tea.Cmd {
 		}
 		var warning string
 		if keepLocal || hadLocal {
-			if err := config.SetLocalSource(path, server, name, localValue, !keepLocal); err != nil {
+			if err := config.SetLocalSourceEntry(path, server, name, localValue, localBuildDir, !keepLocal); err != nil {
 				warning = "Saved on the server, but could not update the local source: " + err.Error()
 			}
 		}
@@ -2281,11 +2284,11 @@ func (m *model) saveQuickAppCmd(f *formHost) tea.Cmd {
 			return saveDoneMsg{form: f, err: fmt.Errorf("app %q is no longer configured on %s", app, server)}
 		}
 	}
-	var localValue string
+	var localValue, localBuildDir string
 	var keepLocal bool
 	if f.purpose == formEditAppSource {
 		var localErr error
-		localValue, keepLocal, localErr = localSourceFromForm(&v)
+		localValue, localBuildDir, keepLocal, localErr = localSourceFromForm(&v)
 		if localErr != nil {
 			return func() tea.Msg { return saveDoneMsg{form: f, err: localErr} }
 		}
@@ -2293,7 +2296,7 @@ func (m *model) saveQuickAppCmd(f *formHost) tea.Cmd {
 		// Changing only the local source value does not require a server write.
 		if da.Record.Source.Type == "image" && (v.SourceKind == "dir" || v.SourceKind == "git") {
 			return func() tea.Msg {
-				if err := config.SetLocalSource(path, server, app, localValue, !keepLocal); err != nil {
+				if err := config.SetLocalSourceEntry(path, server, app, localValue, localBuildDir, !keepLocal); err != nil {
 					return saveDoneMsg{form: f, err: err}
 				}
 				if _, err := config.Load(path); err != nil {
@@ -2321,7 +2324,7 @@ func (m *model) saveQuickAppCmd(f *formHost) tea.Cmd {
 			return saveDoneMsg{form: f, err: err}
 		}
 		if f.purpose == formEditAppSource {
-			if err := config.SetLocalSource(path, server, app, localValue, !keepLocal); err != nil {
+			if err := config.SetLocalSourceEntry(path, server, app, localValue, localBuildDir, !keepLocal); err != nil {
 				return saveDoneMsg{form: f, warning: "Saved on the server, but could not update the local source: " + err.Error()}
 			}
 		}

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 // GitRepo is a validated Git repository URL for a local build source.
@@ -75,6 +76,36 @@ func ParseLocalSource(value string) (LocalSource, error) {
 func ValidateLocalSourceValue(value string) error {
 	_, err := ParseLocalSource(value)
 	return err
+}
+
+// NormalizeBuildDir validates a relative build directory inside a Git
+// checkout. It is portable across operating systems: it uses forward slashes,
+// has no drive or absolute prefix, and never contains a parent component.
+// Blank and "." both mean the checkout root and return "".
+func NormalizeBuildDir(value string) (string, error) {
+	if strings.IndexFunc(value, unicode.IsControl) >= 0 || strings.ContainsRune(value, '\\') {
+		return "", fmt.Errorf("control characters and backslashes are not allowed")
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	if strings.Contains(value, ":") {
+		return "", fmt.Errorf("want a relative directory without a drive or scheme prefix, got %q", value)
+	}
+	if path.IsAbs(value) {
+		return "", fmt.Errorf("want a directory relative to the Git checkout, not an absolute path: %q", value)
+	}
+	for _, part := range strings.Split(value, "/") {
+		if part == ".." {
+			return "", fmt.Errorf("must not contain a parent directory: %q", value)
+		}
+	}
+	clean := path.Clean(value)
+	if clean == "." {
+		return "", nil
+	}
+	return clean, nil
 }
 
 // GitSource returns the parsed repository when value is a Git URL.

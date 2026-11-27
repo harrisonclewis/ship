@@ -350,3 +350,69 @@ func TestServerConfigEditIsDispatched(t *testing.T) {
 		t.Fatalf("dispatchCommand(prod config edit app bogus) = %v", err)
 	}
 }
+
+func TestAppSetBuildDirIsLocalAndRequiresGitSource(t *testing.T) {
+	doc := `servers:
+  prod:
+    host: ops@203.0.113.10
+    sources:
+      app: https://github.com/acme/app.git
+`
+	cfg, path := writeConfig(t, doc)
+	o := &options{in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	if _, err := runAppCommand(o, cfg, "set", "app", "source.build_dir", "docs/"); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Servers["prod"].BuildDirs["app"]; got != "docs" {
+		t.Fatalf("build_dirs.app = %q", got)
+	}
+
+	// A messy but valid relative path is normalized.
+	if _, err := runAppCommand(o, cfg, "set", "app", "source.build_dir", "./site//"); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Servers["prod"].BuildDirs["app"]; got != "site" {
+		t.Fatalf("build_dirs.app = %q", got)
+	}
+
+	// Switching the URL keeps the build directory.
+	if _, err := runAppCommand(o, cfg, "set", "app", "source.path", "https://github.com/acme/other.git"); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Servers["prod"].BuildDirs["app"]; got != "site" {
+		t.Fatalf("build directory lost on Git URL change: %q", got)
+	}
+
+	// Switching to a local directory clears it.
+	if _, err := runAppCommand(o, cfg, "set", "app", "source.path", "~/code/app"); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loaded.Servers["prod"].BuildDirs["app"]; ok {
+		t.Fatal("build directory survived a switch to a local directory")
+	}
+	if _, err := runAppCommand(o, cfg, "set", "app", "source.build_dir", "docs"); err == nil ||
+		!strings.Contains(err.Error(), "not a Git repository URL") {
+		t.Fatalf("local-directory source error = %v", err)
+	}
+
+	// Clearing is always allowed.
+	if _, err := runAppCommand(o, cfg, "set", "app", "source.build_dir", ""); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -177,8 +177,11 @@ func (o *Ops) deployApp(ctx context.Context, s *remote.Session, srv *config.Serv
 				if err != nil {
 					return err
 				}
-			} else if err := o.buildGitImage(ctx, s, srv, name, app, resolved, cache); err != nil {
-				return err
+			} else {
+				builtVersion, err = o.buildGitImage(ctx, s, srv, name, app, resolved, cache)
+				if err != nil {
+					return err
+				}
 			}
 			version = builtVersion
 			sourceRef = resolved.Ref

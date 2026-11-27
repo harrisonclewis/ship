@@ -25,6 +25,7 @@ A local `apps/<name>/` folder is no longer read. App records, compose files and 
 | `servers.<name>.identity_file` | string | empty | optional SSH private key for a remote server, e.g. `~/.ssh/prod`; ssh offers only that key. Without it, ship uses your ssh config and agent. Not allowed for `local` |
 | `servers.<name>.user` | string | empty | for `local`, the optional admin user to act as, e.g. `ops`; empty uses the current user. Not allowed for `remote` |
 | `servers.<name>.sources` | map | empty | app name to the local checkout or Git URL used to build an image app, e.g. `web: ~/code/web` or `web: https://github.com/acme/web` |
+| `servers.<name>.build_dirs` | map | empty | app name to a relative directory inside its Git checkout where builds run; only valid for Git URL sources, e.g. `web: docs` |
 
 Only these keys are accepted. `admin_user`, `arch`, `caddy_image` and `apps` are no longer local keys:
 
@@ -43,6 +44,9 @@ servers:
     identity_file: ~/.ssh/prod
     sources:                     # local checkouts, image apps only
       web: ~/code/web
+      api: https://github.com/acme/api.git
+    build_dirs:                  # optional, Git URL image apps only
+      api: docs
 
   self:
     connection: local            # ship runs on this server
@@ -52,6 +56,8 @@ servers:
 ```
 
 `sources.<app>` is used only when building an image app on this machine. It is not uploaded and is not part of the app's server record. A value is either a directory (absolute or `~/...`) or a Git repository URL (`https://`, `ssh://` or `git@host:path`). Keeping the URL local means a server record can never choose this machine's build input or make Git use local credentials.
+
+`build_dirs.<app>` is optional and applies only to a Git URL source. It is a portable relative directory inside the isolated checkout, for example `docs`, where build commands, the Dockerfile and the Docker build context live. The checkout itself is always complete, and a relative directory may not escape it. Blank or missing means the repository root.
 
 A local connection has no `host` or `identity_file` and never stores a password. See [Run ship on the server](../guides/run-on-the-server.md) for the sudo rules, local installs, image builds and backups.
 
@@ -99,7 +105,7 @@ These keys live in the desired app record on the server, not in `ship.yaml`. Edi
 | `deploy.commands` | string | empty | a script run on the server in the new image just before it goes live |
 | `deploy.maintenance` | boolean | `true` | show a 503 maintenance page while deploying |
 
-A `source.type: image` app uses the directory or Git URL in the local `servers.<name>.sources.<app>` setting. Ship records the selected commit or release beside `current` and `previous` in `.ship-state`. Source builds use the commit SHA as the image version. Asset builds also incorporate the verified asset's digest.
+A `source.type: image` app uses the directory or Git URL in the local `servers.<name>.sources.<app>` setting. A Git URL may also set `servers.<name>.build_dirs.<app>` to a relative directory inside the checkout; blank means root. Ship records the selected commit or release beside `current` and `previous` in `.ship-state`. Source builds use the commit SHA as the image version; a non-root build directory adds a stable `-dir-<hash>` suffix. Asset builds also incorporate the verified asset's digest and, when set, the build directory.
 
 A successful deploy promotes the desired record to `/opt/apps/<app>/ship-app.yaml`. The server record never contains `source.path`; an image app's local checkout lives only in `servers.<name>.sources.<app>`.
 
@@ -123,6 +129,7 @@ ship prod server set caddy_image caddy:2.10-alpine
 - `identity_file` must be an absolute path or start with `~/`; it is only valid for a remote server.
 - `user` is only valid with `connection: local`. It follows the admin-user rules (`ops`, not `root` or `deploy`) and is optional.
 - `sources.<app>` must be a clean absolute path, start with `~/`, or be a supported Git URL (`https://`, `ssh://` or scp-style `git@host:path`). Git URLs must not contain credentials, query strings, fragments or unsafe path segments.
+- `build_dirs.<app>` must be a relative forward-slash path with no `..`, backslash, drive prefix or control characters. It is only used for a Git URL source; blank or `.` means the checkout root.
 - `domains` and `redirects` must be lowercase FQDNs with at least one dot and no trailing dot.
 - Every domain and redirect must be unique across the desired apps on that server.
 - Server paths (`data`, `backup.sqlite`, `backup.files`) must be clean and absolute, use only letters, digits and `._/-`, and not be `/`.

@@ -721,3 +721,77 @@ func TestBuildApprovalRoundTrip(t *testing.T) {
 		t.Fatalf("approved hash = %q, want %q", got, hash)
 	}
 }
+
+func TestBuildDirsParseAndNormalize(t *testing.T) {
+	doc := `servers:
+  prod:
+    host: ops@203.0.113.10
+    sources:
+      web: https://github.com/acme/web.git
+    build_dirs:
+      web: docs/
+`
+	c, err := decode(t, doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := server(t, c, "prod").BuildDirs["web"]; got != "docs" {
+		t.Fatalf("build_dirs.web = %q", got)
+	}
+	bad := strings.Replace(doc, "web: docs/", "web: ../docs", 1)
+	if _, err := decode(t, bad); err == nil || !strings.Contains(err.Error(), "build_dirs.web") {
+		t.Fatalf("bad build directory error = %v", err)
+	}
+}
+
+func TestLocalBuildDirEditing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ship.yaml")
+	doc := `servers:
+  prod:
+    host: ops@203.0.113.10
+    sources:
+      web: https://github.com/acme/web.git
+`
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetLocalSourceEntry(path, "prod", "web", "https://github.com/acme/web.git", "docs/", false); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Servers["prod"].BuildDirs["web"]; got != "docs" {
+		t.Fatalf("build_dirs.web = %q", got)
+	}
+	// Changing only the build directory leaves the source scalar as written.
+	if err := SetLocalBuildDir(path, "prod", "web", "site"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "web: https://github.com/acme/web.git") {
+		t.Fatalf("source changed unexpectedly:\n%s", data)
+	}
+	c, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Servers["prod"].BuildDirs["web"]; got != "site" {
+		t.Fatalf("build_dirs.web = %q", got)
+	}
+	if err := SetLocalSource(path, "prod", "web", "", true); err != nil {
+		t.Fatal(err)
+	}
+	c, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.Servers["prod"].BuildDirs["web"]; ok {
+		t.Fatal("build directory was not removed with the source")
+	}
+}

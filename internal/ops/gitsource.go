@@ -309,7 +309,7 @@ func (o *Ops) resolveGitRevision(ctx context.Context, cache string, repo config.
 		if sel.kind == "release-asset" {
 			resolved.Ref += ":" + sel.asset
 			resolved.Asset = sel.asset
-			resolved.ImageVersion = releaseAssetImageVersion(sel.value, sel.asset, commit, "")
+			resolved.ImageVersion = releaseAssetImageVersion(sel.value, sel.asset, commit, "", "")
 		}
 		return resolved, nil
 	default:
@@ -503,6 +503,7 @@ func (o *Ops) newerAvailable(ctx context.Context, repo config.GitRepo, current, 
 	if current == "" {
 		return false, "", nil
 	}
+	current = GitVersionCommit(current)
 	ctx, cancel := context.WithTimeout(ctx, gitCheckTimeout)
 	defer cancel()
 	if tag, ok := releaseTagFromRef(currentRef); ok {
@@ -575,12 +576,92 @@ func releaseTagFromRef(ref string) (string, bool) {
 }
 
 // releaseAssetImageVersion binds the image identity to the release tag, the
-// asset name, the source checkout commit and the verified payload digest. A
-// replaced asset under the same name, or a moved tag, therefore produces a new
-// image instead of overwriting the rollback tag.
-func releaseAssetImageVersion(tag, asset, commit, payloadSHA string) string {
-	sum := sha256.Sum256([]byte(tag + "\x00" + asset + "\x00" + commit + "\x00" + payloadSHA))
+// asset name, the source checkout commit, the verified payload digest and,
+// for a non-root build directory, the directory. A replaced asset under the
+// same name, a moved tag, or a different build directory therefore produces a
+// new image instead of overwriting the rollback tag. Root builds keep the
+// identity they had before build directories existed.
+func releaseAssetImageVersion(tag, asset, commit, payloadSHA, buildDir string) string {
+	input := tag + "\x00" + asset + "\x00" + commit + "\x00" + payloadSHA
+	if dir, err := config.NormalizeBuildDir(buildDir); err == nil && dir != "" {
+		input += "\x00" + dir
+	}
+	sum := sha256.Sum256([]byte(input))
 	return "asset-" + hex.EncodeToString(sum[:])
+}
+
+const gitBuildDirVersionMarker = "-dir-"
+
+// gitBuildImageVersion keeps root builds at the bare commit SHA and gives a
+// non-root build directory a stable, distinct suffix. The suffix makes a
+// build-directory change produce a new image at the same commit.
+func gitBuildImageVersion(base, buildDir string) string {
+	dir, err := config.NormalizeBuildDir(buildDir)
+	if err != nil || dir == "" || !gitCommitSHA.MatchString(base) {
+		return base
+	}
+	sum := sha256.Sum256([]byte(dir))
+	return base + gitBuildDirVersionMarker + hex.EncodeToString(sum[:6])
+}
+
+// GitVersionCommit returns the commit SHA of a Git image version, stripping
+// the stable build-directory suffix when present. Status and the TUI use it
+// so a non-root build still matches its commit.
+func GitVersionCommit(version string) string {
+	if i := strings.LastIndex(version, gitBuildDirVersionMarker); i > 0 &&
+		len(version) == i+len(gitBuildDirVersionMarker)+12 {
+		return version[:i]
+	}
+	return version
+}
+
+// resolveGitBuildDir returns the build context below a checked-out repository.
+// The relative path is validated again here, and an existing path is resolved
+// through symlinks so it cannot escape the checkout, including when a parent
+// of the checkout is itself a symlink. Dry runs only resolve the path
+// lexically because the checkout has not been created yet.
+func resolveGitBuildDir(root, buildDir string, requireExists bool) (string, error) {
+	dir, err := config.NormalizeBuildDir(buildDir)
+	if err != nil {
+		return "", fmt.Errorf("build directory: %w", err)
+	}
+	if dir == "" {
+		return root, nil
+	}
+	target := filepath.Join(root, filepath.FromSlash(dir))
+	if !requireExists {
+		if !insideDir(root, target) {
+			return "", fmt.Errorf("build directory %s escapes the checkout", dir)
+		}
+		return target, nil
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve the build checkout: %w", err)
+	}
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return "", fmt.Errorf("build directory %s does not exist inside the checkout: %w", dir, err)
+	}
+	if !insideDir(resolvedRoot, resolvedTarget) {
+		return "", fmt.Errorf("build directory %s escapes the checkout", dir)
+	}
+	fi, err := os.Stat(resolvedTarget)
+	if err != nil {
+		return "", fmt.Errorf("build directory %s: %w", dir, err)
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("build directory %s is not a directory", dir)
+	}
+	return resolvedTarget, nil
+}
+
+func insideDir(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 func shortSHA(sha string, n int) string {
@@ -591,35 +672,53 @@ func shortSHA(sha string, n int) string {
 }
 
 // buildGitImage clones a resolved commit into a private build directory,
-// runs the app's approved build script and docker buildx there, and tags the
-// image with the full commit SHA.
-func (o *Ops) buildGitImage(ctx context.Context, s *remote.Session, srv *config.Server, name string, app *config.App, resolved gitResolution, cache string) error {
+// resolves the app's optional subdirectory, runs the app's approved build
+// script and docker buildx there, and tags the image with the full commit SHA
+// plus a stable build-directory suffix when the build directory is not root.
+func (o *Ops) buildGitImage(ctx context.Context, s *remote.Session, srv *config.Server, name string, app *config.App, resolved gitResolution, cache string) (string, error) {
 	if err := checkLocalBuild(s, name); err != nil {
-		return err
+		return "", err
 	}
 	buildDir, cleanup, err := o.checkoutGitBuild(ctx, s, srv, name, resolved, cache)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer cleanup()
+	contextDir, err := resolveGitBuildDir(buildDir, srv.BuildDirs[name], !s.DryRun)
+	if err != nil {
+		return "", err
+	}
 	if !s.DryRun {
-		if fi, err := os.Stat(filepath.Join(buildDir, "Dockerfile")); err != nil || fi.IsDir() {
-			return fmt.Errorf("the repository at %s has no Dockerfile", shortSHA(resolved.Commit, 8))
+		if fi, err := os.Stat(filepath.Join(contextDir, "Dockerfile")); err != nil || fi.IsDir() {
+			return "", fmt.Errorf("the repository at %s has no Dockerfile in %s", shortSHA(resolved.Commit, 8), buildDirLabel(srv.BuildDirs[name]))
 		}
 	}
-	if err := o.runBuildCommands(s, srv, name, app, buildDir); err != nil {
-		return err
+	if err := o.runBuildCommands(s, srv, name, app, contextDir); err != nil {
+		return "", err
 	}
-	ref := srv.ImageRef(name, resolved.ImageVersion)
-	return o.dockerBuild(s, srv, ref, buildDir, "")
+	imageVersion := gitBuildImageVersion(resolved.ImageVersion, srv.BuildDirs[name])
+	ref := srv.ImageRef(name, imageVersion)
+	if err := o.dockerBuild(s, srv, ref, contextDir, ""); err != nil {
+		return "", err
+	}
+	return imageVersion, nil
+}
+
+func buildDirLabel(dir string) string {
+	if dir == "" {
+		return "the repository root"
+	}
+	return dir
 }
 
 // buildReleaseAssetImage builds an image from a verified release asset at the
-// release tag's checkout, using Dockerfile.release when the checkout has one.
+// release tag's checkout, using Dockerfile.release when the build directory has
+// one.
 func (o *Ops) buildReleaseAssetImage(ctx context.Context, s *remote.Session, srv *config.Server, name string, resolved gitResolution, repo config.GitRepo, cache string) (string, error) {
 	if err := checkLocalBuild(s, name); err != nil {
 		return "", err
 	}
+	buildRelative := srv.BuildDirs[name]
 	if s.DryRun {
 		owner, repoName, _ := repo.GitHubOwnerRepo()
 		fmt.Fprintf(s.Out, "$ gh api --hostname github.com repos/%s/%s/releases/tags/%s\n", owner, repoName, url.PathEscape(resolved.Tag))
@@ -631,9 +730,13 @@ func (o *Ops) buildReleaseAssetImage(ctx context.Context, s *remote.Session, srv
 			return "", err
 		}
 		defer cleanup()
+		contextDir, err := resolveGitBuildDir(buildDir, buildRelative, false)
+		if err != nil {
+			return "", err
+		}
 		fmt.Fprintf(s.Out, "# would use Dockerfile.release when present, otherwise a Dockerfile declaring ARG BINARY\n")
 		args := []string{"--build-arg", "VERSION=" + resolved.Tag, "--build-arg", "BINARY=ship-release-binary"}
-		if err := o.dockerBuild(s, srv, srv.ImageRef(name, resolved.ImageVersion), buildDir, "", args...); err != nil {
+		if err := o.dockerBuild(s, srv, srv.ImageRef(name, resolved.ImageVersion), contextDir, "", args...); err != nil {
 			return "", err
 		}
 		return "asset-dry-run", nil
@@ -660,22 +763,26 @@ func (o *Ops) buildReleaseAssetImage(ctx context.Context, s *remote.Session, srv
 		return "", err
 	}
 	defer cleanup()
+	contextDir, err := resolveGitBuildDir(buildDir, buildRelative, true)
+	if err != nil {
+		return "", err
+	}
 
 	const binaryName = "ship-release-binary"
 	dockerfile := "Dockerfile"
-	releaseDockerfile := filepath.Join(buildDir, "Dockerfile.release")
-	rootDockerfile := filepath.Join(buildDir, "Dockerfile")
+	releaseDockerfile := filepath.Join(contextDir, "Dockerfile.release")
+	rootDockerfile := filepath.Join(contextDir, "Dockerfile")
 	if fi, err := os.Lstat(releaseDockerfile); err == nil {
 		if !fi.Mode().IsRegular() {
 			return "", fmt.Errorf("Dockerfile.release must be a regular file")
 		}
 		dockerfile = "Dockerfile.release"
 	} else if fi, err := os.Lstat(rootDockerfile); err != nil || !fi.Mode().IsRegular() {
-		return "", fmt.Errorf("the repository at %s has no Dockerfile.release or Dockerfile", shortSHA(resolved.Commit, 8))
+		return "", fmt.Errorf("the repository at %s has no Dockerfile.release or Dockerfile in %s", shortSHA(resolved.Commit, 8), buildDirLabel(buildRelative))
 	} else if !dockerfileDeclaresBinary(rootDockerfile) {
 		return "", fmt.Errorf("the repository's Dockerfile does not declare ARG BINARY; add a Dockerfile.release that consumes the release asset, or add ARG BINARY to Dockerfile")
 	}
-	dest := filepath.Join(buildDir, binaryName)
+	dest := filepath.Join(contextDir, binaryName)
 	if err := os.Remove(dest); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return "", err
 	}
@@ -684,9 +791,9 @@ func (o *Ops) buildReleaseAssetImage(ctx context.Context, s *remote.Session, srv
 	}
 	fmt.Fprintf(s.Out, "using verified asset %s for %s\n", resolved.Asset, resolved.Tag)
 
-	imageVersion := releaseAssetImageVersion(resolved.Tag, resolved.Asset, resolved.Commit, payloadSHA)
+	imageVersion := releaseAssetImageVersion(resolved.Tag, resolved.Asset, resolved.Commit, payloadSHA, buildRelative)
 	args := []string{"--build-arg", "VERSION=" + resolved.Tag, "--build-arg", "BINARY=" + binaryName}
-	if err := o.dockerBuild(s, srv, srv.ImageRef(name, imageVersion), buildDir, dockerfile, args...); err != nil {
+	if err := o.dockerBuild(s, srv, srv.ImageRef(name, imageVersion), contextDir, dockerfile, args...); err != nil {
 		return "", err
 	}
 	return imageVersion, nil
@@ -740,17 +847,17 @@ func (o *Ops) checkoutGitBuild(ctx context.Context, s *remote.Session, srv *conf
 	return buildDir, cleanup, nil
 }
 
-func (o *Ops) dockerBuild(s *remote.Session, srv *config.Server, ref, buildDir, dockerfile string, extra ...string) error {
+func (o *Ops) dockerBuild(s *remote.Session, srv *config.Server, ref, contextDir, dockerfile string, extra ...string) error {
 	arch := srv.Arch
 	if arch == "" {
 		arch = config.DefaultArch
 	}
 	args := []string{"buildx", "build", "--platform", arch, "--tag", ref, "--load"}
 	if dockerfile != "" && dockerfile != "Dockerfile" {
-		args = append(args, "-f", filepath.Join(buildDir, dockerfile))
+		args = append(args, "-f", filepath.Join(contextDir, dockerfile))
 	}
 	args = append(args, extra...)
-	args = append(args, buildDir)
+	args = append(args, contextDir)
 	if err := s.Local(append([]string{"docker"}, args...)...); err != nil {
 		return fmt.Errorf("docker buildx: %w", err)
 	}

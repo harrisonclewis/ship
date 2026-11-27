@@ -54,10 +54,13 @@ servers:
       web: ~/code/web
       api: https://github.com/acme/api.git
       worker: git@github.com:acme/worker.git
+    build_dirs:
+      api: docs
 ```
 
 - A directory must be a clean absolute path or start with `~/`.
 - A Git URL must use `https://`, `ssh://` or scp-style `git@host:path`. Credentials, query strings, fragments, `file://`, `ext::` and unsafe path segments are rejected.
+- `build_dirs` is optional and only for a Git URL. It is a relative directory inside the checkout where build commands, the Dockerfile and the Docker context live. Blank or missing means the repository root.
 - The URL is never uploaded and never appears in the server record. A server record cannot change this machine's build input or make Git use local credentials.
 - If it is empty, the app can still be deployed to an existing version, rolled back, backed up, restored and compared, but it cannot be built.
 
@@ -68,11 +71,20 @@ ship prod app set web source.path ~/code/web
 ship prod app set api source.path https://github.com/acme/api.git
 ```
 
-This edits only `servers.prod.sources.<app>`. Clear it with an empty value:
+This updates `servers.prod.sources.<app>` in the local config. Switching to a local directory clears any Git build directory. Clear the source with an empty value:
 
 ```sh
 ship prod app set web source.path ""
 ```
+
+For a Git URL, set an optional relative build directory with:
+
+```sh
+ship prod app set api source.build_dir docs
+ship prod app set api source.build_dir ""
+```
+
+A non-empty `source.build_dir` requires a Git URL and a relative path inside the checkout. Ship rejects `..` components and symlinks that escape the checkout.
 
 Change the type itself on the server, then deploy:
 
@@ -87,12 +99,14 @@ ship prod deploy web
 
 A Git URL is fetched into `~/.ship/servers/<server>/repositories/<host>/...`, keyed by the full host and repository path so two repositories with the same basename do not collide. The cache origin is checked before every use. Each build clones the resolved commit into a separate directory under `~/.ship/servers/<server>/builds/<app>/`; a failed or concurrent build cannot change another build's or the cache's inputs. Builds use the server's architecture, just like a directory build.
 
+A `build_dirs.<app>` setting changes the build directory inside that isolated checkout. Build commands run there, the Dockerfile or `Dockerfile.release` is selected there, and Docker uses it as the context. The complete checkout is still present and is removed after the build. Blank means the repository root.
+
 - No version: the remote default branch's latest commit.
 - `commit:<sha>`: build that commit (7–40 hex characters; ambiguous short SHAs are refused).
 - `release:<tag>`: verify the tag is a published GitHub release through `gh`, then build source at the tag's commit.
 - `release:<tag>:<asset>`: use one asset from that published release instead of building source. See below.
 
-The build image is tagged with the full commit SHA. The TUI's **v** action opens a Commits/Releases picker; releases offer **Build source** or a downloadable asset. The same selection is available on the CLI:
+The build image is tagged with the full commit SHA. When a non-root build directory is set, a stable `-dir-<hash>` suffix is added so changing the directory at the same commit builds a new image. The TUI's **v** action opens a Commits/Releases picker; releases offer **Build source** or a downloadable asset. The same selection is available on the CLI:
 
 ```sh
 ship prod deploy api                       # default branch HEAD
@@ -105,7 +119,7 @@ The last successfully deployed identity is stored in `/opt/apps/<app>/.ship-stat
 
 ### Release assets from a Git URL
 
-The asset route uses the trusted repository checkout at the release tag as the Docker build context. It requires `Dockerfile.release`, or a root `Dockerfile` that declares `ARG BINARY`; the asset is copied into the context as `ship-release-binary` and passed as `BINARY`, with the tag as `VERSION`. The Dockerfile must consume `BINARY` (and unpack an archive if needed). Source `build.commands` are not run for this route. Release assets are downloaded with `gh api` on this machine, verified against GitHub's asset digest or the release's `SHA256SUMS`/`checksums.txt`, and staged outside the checkout before being copied in. Checksum files are not offered as choices. The image version includes the tag, asset name, source commit and verified payload digest, so replacing an asset or moving a tag produces a distinct image and cannot overwrite the rollback tag.
+The asset route uses the trusted repository checkout at the release tag as the Docker build context, or the `build_dirs.<app>` directory inside it. It requires `Dockerfile.release`, or a root `Dockerfile` that declares `ARG BINARY`; the asset is copied into the context as `ship-release-binary` and passed as `BINARY`, with the tag as `VERSION`. The Dockerfile must consume `BINARY` (and unpack an archive if needed). Source `build.commands` are not run for this route. Release assets are downloaded with `gh api` on this machine, verified against GitHub's asset digest or the release's `SHA256SUMS`/`checksums.txt`, and staged outside the checkout before being copied in. Checksum files are not offered as choices. The image version includes the tag, asset name, source commit and verified payload digest, plus the build directory when set, so replacing an asset, moving a tag, or changing the build directory produces a distinct image and cannot overwrite the rollback tag.
 
 ## How the version is chosen
 

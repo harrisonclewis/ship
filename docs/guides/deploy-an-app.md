@@ -81,7 +81,7 @@ ship prod deploy hello v1.2.3
 
 ## Git URL image apps
 
-An image app whose local `sources.<app>` is a Git URL is fetched and built on this machine, then sent to the server like any image app. Its image version is the full commit SHA.
+An image app whose local `sources.<app>` is a Git URL is fetched and built on this machine, then sent to the server like any image app. Its image version is the full commit SHA, plus a stable `-dir-<hash>` suffix when an optional `build_dirs.<app>` directory is set. That directory, relative to the checkout, is where build commands, Dockerfile selection and the Docker build context live; blank means the repository root.
 
 ```sh
 ship prod deploy web                         # remote default branch HEAD
@@ -91,9 +91,9 @@ ship prod deploy web release:v1.2.3:web_linux_amd64  # a release asset
 ```
 
 - `release:<tag>` is accepted only when `gh` confirms a published, non-draft GitHub release at that tag.
-- `release:<tag>:<asset>` downloads the asset with `gh api`, verifies it, and builds from the tag's checkout. The asset build uses `Dockerfile.release` when present; otherwise the root `Dockerfile` must declare `ARG BINARY`. The asset is copied in as `ship-release-binary` and passed as `BINARY`, with the tag as `VERSION`. Source build commands are skipped on this route.
+- `release:<tag>:<asset>` downloads the asset with `gh api`, verifies it, and builds from the tag's checkout. The asset build uses `Dockerfile.release` when present; otherwise the root `Dockerfile` must declare `ARG BINARY`. The asset is copied in as `ship-release-binary` and passed as `BINARY`, with the tag as `VERSION`. The build directory and Docker context follow `build_dirs.<app>`. Source build commands are skipped on this route.
 - Checksum assets are not offered in the picker. Both the selected asset and the release checksum files are staged separately from the checkout, and a verified copy is placed into the build input.
-- The image version for an asset includes the tag, asset name, source commit and verified payload digest, so a replaced asset or moved tag never collides with the rollback image.
+- The image version for an asset includes the tag, asset name, source commit, verified payload digest and, when set, the build directory, so a replaced asset, moved tag or changed build directory never collides with the rollback image.
 
 The TUI **v** action opens a Commits/Releases picker. Select a release to choose **Build source** or one of its assets. Caches live in `~/.ship/servers/<server>/repositories/`; each build uses a separate directory under `~/.ship/servers/<server>/builds/<app>/`.
 

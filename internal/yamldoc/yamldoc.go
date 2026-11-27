@@ -50,6 +50,7 @@ type AppValues struct {
 	SourceAsset       string
 	SourcePath        string
 	SourceURL         string
+	SourceBuildDir    string
 	UID               string
 	DataText          string
 	HealthPath        string

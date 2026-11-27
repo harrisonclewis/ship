@@ -10,8 +10,84 @@ import (
 )
 
 // SetLocalSource updates servers.<server>.sources.<app> in a new-format
-// ship.yaml, keeping the rest of the file (and its comments) intact.
+// ship.yaml, keeping the rest of the file (and its comments) intact. Any
+// build_dirs entry for the app is cleared too.
 func SetLocalSource(path, server, app, value string, remove bool) error {
+	return SetLocalSourceEntry(path, server, app, value, "", remove)
+}
+
+// SetLocalSourceEntry writes servers.<server>.sources.<app> and its
+// build_dirs.<app> entry in one file update. An empty buildDir removes the
+// entry. remove deletes both and the containing maps when they become empty.
+func SetLocalSourceEntry(path, server, app, value, buildDir string, remove bool) error {
+	dir, err := NormalizeBuildDir(buildDir)
+	if err != nil {
+		return err
+	}
+	return editLocalServer(path, server, func(target *yaml.Node) error {
+		sources := mapGet(target, "sources")
+		if sources == nil || sources.Kind != yaml.MappingNode {
+			sources = &yaml.Node{Kind: yaml.MappingNode}
+			mapSet(target, "sources", sources)
+		}
+		if remove {
+			mapDelete(sources, app)
+			if len(sources.Content) == 0 {
+				mapDelete(target, "sources")
+			}
+			deleteLocalBuildDir(target, app)
+			return nil
+		}
+		mapSet(sources, app, &yaml.Node{Kind: yaml.ScalarNode, Value: value})
+		if dir == "" {
+			deleteLocalBuildDir(target, app)
+			return nil
+		}
+		setLocalBuildDir(target, app, dir)
+		return nil
+	})
+}
+
+// SetLocalBuildDir updates only servers.<server>.build_dirs.<app>. It leaves
+// the source value exactly as written, including a ~/ path.
+func SetLocalBuildDir(path, server, app, value string) error {
+	dir, err := NormalizeBuildDir(value)
+	if err != nil {
+		return err
+	}
+	return editLocalServer(path, server, func(target *yaml.Node) error {
+		if dir == "" {
+			deleteLocalBuildDir(target, app)
+			return nil
+		}
+		setLocalBuildDir(target, app, dir)
+		return nil
+	})
+}
+
+func setLocalBuildDir(target *yaml.Node, app, dir string) {
+	buildDirs := mapGet(target, "build_dirs")
+	if buildDirs == nil || buildDirs.Kind != yaml.MappingNode {
+		buildDirs = &yaml.Node{Kind: yaml.MappingNode}
+		mapSet(target, "build_dirs", buildDirs)
+	}
+	mapSet(buildDirs, app, &yaml.Node{Kind: yaml.ScalarNode, Value: dir})
+}
+
+func deleteLocalBuildDir(target *yaml.Node, app string) {
+	buildDirs := mapGet(target, "build_dirs")
+	if buildDirs == nil || buildDirs.Kind != yaml.MappingNode {
+		return
+	}
+	mapDelete(buildDirs, app)
+	if len(buildDirs.Content) == 0 {
+		mapDelete(target, "build_dirs")
+	}
+}
+
+// editLocalServer loads a new-format ship.yaml, runs edit on the server node
+// and writes the file back once.
+func editLocalServer(path, server string, edit func(*yaml.Node) error) error {
 	original, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -35,18 +111,8 @@ func SetLocalSource(path, server, app, value string, remove bool) error {
 	if target == nil || target.Kind != yaml.MappingNode {
 		return fmt.Errorf("servers.%s is not a mapping", server)
 	}
-	sources := mapGet(target, "sources")
-	if sources == nil || sources.Kind != yaml.MappingNode {
-		sources = &yaml.Node{Kind: yaml.MappingNode}
-		mapSet(target, "sources", sources)
-	}
-	if remove {
-		mapDelete(sources, app)
-		if len(sources.Content) == 0 {
-			mapDelete(target, "sources")
-		}
-	} else {
-		mapSet(sources, app, &yaml.Node{Kind: yaml.ScalarNode, Value: value})
+	if err := edit(target); err != nil {
+		return err
 	}
 	out, err := MarshalYAMLNode(&doc)
 	if err != nil {
