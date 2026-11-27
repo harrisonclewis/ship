@@ -339,3 +339,14 @@ func runAppCommand(o *options, cfg *config.Config, args ...string) (string, erro
 	err := cmdApp(o, cfg, "prod", args)
 	return out.String(), err
 }
+
+func TestServerConfigEditIsDispatched(t *testing.T) {
+	cfg, _ := writeConfig(t, oneServerDoc)
+	o := &options{in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	// An invalid file name fails in cmdConfigServer before any server call,
+	// so reaching that error proves `ship prod config edit` is routed there.
+	err := dispatchCommand(o, cfg, "prod", []string{"config", "edit", "app", "bogus"})
+	if err == nil || !strings.Contains(err.Error(), "edit either compose or Dockerfile") {
+		t.Fatalf("dispatchCommand(prod config edit app bogus) = %v", err)
+	}
+}

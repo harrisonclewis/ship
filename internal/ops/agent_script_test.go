@@ -420,6 +420,40 @@ grep -q "compose .* up -d" "$WORK/log"
 	}
 }
 
+func TestAgentImageLoadUsesDesiredMetaForNewApp(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the agent test harness needs bash")
+	}
+	if err := exec.Command("bash", "-c", "declare -A probe=()").Run(); err != nil {
+		t.Skip("the agent needs bash 4 or newer")
+	}
+	agent, err := filepath.Abs("../../ship-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	harness := filepath.Join(work, "harness.sh")
+	// A new app has desired config only: no running .ship-meta yet.
+	script := `set -euo pipefail
+source "$AGENT"
+APPS="$WORK/apps"
+mkdir -p "$APPS/app/.ship/desired"
+printf 'source=image\nimage_repo=ship/app\n' > "$APPS/app/.ship/desired/.ship-meta"
+docker(){ echo "docker $*" >> "$WORK/log"; [ "$1" != load ] || cat > /dev/null; }
+echo image | image_load app v1
+[ ! -e "$APPS/app/.ship-meta" ]
+grep -q "docker image inspect ship/app:v1" "$WORK/log"
+`
+	if err := os.WriteFile(harness, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", harness)
+	cmd.Env = append(os.Environ(), "AGENT="+agent, "WORK="+work)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("agent harness: %v\n%s", err, out)
+	}
+}
+
 func tarNames(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {

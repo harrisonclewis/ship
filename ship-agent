@@ -859,7 +859,11 @@ image_load() {
   local app=$1 ver=$2 image
   [[ $app =~ $APP_RE ]] || die "invalid app name '$app'"
   [[ $ver =~ $VER_RE ]] || die "invalid image version '$ver'"
-  image=$(image_for "$app" "$ver")
+  # The image is loaded for the deploy that follows, which reads the desired
+  # record. A new app has no running .ship-meta until that deploy succeeds.
+  local meta_dir=$APPS/$app
+  [ -f "$(desired_dir "$app")/.ship-meta" ] && meta_dir=$(desired_dir "$app")
+  image=$(META_DIR=$meta_dir image_for "$app" "$ver")
   note "loading $image from stdin"
   docker load >/dev/null
   docker image inspect "$image" >/dev/null 2>&1 \

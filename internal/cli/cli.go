@@ -215,6 +215,8 @@ func dispatchCommand(o *options, cfg *config.Config, server string, args []strin
 		return cmdDiff(o, cfg, server, rest)
 	case "server":
 		return cmdServerSettings(o, cfg, server, rest)
+	case "config":
+		return cmdConfigServer(o, cfg, server, rest)
 	case "version":
 		return requireNoArgs(cmd, rest, func() error {
 			fmt.Fprintln(o.out, "ship "+version.Version)
