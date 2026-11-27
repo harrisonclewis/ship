@@ -226,7 +226,10 @@ maintenance_check() {
 
 maintenance_app() {
   local app=$1 state=$2
-  validate_app "$app"
+  [[ $app =~ $APP_RE ]] || die "invalid app name '$app'"
+  # A first deploy turns the page on before the app has running config.
+  [ -f "$APPS/$app/.ship-meta" ] || [ -f "$(desired_dir "$app")/.ship-meta" ] \
+    || die "app '$app' is not installed; run ship deploy $app"
   case "$state" in
     on)
       maintenance_mount \
@@ -1064,7 +1067,8 @@ deploy_app() {
   DEPLOY_COMMANDS_RAN=0
   archive=""
 
-  if [ "$prev" != "$resolved" ] && has_data "$app"; then
+  # A first deploy has no previous version, so nothing to protect yet.
+  if [ -n "$prev" ] && [ "$prev" != "$resolved" ] && has_data "$app"; then
     note "backing up $app before ${prev:-none} -> $resolved"
     TAKE_BACKUP_RC=0
     TAKE_BACKUP_ARCHIVE=

@@ -454,6 +454,57 @@ grep -q "docker image inspect ship/app:v1" "$WORK/log"
 	}
 }
 
+func TestAgentFirstDeployUsesMaintenanceWithoutBackup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the agent test harness needs bash")
+	}
+	if err := exec.Command("bash", "-c", "declare -A probe=()").Run(); err != nil {
+		t.Skip("the agent needs bash 4 or newer")
+	}
+	agent, err := filepath.Abs("../../ship-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	harness := filepath.Join(work, "harness.sh")
+	// A new app: desired config only, no running .ship-meta or .ship-state.
+	script := `set -euo pipefail
+source "$AGENT"
+APPS="$WORK/apps"
+STATE="$APPS/.ship"
+PROXY="$WORK/proxy"
+mkdir -p "$APPS/app/.ship/desired"
+printf 'source=image\nmaintenance=on\nimage_repo=ship/app\n' > "$APPS/app/.ship/desired/.ship-meta"
+lock_state(){ :; }
+unlock_state(){ :; }
+maintenance_mount(){ return 0; }
+is_healthy(){ return 0; }
+deploy_image(){ RESOLVED_TAG=$2; DEPLOY_IMAGE="ship/app:$2"; }
+compose_app(){ :; }
+ensure_data_dirs(){ :; }
+write_ship_env(){ :; }
+set_state(){ echo "state $2 $3" >> "$WORK/log"; }
+promote_desired(){ echo PROMOTE >> "$WORK/log"; }
+prune_images(){ :; }
+http_check(){ return 0; }
+has_data(){ return 0; }
+take_backup(){ echo BACKUP >> "$WORK/log"; }
+deploy_app app v1
+grep -q "state v1 " "$WORK/log"
+grep -q PROMOTE "$WORK/log"
+! grep -q BACKUP "$WORK/log"
+[ ! -e "$PROXY/maintenance/app" ]
+`
+	if err := os.WriteFile(harness, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", harness)
+	cmd.Env = append(os.Environ(), "AGENT="+agent, "WORK="+work)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("agent harness: %v\n%s", err, out)
+	}
+}
+
 func tarNames(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
