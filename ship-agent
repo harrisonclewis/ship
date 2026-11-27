@@ -52,7 +52,7 @@ EXPORT_TOTAL_LIMIT=$((32 << 20))
 APP_RE='^[a-z][a-z0-9-]{0,30}[a-z0-9]$'
 TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
 VER_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
-REF_RE='^[^[:space:]=]{1,512}$'
+REF_RE='^[^[:space:]=]+$'
 LABEL_RE='^[A-Za-z0-9._-]+$'
 SERVICE_RE='^[a-z][a-z0-9-]{0,30}[a-z0-9]$'
 USER_RE='^[a-z_][a-z0-9_-]{0,31}$'
@@ -155,12 +155,17 @@ state_get() {
   awk -F= -v k="$2" '$1 == k { print $2; exit }' "$f"
 }
 
+valid_deploy_ref() {
+  local ref=$1
+  [ -z "$ref" ] || { [ "${#ref}" -le 512 ] && [[ $ref =~ $REF_RE ]]; }
+}
+
 set_state() {
   local app=$1 cur=$2 prev=$3 cur_ref=${4:-} prev_ref=${5:-} tmp
   [[ $cur =~ $VER_RE ]] || die "refusing to record version '$cur'"
   [ -z "$prev" ] || [[ $prev =~ $VER_RE ]] || die "refusing to record previous '$prev'"
-  [ -z "$cur_ref" ] || [[ $cur_ref =~ $REF_RE ]] || die "refusing to record ref '$cur_ref'"
-  [ -z "$prev_ref" ] || [[ $prev_ref =~ $REF_RE ]] || die "refusing to record previous ref '$prev_ref'"
+  valid_deploy_ref "$cur_ref" || die "refusing to record ref '$cur_ref'"
+  valid_deploy_ref "$prev_ref" || die "refusing to record previous ref '$prev_ref'"
   tmp=$(mktemp "$APPS/$app/.ship-state.XXXXXX")
   printf 'current=%s\nprevious=%s\ncurrent_ref=%s\nprevious_ref=%s\n' \
     "$cur" "$prev" "$cur_ref" "$prev_ref" > "$tmp"
@@ -1017,7 +1022,7 @@ deploy_app() {
   install -d -m 0755 "$APPS/$app"
   # Validate the identity before any container switch. A late set_state
   # rejection would leave a new image running without its recorded ref.
-  [ -z "$ref" ] || [[ $ref =~ $REF_RE ]] || die "invalid deploy ref '$ref'"
+  valid_deploy_ref "$ref" || die "invalid deploy ref '$ref'"
   source=$(meta_get "$app" source)
   case "$source" in
     github-release)
