@@ -541,17 +541,15 @@ func (s *Server) validate() error {
 		if err := checkAppName(p+".sources", name); err != nil {
 			return err
 		}
-		local, err := expandHome(s.Sources[name])
+		source, err := ParseLocalSource(s.Sources[name])
 		if err != nil {
 			return fmt.Errorf("%s.sources.%s: %w", p, name, err)
 		}
-		if !filepath.IsAbs(local) || filepath.Clean(local) != local {
-			return fmt.Errorf("%s.sources.%s: want a clean absolute path or ~/path, got %q", p, name, s.Sources[name])
+		if source.IsGit {
+			s.Sources[name] = source.Git.Transport
+		} else {
+			s.Sources[name] = source.Path
 		}
-		if strings.ContainsAny(local, "\n\r\x00") {
-			return fmt.Errorf("%s.sources.%s: control characters are not allowed", p, name)
-		}
-		s.Sources[name] = local
 	}
 	return nil
 }

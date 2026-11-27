@@ -597,7 +597,7 @@ func cmdDeploy(o *options, cfg *config.Config, server string, args []string) err
 		positional = append(positional, a)
 	}
 	if len(positional) < 1 || len(positional) > 2 {
-		return usageErr("usage: ship <server> deploy <app|all> [version] [--allow-dirty]")
+		return usageErr("usage: ship <server> deploy <app|all> [version | commit:<sha> | release:<tag> | release:<tag>:<asset>] [--allow-dirty]")
 	}
 	name := positional[0]
 	version := ""
@@ -731,7 +731,7 @@ func cmdAppSet(o *options, cfg *config.Config, server, sub, app, key string, val
 	}
 	if key == "source.path" {
 		if sub != "set" {
-			return usageErr("source.path is local; use `ship %s app set %s source.path <path>`", server, app)
+			return usageErr("source.path is local; use `ship %s app set %s source.path <directory|git-url>`", server, app)
 		}
 		value := strings.Join(values, " ")
 		path := cfg.Path
@@ -748,6 +748,9 @@ func cmdAppSet(o *options, cfg *config.Config, server, sub, app, key string, val
 			}
 			fmt.Fprintf(o.out, "sources.%s cleared.\n", app)
 		} else {
+			if err := config.ValidateLocalSourceValue(value); err != nil {
+				return fmt.Errorf("source.path: %w", err)
+			}
 			if err := config.SetLocalSource(path, server, app, value, false); err != nil {
 				return err
 			}
@@ -1286,6 +1289,8 @@ Commands:
   proxy sync|update             render the Caddyfile and reload Caddy
   proxy restart                 render the Caddyfile and recreate Caddy
   deploy <app|all> [version]    deploy one app, or every app in name order
+                                Git sources: commit:<sha>, release:<tag>,
+                                release:<tag>:<asset>, or empty for HEAD
                                 (--allow-dirty permits an uncommitted build)
   rollback <app>                previous image (database is not restored)
   status [app]                  version, previous version, health, config state

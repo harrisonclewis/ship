@@ -86,6 +86,10 @@ type fakeBackend struct {
 	approvalFn    func(approvalCall) error
 	approvalCalls []approvalCall
 
+	commitsFn       func(server, app string) ([]ops.GitCommit, error)
+	releasesFn      func(server, app string) ([]ops.GitRelease, error)
+	releaseAssetsFn func(server, app, tag string) ([]ops.GitAsset, error)
+
 	variance      map[string]ops.VarianceReport
 	varianceFn    func(server string) (ops.VarianceReport, error)
 	varianceCalls int
@@ -168,6 +172,27 @@ func (f *fakeBackend) RecordBuildApproval(ctx context.Context, server, app, scri
 		return f.approvalFn(call)
 	}
 	return nil
+}
+
+func (f *fakeBackend) GitCommits(ctx context.Context, server, app string) ([]ops.GitCommit, error) {
+	if f.commitsFn != nil {
+		return f.commitsFn(server, app)
+	}
+	return nil, nil
+}
+
+func (f *fakeBackend) GitReleases(ctx context.Context, server, app string) ([]ops.GitRelease, error) {
+	if f.releasesFn != nil {
+		return f.releasesFn(server, app)
+	}
+	return nil, nil
+}
+
+func (f *fakeBackend) GitReleaseAssets(ctx context.Context, server, app, tag string) ([]ops.GitAsset, error) {
+	if f.releaseAssetsFn != nil {
+		return f.releaseAssetsFn(server, app, tag)
+	}
+	return nil, nil
 }
 
 func (f *fakeBackend) TerminalCommand(ctx context.Context, req TerminalRequest) (*exec.Cmd, string, error) {
@@ -667,6 +692,95 @@ func TestImageSourcePathOnlyWritesLocalFile(t *testing.T) {
 	}
 	if srv.Sources["web"] == "" {
 		t.Fatalf("sources = %+v", srv.Sources)
+	}
+}
+
+func TestGitSourceURLOnlyWritesLocalFile(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	state := testState("staging", map[string]*config.App{
+		"web": decodedRecord(t, "domains: [web.example.com]\nupstream: web:8080\nsource: {type: image}\n"),
+	})
+	setVariances(m, fake, "staging", ops.VarianceReport{
+		Server: "staging",
+		State:  state,
+		Apps:   []ops.AppVariance{{App: "web", State: ops.VarianceApplied}},
+	})
+	m.serverName = "staging"
+	m.appName = "web"
+	m.page = pageAppEdit
+	m.openAppQuickForm(eaSource)
+	m.form.app.SourceKind = "git"
+	m.form.app.SourceURL = "https://github.com/acme/web.git"
+	m.form.app.SourcePath = ""
+	runCmd(t, m, m.submitForm())
+	if len(fake.putCalls) != 0 {
+		t.Fatalf("local Git URL wrote to the server: %+v", fake.putCalls)
+	}
+	data, err := os.ReadFile(m.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "web: https://github.com/acme/web.git") {
+		t.Fatalf("local sources not updated:\n%s", data)
+	}
+}
+
+func TestGitReleasePickerBuildsSourceOrAsset(t *testing.T) {
+	doc := strings.Replace(tuiTestDoc, "web: ~/web", "web: https://github.com/acme/web", 1)
+	m, fake := testModel(t, doc)
+	state := testState("staging", map[string]*config.App{
+		"web": decodedRecord(t, "domains: [web.example.com]\nupstream: web:8080\nsource: {type: image}\n"),
+	})
+	setVariances(m, fake, "staging", ops.VarianceReport{
+		Server: "staging",
+		State:  state,
+		Apps:   []ops.AppVariance{{App: "web", State: ops.VarianceApplied}},
+	})
+	fake.commitsFn = func(server, app string) ([]ops.GitCommit, error) {
+		return []ops.GitCommit{{SHA: strings.Repeat("a", 40), Short: "aaaaaaa", Subject: "latest"}}, nil
+	}
+	fake.releasesFn = func(server, app string) ([]ops.GitRelease, error) {
+		return []ops.GitRelease{{Tag: "v1.2.3", Name: "Release"}}, nil
+	}
+	fake.releaseAssetsFn = func(server, app, tag string) ([]ops.GitAsset, error) {
+		return []ops.GitAsset{{Name: "web_linux_amd64", Size: 10, Digest: "sha256:" + strings.Repeat("b", 64)}}, nil
+	}
+	m.serverName = "staging"
+	m.appName = "web"
+	m.page = pageAppActions
+
+	runCmd(t, m, m.openDeployPicker())
+	if m.page != pageDeployPick || len(m.pickCommits) != 1 {
+		t.Fatalf("commit picker page=%v commits=%+v", m.page, m.pickCommits)
+	}
+	var cmd tea.Cmd
+	m, cmd = press(t, m, "tab")
+	runCmd(t, m, cmd)
+	if len(m.pickReleases) != 1 {
+		t.Fatalf("releases = %+v", m.pickReleases)
+	}
+	m, cmd = press(t, m, "enter")
+	runCmd(t, m, cmd)
+	if m.pickReleaseTag != "v1.2.3" || len(m.pickAssets) != 1 {
+		t.Fatalf("release choice tag=%q assets=%+v", m.pickReleaseTag, m.pickAssets)
+	}
+	m.width, m.height = 64, 24
+	m.resizeViewport()
+	view := m.View()
+	for _, want := range []string{"Build source", "web_linux_amd64"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("choice view missing %q:\n%s", want, view)
+		}
+	}
+	m, cmd = press(t, m, "down")
+	_ = cmd
+	m, cmd = press(t, m, "enter")
+	runCmd(t, m, cmd)
+	if len(fake.runCalls) != 1 {
+		t.Fatalf("run calls = %+v", fake.runCalls)
+	}
+	if got := fake.runCalls[0].Version; got != "release:v1.2.3:web_linux_amd64" {
+		t.Fatalf("deploy version = %q", got)
 	}
 }
 

@@ -79,6 +79,26 @@ Deploy a specific release with:
 ship prod deploy hello v1.2.3
 ```
 
+## Git URL image apps
+
+An image app whose local `sources.<app>` is a Git URL is fetched and built on this machine, then sent to the server like any image app. Its image version is the full commit SHA.
+
+```sh
+ship prod deploy web                         # remote default branch HEAD
+ship prod deploy web commit:9f2c1ab          # a specific commit
+ship prod deploy web release:v1.2.3          # source at a published release tag
+ship prod deploy web release:v1.2.3:web_linux_amd64  # a release asset
+```
+
+- `release:<tag>` is accepted only when `gh` confirms a published, non-draft GitHub release at that tag.
+- `release:<tag>:<asset>` downloads the asset with `gh api`, verifies it, and builds from the tag's checkout. The asset build uses `Dockerfile.release` when present; otherwise the root `Dockerfile` must declare `ARG BINARY`. The asset is copied in as `ship-release-binary` and passed as `BINARY`, with the tag as `VERSION`. Source build commands are skipped on this route.
+- Checksum assets are not offered in the picker. Both the selected asset and the release checksum files are staged separately from the checkout, and a verified copy is placed into the build input.
+- The image version for an asset includes the tag, asset name, source commit and verified payload digest, so a replaced asset or moved tag never collides with the rollback image.
+
+The TUI **v** action opens a Commits/Releases picker. Select a release to choose **Build source** or one of its assets. Caches live in `~/.ship/servers/<server>/repositories/`; each build uses a separate directory under `~/.ship/servers/<server>/builds/<app>/`.
+
+`status` shows the running ref and `newer=yes` when the running commit is behind the remote default branch, or when a newer published release exists for a release identity. It never treats an offline or authentication error as newer, and it does not show a badge before the first successful deploy.
+
 ## Image apps
 
 The image is built on your machine and sent to the server over SSH. No registry is involved.

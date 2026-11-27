@@ -18,7 +18,7 @@
 #   sudo ship-agent app-export                        (tar of app records on stdout)
 #   sudo ship-agent arch                              (uname -m)
 #   sudo ship-agent image-load <app> <version>        (compressed docker save on stdin)
-#   sudo ship-agent deploy <app> <version|latest>
+#   sudo ship-agent deploy <app> <version|latest> [ref]
 #   sudo ship-agent rollback <app>
 #   sudo ship-agent maintenance-check
 #   sudo ship-agent maintenance <app> <on|off>
@@ -37,7 +37,7 @@
 set -euo pipefail
 umask 022
 
-AGENT_VERSION=5
+AGENT_VERSION=6
 
 APPS=/opt/apps
 PROXY=/opt/proxy
@@ -52,6 +52,7 @@ EXPORT_TOTAL_LIMIT=$((32 << 20))
 APP_RE='^[a-z][a-z0-9-]{0,30}[a-z0-9]$'
 TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
 VER_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+REF_RE='^[^[:space:]=]{1,512}$'
 LABEL_RE='^[A-Za-z0-9._-]+$'
 SERVICE_RE='^[a-z][a-z0-9-]{0,30}[a-z0-9]$'
 USER_RE='^[a-z_][a-z0-9_-]{0,31}$'
@@ -155,11 +156,14 @@ state_get() {
 }
 
 set_state() {
-  local app=$1 cur=$2 prev=$3 tmp
+  local app=$1 cur=$2 prev=$3 cur_ref=${4:-} prev_ref=${5:-} tmp
   [[ $cur =~ $VER_RE ]] || die "refusing to record version '$cur'"
   [ -z "$prev" ] || [[ $prev =~ $VER_RE ]] || die "refusing to record previous '$prev'"
+  [ -z "$cur_ref" ] || [[ $cur_ref =~ $REF_RE ]] || die "refusing to record ref '$cur_ref'"
+  [ -z "$prev_ref" ] || [[ $prev_ref =~ $REF_RE ]] || die "refusing to record previous ref '$prev_ref'"
   tmp=$(mktemp "$APPS/$app/.ship-state.XXXXXX")
-  printf 'current=%s\nprevious=%s\n' "$cur" "$prev" > "$tmp"
+  printf 'current=%s\nprevious=%s\ncurrent_ref=%s\nprevious_ref=%s\n' \
+    "$cur" "$prev" "$cur_ref" "$prev_ref" > "$tmp"
   chmod 0644 "$tmp"
   mv "$tmp" "$APPS/$app/.ship-state"
 }
@@ -875,11 +879,11 @@ image_load() {
 }
 
 rollback_to() {
-  local app=$1 target=$2 saved_previous=$3
+  local app=$1 target=$2 saved_previous=$3 target_ref=${4:-} saved_previous_ref=${5:-}
   note "switching back to $target"
   write_ship_env "$app" "$(image_for "$app" "$target")"
   if compose_app "$app" up -d --wait --wait-timeout 120 && is_healthy "$app"; then
-    set_state "$app" "$target" "$saved_previous"
+    set_state "$app" "$target" "$saved_previous" "$target_ref" "$saved_previous_ref"
     note "rolled the image back to $target. Database migrations are not undone."
   else
     note "rollback to $target failed; logs:"
@@ -924,13 +928,13 @@ take_backup() {
 }
 
 restore_previous_image() {
-  local app=$1 prev=$2 prevprev=$3 resolved=$4
+  local app=$1 prev=$2 prevprev=$3 resolved=$4 prev_ref=${5:-} prevprev_ref=${6:-}
   # Always restore with the running files, never the desired config that just
   # failed to come up.
   META_DIR=
   APP_COMPOSE_FILE=
   if [ -n "$prev" ] && [ "$prev" != "$resolved" ]; then
-    rollback_to "$app" "$prev" "$prevprev"
+    rollback_to "$app" "$prev" "$prevprev" "$prev_ref" "$prevprev_ref"
   elif [ -z "$prev" ]; then
     note "no previous version; stopping $app"
     compose_app "$app" stop || true
@@ -994,8 +998,8 @@ promote_desired() {
 # promotes. run_commands is "no" for rollback, because the deploy script
 # belongs to the version being rolled back from, not to the restored image.
 deploy_app() {
-  local app=$1 version=$2 run_commands=${3:-yes} config=${4:-desired}
-  local source prev prevprev image resolved maintenance archive deploy_script desired
+  local app=$1 version=$2 run_commands=${3:-yes} config=${4:-desired} ref=${5:-}
+  local source prev prevprev cur_ref prev_ref image resolved maintenance archive deploy_script desired
   if [ "$config" = running ]; then
     validate_app "$app"
   else
@@ -1011,6 +1015,9 @@ deploy_app() {
     APP_COMPOSE_FILE=$desired/compose.yaml
   fi
   install -d -m 0755 "$APPS/$app"
+  # Validate the identity before any container switch. A late set_state
+  # rejection would leave a new image running without its recorded ref.
+  [ -z "$ref" ] || [[ $ref =~ $REF_RE ]] || die "invalid deploy ref '$ref'"
   source=$(meta_get "$app" source)
   case "$source" in
     github-release)
@@ -1024,11 +1031,16 @@ deploy_app() {
 
   prev=$(state_get "$app" current)
   prevprev=$(state_get "$app" previous)
+  cur_ref=$(state_get "$app" current_ref)
+  prev_ref=$(state_get "$app" previous_ref)
   maintenance=$(meta_get "$app" maintenance)
   [ "$maintenance" = on ] || maintenance=off
 
   if [ "$config" = desired ] && [ "$prev" = "$version" ] && is_healthy "$app" && desired_matches_running "$app"; then
     note "$app $version is already running with the desired configuration"
+    if [ "$ref" != "$cur_ref" ]; then
+      set_state "$app" "$prev" "$prevprev" "$ref" "$prev_ref"
+    fi
     [ "$maintenance" = on ] && { maintenance_app "$app" off || true; }
     return 0
   fi
@@ -1054,6 +1066,9 @@ deploy_app() {
   # app built the same version again.
   if [ "$config" = desired ] && [ "$prev" = "$resolved" ] && is_healthy "$app" && desired_matches_running "$app"; then
     note "$app $resolved is already running with the desired configuration"
+    if [ "$ref" != "$cur_ref" ]; then
+      set_state "$app" "$prev" "$prevprev" "$ref" "$prev_ref"
+    fi
     [ "$maintenance" = on ] && { maintenance_app "$app" off || true; }
     return 0
   fi
@@ -1098,7 +1113,7 @@ deploy_app() {
       compose_app "$app" logs --tail 60 || true
       META_DIR=
       APP_COMPOSE_FILE=
-      restore_previous_image "$app" "$prev" "$prevprev" "$resolved"
+      restore_previous_image "$app" "$prev" "$prevprev" "$resolved" "$cur_ref" "$prev_ref"
       recovery_hint "$app" "$archive"
       exit 1
     fi
@@ -1107,9 +1122,9 @@ deploy_app() {
   note "starting $app $resolved"
   if compose_app "$app" up -d --wait --wait-timeout 120 && is_healthy "$app" && http_check "$app"; then
     if [ "$prev" != "$resolved" ]; then
-      set_state "$app" "$resolved" "${prev:-}"
+      set_state "$app" "$resolved" "${prev:-}" "$ref" "$cur_ref"
     else
-      set_state "$app" "$resolved" "$prevprev"
+      set_state "$app" "$resolved" "$prevprev" "$ref" "$prev_ref"
     fi
     prune_images "$app"
     if [ "$maintenance" = on ]; then
@@ -1126,7 +1141,7 @@ deploy_app() {
   compose_app "$app" logs --tail 60 || true
   META_DIR=
   APP_COMPOSE_FILE=
-  restore_previous_image "$app" "$prev" "$prevprev" "$resolved"
+  restore_previous_image "$app" "$prev" "$prevprev" "$resolved" "$cur_ref" "$prev_ref"
   if [ "$DEPLOY_COMMANDS_RAN" = 1 ]; then
     note "deploy commands ran for $app; leaving the maintenance page ON"
     recovery_hint "$app" "$archive"
@@ -1137,13 +1152,14 @@ deploy_app() {
 }
 
 rollback_app() {
-  local app=$1 current prev
+  local app=$1 current prev prev_ref
   validate_app "$app"
   current=$(state_get "$app" current)
   prev=$(state_get "$app" previous)
+  prev_ref=$(state_get "$app" previous_ref)
   [[ $prev =~ $VER_RE ]] || die "no previous version recorded for $app"
   note "rolling back $app from ${current:-none} to $prev. The database is not restored."
-  deploy_app "$app" "$prev" no running
+  deploy_app "$app" "$prev" no running "$prev_ref"
 }
 
 restart_app() {
@@ -1770,16 +1786,17 @@ main() {
       image_load "$1" "$2"
       ;;
     deploy)
-      # The CLI passes two arguments. CI's forced command passes
-      # SSH_ORIGINAL_COMMAND as one quoted argument ("app version"); split it
-      # safely here and let the normal validation reject anything else.
-      [ $# -eq 1 ] || [ $# -eq 2 ] || die "usage: ship-agent deploy <app> <version|latest>"
+      # The CLI passes two arguments, plus an optional typed ref for Git
+      # sources. CI's forced command passes SSH_ORIGINAL_COMMAND as one quoted
+      # argument ("app version"); split it safely here and let the normal
+      # validation reject anything else.
+      [ $# -eq 1 ] || [ $# -eq 2 ] || [ $# -eq 3 ] || die "usage: ship-agent deploy <app> <version|latest> [ref]"
       if [ $# -eq 1 ]; then
         [[ $1 =~ ^([^[:space:]]+)[[:space:]]+([^[:space:]]+)$ ]] \
           || die "usage: ship-agent deploy <app> <version|latest>"
         set -- "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
       fi
-      deploy_app "$1" "$2"
+      deploy_app "$1" "$2" yes desired "${3:-}"
       ;;
     rollback)
       [ $# -eq 1 ] || die "usage: ship-agent rollback <app>"

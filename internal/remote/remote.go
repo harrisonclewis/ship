@@ -24,7 +24,7 @@ import (
 
 // AgentProtocol is the ship-agent protocol version embedded in this ship. The
 // CLI refuses to replace a newer agent on a VPS.
-const AgentProtocol = 5
+const AgentProtocol = 6
 
 const agentPath = "/usr/local/sbin/ship-agent"
 
@@ -41,6 +41,9 @@ type Cmd struct {
 	StdinSize int
 	// TTY marks interactive commands in dry-run output.
 	TTY bool
+	// Env, when set, is the complete environment for the command. A nil Env
+	// inherits the current process environment.
+	Env []string
 }
 
 // Runner runs commands. Tests and --dry-run provide their own.
@@ -69,6 +72,9 @@ func (e ExecRunner) Run(c Cmd) error {
 	cmd.Stdin = c.Stdin
 	cmd.Stdout = c.Stdout
 	cmd.Stderr = c.Stderr
+	if c.Env != nil {
+		cmd.Env = c.Env
+	}
 	return cmd.Run()
 }
 

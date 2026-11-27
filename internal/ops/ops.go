@@ -28,12 +28,16 @@ type Options struct {
 	// ApproveBuild asks the user to approve an unapproved build script. When
 	// nil, deploy returns *BuildApprovalError instead of prompting.
 	ApproveBuild func(*BuildApprovalError) error
+	// Local runs Git and GitHub CLI commands. Tests set it; the default uses
+	// exec on this machine.
+	Local LocalRunner
 }
 
 // Ops runs ship operations for one loaded config.
 type Ops struct {
 	Config *config.Config
 	opts   Options
+	local  LocalRunner
 }
 
 // New returns operations for cfg.
@@ -47,7 +51,10 @@ func New(cfg *config.Config, opts Options) *Ops {
 	if opts.In == nil {
 		opts.In = os.Stdin
 	}
-	return &Ops{Config: cfg, opts: opts}
+	if opts.Local == nil {
+		opts.Local = execLocalRunner{}
+	}
+	return &Ops{Config: cfg, opts: opts, local: opts.Local}
 }
 
 // Load finds and loads ship.yaml, then returns operations for it.

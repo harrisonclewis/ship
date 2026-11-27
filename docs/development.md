@@ -17,7 +17,7 @@ make dist     # all six release binaries in dist/
 | `internal/config` | finds, loads and validates `ship.yaml` and server-side app records |
 | `internal/remote` | builds and runs `ssh`, `docker` and local commands |
 | `internal/render` | renders the Caddyfile |
-| `internal/ops` | every server operation, shared by the CLI and the TUI |
+| `internal/ops` | every server operation, shared by the CLI and the TUI, including local Git/release builds |
 | `internal/tui` | the interactive TUI (Bubble Tea) |
 | `internal/yamldoc` | comment-preserving `ship.yaml` edits |
 | `internal/localedit` | temporary-copy editing and validated saves |

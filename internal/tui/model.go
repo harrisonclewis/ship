@@ -33,6 +33,7 @@ const (
 	pageOutput
 	pageRestorePick
 	pageCompare
+	pageDeployPick
 )
 
 type serverAction int
@@ -105,7 +106,7 @@ type appActionDef struct {
 
 var appActionDefs = []appActionDef{
 	{"d", "Deploy latest/build", "Release latest, or build the current git tree", aaDeployLatest, false},
-	{"v", "Deploy version…", "Deploy a release tag or loaded image", aaDeployVersion, false},
+	{"v", "Deploy version…", "Git: pick a commit, release or asset; otherwise a release tag or loaded image", aaDeployVersion, false},
 	{"o", "Rollback", "Previous image; the database is not restored", aaRollback, true},
 	{"s", "Restart", "Recreate the app containers", aaRestart, false},
 	{"m", "Maintenance on/off", "Toggle the maintenance page", aaMaintenance, false},
@@ -241,6 +242,23 @@ type model struct {
 	backupsServer  string
 	backupsApp     string
 
+	pickServer   string
+	pickApp      string
+	pickTab      int
+	pickCursor   int
+	pickCommits  []ops.GitCommit
+	pickReleases []ops.GitRelease
+	pickLoading  [2]bool
+	pickLoaded   [2]bool
+	pickErr      [2]string
+
+	pickReleaseTag  string
+	pickAssets      []ops.GitAsset
+	pickAssetLoad   bool
+	pickAssetErr    string
+	pickChoiceCur   int
+	pickAssetsReady bool
+
 	vp            viewport.Model
 	spinnerFrame  int
 	tickScheduled bool
@@ -276,6 +294,28 @@ type saveDoneMsg struct {
 	form    *formHost
 	err     error
 	warning string
+}
+
+type gitCommitsMsg struct {
+	server string
+	app    string
+	items  []ops.GitCommit
+	err    error
+}
+
+type gitReleasesMsg struct {
+	server string
+	app    string
+	items  []ops.GitRelease
+	err    error
+}
+
+type gitAssetsMsg struct {
+	server string
+	app    string
+	tag    string
+	items  []ops.GitAsset
+	err    error
 }
 
 type deleteDoneMsg struct {
@@ -446,6 +486,48 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.backupsErr = ""
 		}
 		return m, nil
+	case gitCommitsMsg:
+		if m.page != pageDeployPick || msg.server != m.pickServer || msg.app != m.pickApp {
+			return m, nil
+		}
+		m.pickLoading[0] = false
+		m.pickLoaded[0] = true
+		m.pickCommits = msg.items
+		if msg.err != nil {
+			m.pickErr[0] = msg.err.Error()
+		} else {
+			m.pickErr[0] = ""
+		}
+		m.pickCursor = clampIndex(m.pickCursor, m.pickLength())
+		return m, nil
+	case gitReleasesMsg:
+		if m.page != pageDeployPick || msg.server != m.pickServer || msg.app != m.pickApp {
+			return m, nil
+		}
+		m.pickLoading[1] = false
+		m.pickLoaded[1] = true
+		m.pickReleases = msg.items
+		if msg.err != nil {
+			m.pickErr[1] = msg.err.Error()
+		} else {
+			m.pickErr[1] = ""
+		}
+		m.pickCursor = clampIndex(m.pickCursor, m.pickLength())
+		return m, nil
+	case gitAssetsMsg:
+		if m.page != pageDeployPick || msg.server != m.pickServer || msg.app != m.pickApp || msg.tag != m.pickReleaseTag {
+			return m, nil
+		}
+		m.pickAssetLoad = false
+		m.pickAssetsReady = true
+		m.pickAssets = msg.items
+		if msg.err != nil {
+			m.pickAssetErr = msg.err.Error()
+		} else {
+			m.pickAssetErr = ""
+		}
+		m.pickChoiceCur = 0
+		return m, nil
 	case runDoneMsg:
 		return m, m.finishRun(msg)
 	case runTickMsg:
@@ -602,6 +684,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleRestoreKey(key)
 	case pageCompare:
 		return m.handleCompareKey(msg, key)
+	case pageDeployPick:
+		return m.handleDeployPickKey(key)
 	}
 	return m, nil
 }
@@ -846,6 +930,172 @@ func (m *model) handleRestoreKey(key string) (tea.Model, tea.Cmd) {
 		})
 	case "r":
 		return m, m.loadBackups(m.backupsServer, m.backupsApp)
+	}
+	return m, nil
+}
+
+func (m *model) appGitRepo(name string) (config.GitRepo, bool) {
+	rec := m.recordFor(m.serverName, name)
+	if rec == nil || rec.Source.Type != "image" {
+		return config.GitRepo{}, false
+	}
+	srv := m.currentServer()
+	if srv == nil {
+		return config.GitRepo{}, false
+	}
+	return config.GitSource(srv.Sources[name])
+}
+
+func (m *model) openDeployPicker() tea.Cmd {
+	if _, ok := m.appGitRepo(m.appName); !ok {
+		return nil
+	}
+	m.pickServer = m.serverName
+	m.pickApp = m.appName
+	m.pickTab = 0
+	m.pickCursor = 0
+	m.pickCommits = nil
+	m.pickReleases = nil
+	m.pickLoading = [2]bool{}
+	m.pickLoaded = [2]bool{}
+	m.pickErr = [2]string{}
+	m.pickReleaseTag = ""
+	m.pickAssets = nil
+	m.pickAssetLoad = false
+	m.pickAssetErr = ""
+	m.pickChoiceCur = 0
+	m.pickAssetsReady = false
+	m.page = pageDeployPick
+	return m.loadDeployTab(0, true)
+}
+
+func (m *model) loadDeployTab(tab int, force bool) tea.Cmd {
+	if tab < 0 || tab > 1 {
+		return nil
+	}
+	if !force && (m.pickLoaded[tab] || m.pickLoading[tab]) {
+		return nil
+	}
+	m.pickLoading[tab] = true
+	m.pickErr[tab] = ""
+	backend := m.backend
+	server, app := m.pickServer, m.pickApp
+	if tab == 0 {
+		return func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			items, err := backend.GitCommits(ctx, server, app)
+			return gitCommitsMsg{server: server, app: app, items: items, err: err}
+		}
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		items, err := backend.GitReleases(ctx, server, app)
+		return gitReleasesMsg{server: server, app: app, items: items, err: err}
+	}
+}
+
+func (m *model) pickLength() int {
+	if m.pickTab == 0 {
+		return len(m.pickCommits)
+	}
+	return len(m.pickReleases)
+}
+
+func (m *model) loadReleaseAssets(tag string) tea.Cmd {
+	m.pickAssetLoad = true
+	m.pickAssetsReady = false
+	m.pickAssetErr = ""
+	m.pickAssets = nil
+	backend := m.backend
+	server, app := m.pickServer, m.pickApp
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		items, err := backend.GitReleaseAssets(ctx, server, app, tag)
+		return gitAssetsMsg{server: server, app: app, tag: tag, items: items, err: err}
+	}
+}
+
+func (m *model) pickChoiceLength() int {
+	if !m.pickAssetsReady {
+		return 0
+	}
+	// Build source first, then assets.
+	return 1 + len(m.pickAssets)
+}
+
+func (m *model) handleDeployPickKey(key string) (tea.Model, tea.Cmd) {
+	if m.pickReleaseTag != "" {
+		// Choice view for one selected release.
+		switch key {
+		case "esc":
+			m.pickReleaseTag = ""
+			m.pickAssets = nil
+			m.pickAssetsReady = false
+			m.pickAssetErr = ""
+			m.pickChoiceCur = 0
+			return m, nil
+		case "up", "k":
+			m.pickChoiceCur = clampIndex(m.pickChoiceCur-1, m.pickChoiceLength())
+		case "down", "j":
+			m.pickChoiceCur = clampIndex(m.pickChoiceCur+1, m.pickChoiceLength())
+		case "r":
+			return m, m.loadReleaseAssets(m.pickReleaseTag)
+		case "enter":
+			if m.pickAssetLoad || m.pickChoiceLength() == 0 {
+				return m, nil
+			}
+			m.pickChoiceCur = clampIndex(m.pickChoiceCur, m.pickChoiceLength())
+			version := "release:" + m.pickReleaseTag
+			if m.pickChoiceCur > 0 {
+				version += ":" + m.pickAssets[m.pickChoiceCur-1].Name
+			}
+			m.page = pageAppActions
+			return m, m.startRun(Request{Action: ActDeploy, Server: m.pickServer, App: m.pickApp, Version: version})
+		}
+		return m, nil
+	}
+	switch key {
+	case "esc":
+		m.page = pageAppActions
+		return m, nil
+	case "tab", "right", "l", "1", "2":
+		next := 1 - m.pickTab
+		if key == "1" {
+			next = 0
+		} else if key == "2" {
+			next = 1
+		}
+		m.pickTab = next
+		m.pickCursor = 0
+		return m, m.loadDeployTab(next, false)
+	case "left", "h":
+		if m.pickTab != 0 {
+			m.pickTab = 0
+			m.pickCursor = 0
+			return m, m.loadDeployTab(0, false)
+		}
+	case "up", "k":
+		m.pickCursor = clampIndex(m.pickCursor-1, m.pickLength())
+	case "down", "j":
+		m.pickCursor = clampIndex(m.pickCursor+1, m.pickLength())
+	case "r":
+		return m, m.loadDeployTab(m.pickTab, true)
+	case "enter":
+		if m.pickLoading[m.pickTab] || m.pickLength() == 0 {
+			return m, nil
+		}
+		m.pickCursor = clampIndex(m.pickCursor, m.pickLength())
+		if m.pickTab == 0 {
+			version := "commit:" + m.pickCommits[m.pickCursor].SHA
+			m.page = pageAppActions
+			return m, m.startRun(Request{Action: ActDeploy, Server: m.pickServer, App: m.pickApp, Version: version})
+		}
+		m.pickReleaseTag = m.pickReleases[m.pickCursor].Tag
+		m.pickChoiceCur = 0
+		return m, m.loadReleaseAssets(m.pickReleaseTag)
 	}
 	return m, nil
 }
@@ -1357,6 +1607,11 @@ func (m *model) runServerAction(action serverAction) tea.Cmd {
 
 func (m *model) appActions() []appActionDef {
 	defs := append([]appActionDef(nil), appActionDefs...)
+	if _, ok := m.appGitRepo(m.appName); ok {
+		defs[aaDeployLatest].label = "Deploy latest commit"
+		defs[aaDeployLatest].desc = "Build the head of the remote default branch"
+		defs[aaDeployVersion].desc = "Choose a commit or a GitHub release"
+	}
 	if rec := m.currentApp(); rec != nil && rec.Source.Type != "image" {
 		// Keep the Dockerfile action next to the compose action.
 		out := make([]appActionDef, 0, len(defs)+1)
@@ -1377,6 +1632,9 @@ func (m *model) runAppAction(action appAction) tea.Cmd {
 	case aaDeployLatest:
 		return m.startRun(Request{Action: ActDeploy, Server: server, App: app})
 	case aaDeployVersion:
+		if _, ok := m.appGitRepo(app); ok {
+			return m.openDeployPicker()
+		}
 		f := &formHost{purpose: formDeployVersion, serverName: server, appName: app}
 		f.form = m.buildForm(f)
 		m.form = f
@@ -1976,6 +2234,14 @@ func (m *model) saveAppFormCmd(f *formHost) tea.Cmd {
 		}
 		compose = []byte("name: " + name + "\nservices:\n  " + name + ":\n    image: \"${IMAGE:?IMAGE is set by ship}\"\n")
 	}
+	localValue, keepLocal, localErr := localSourceFromForm(&v)
+	if localErr != nil {
+		return func() tea.Msg { return saveDoneMsg{form: f, err: localErr} }
+	}
+	hadLocal := false
+	if srv, err := m.backend.Server(server); err == nil {
+		_, hadLocal = srv.Sources[name]
+	}
 	arch := config.DefaultArch
 	if state != nil && state.Arch != "" {
 		arch = state.Arch
@@ -1994,10 +2260,9 @@ func (m *model) saveAppFormCmd(f *formHost) tea.Cmd {
 			return saveDoneMsg{form: f, err: err}
 		}
 		var warning string
-		if record.Source.Type == "image" {
-			sourcePath := strings.TrimSpace(v.SourcePath)
-			if err := config.SetLocalSource(path, server, name, sourcePath, sourcePath == ""); err != nil {
-				warning = "Saved on the server, but could not update the local source path: " + err.Error()
+		if keepLocal || hadLocal {
+			if err := config.SetLocalSource(path, server, name, localValue, !keepLocal); err != nil {
+				warning = "Saved on the server, but could not update the local source: " + err.Error()
 			}
 		}
 		return saveDoneMsg{form: f, warning: warning}
@@ -2010,22 +2275,32 @@ func (m *model) saveQuickAppCmd(f *formHost) tea.Cmd {
 	state := m.serverConfig(server)
 	backend := m.backend
 	path := m.path
-	if f.purpose == formEditAppSource && v.SourceType == "image" {
-		sourcePath := strings.TrimSpace(v.SourcePath)
-		return func() tea.Msg {
-			if err := config.SetLocalSource(path, server, app, sourcePath, sourcePath == ""); err != nil {
-				return saveDoneMsg{form: f, err: err}
-			}
-			if _, err := config.Load(path); err != nil {
-				return saveDoneMsg{form: f, err: err}
-			}
-			return saveDoneMsg{form: f}
-		}
-	}
 	da := m.desiredApp(server, app)
-	if da == nil {
+	if da == nil || da.Record == nil {
 		return func() tea.Msg {
 			return saveDoneMsg{form: f, err: fmt.Errorf("app %q is no longer configured on %s", app, server)}
+		}
+	}
+	var localValue string
+	var keepLocal bool
+	if f.purpose == formEditAppSource {
+		var localErr error
+		localValue, keepLocal, localErr = localSourceFromForm(&v)
+		if localErr != nil {
+			return func() tea.Msg { return saveDoneMsg{form: f, err: localErr} }
+		}
+		// Directory and Git sources are both server-side image sources.
+		// Changing only the local source value does not require a server write.
+		if da.Record.Source.Type == "image" && (v.SourceKind == "dir" || v.SourceKind == "git") {
+			return func() tea.Msg {
+				if err := config.SetLocalSource(path, server, app, localValue, !keepLocal); err != nil {
+					return saveDoneMsg{form: f, err: err}
+				}
+				if _, err := config.Load(path); err != nil {
+					return saveDoneMsg{form: f, err: err}
+				}
+				return saveDoneMsg{form: f}
+			}
 		}
 	}
 	arch := config.DefaultArch
@@ -2042,8 +2317,15 @@ func (m *model) saveQuickAppCmd(f *formHost) tea.Cmd {
 		if _, err := m.recordsFor(state, app, record); err != nil {
 			return saveDoneMsg{form: f, err: err}
 		}
-		_, err = backend.PutDesiredApp(ctx, server, app, record, da.Compose, da.Dockerfile, arch, da.Hash)
-		return saveDoneMsg{form: f, err: err}
+		if _, err := backend.PutDesiredApp(ctx, server, app, record, da.Compose, da.Dockerfile, arch, da.Hash); err != nil {
+			return saveDoneMsg{form: f, err: err}
+		}
+		if f.purpose == formEditAppSource {
+			if err := config.SetLocalSource(path, server, app, localValue, !keepLocal); err != nil {
+				return saveDoneMsg{form: f, warning: "Saved on the server, but could not update the local source: " + err.Error()}
+			}
+		}
+		return saveDoneMsg{form: f}
 	}
 }
 
@@ -2288,6 +2570,11 @@ func (m *model) appType(name string) string {
 		return ""
 	}
 	if app.Source.Type == "image" {
+		if srv := m.currentServer(); srv != nil {
+			if _, ok := config.GitSource(srv.Sources[name]); ok {
+				return "git"
+			}
+		}
 		return "image"
 	}
 	return "release"

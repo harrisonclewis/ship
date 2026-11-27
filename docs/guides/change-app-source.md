@@ -1,11 +1,13 @@
 # Change the app source
 
-`source.type` is either `github-release` or `image`. The type, repository and asset pattern are part of the desired app record on the server. The local checkout path for an image app is the only source setting that stays on this machine.
+`source.type` is either `github-release` or `image`. The type, repository and asset pattern are part of the desired app record on the server. The local directory or Git repository URL for an image app is the only source setting that stays on this machine.
 
 | Type | Where the image comes from | Record keys | Local key |
 |---|---|---|---|
 | `github-release` | built on the server from a release binary | `repo`, optional `asset` | none |
-| `image` | built on your machine from a local git checkout and sent over SSH | `type: image` | `servers.<name>.sources.<app>` |
+| `image` | built on your machine from a local directory or Git URL and sent over SSH | `type: image` | `servers.<name>.sources.<app>` |
+
+The TUI offers three source choices: **Source directory**, **Git repository URL** and **GitHub release asset**. The first two are both `source.type: image`; only the local `sources.<app>` value differs. The same choice is available when editing an existing image app's source.
 
 ## GitHub release app
 
@@ -42,7 +44,7 @@ source:
   type: image
 ```
 
-The build checkout is local:
+The build input is local and may be a directory or a Git URL:
 
 ```yaml
 servers:
@@ -50,19 +52,23 @@ servers:
     host: ops@203.0.113.10
     sources:
       web: ~/code/web
+      api: https://github.com/acme/api.git
+      worker: git@github.com:acme/worker.git
 ```
 
-- `sources.web` is a local git checkout with a `Dockerfile`, absolute or starting with `~/`.
-- It is never uploaded and never appears in the server record.
+- A directory must be a clean absolute path or start with `~/`.
+- A Git URL must use `https://`, `ssh://` or scp-style `git@host:path`. Credentials, query strings, fragments, `file://`, `ext::` and unsafe path segments are rejected.
+- The URL is never uploaded and never appears in the server record. A server record cannot change this machine's build input or make Git use local credentials.
 - If it is empty, the app can still be deployed to an existing version, rolled back, backed up, restored and compared, but it cannot be built.
 
 Set it locally:
 
 ```sh
 ship prod app set web source.path ~/code/web
+ship prod app set api source.path https://github.com/acme/api.git
 ```
 
-This edits only `servers.prod.sources.web`. Clear it with an empty value:
+This edits only `servers.prod.sources.<app>`. Clear it with an empty value:
 
 ```sh
 ship prod app set web source.path ""
@@ -77,10 +83,35 @@ ship prod deploy web
 
 `app set ... source.type image` clears `repo` and `asset`. Changing to `github-release` needs a `repo` before the record validates.
 
+### Git URL builds
+
+A Git URL is fetched into `~/.ship/servers/<server>/repositories/<host>/...`, keyed by the full host and repository path so two repositories with the same basename do not collide. The cache origin is checked before every use. Each build clones the resolved commit into a separate directory under `~/.ship/servers/<server>/builds/<app>/`; a failed or concurrent build cannot change another build's or the cache's inputs. Builds use the server's architecture, just like a directory build.
+
+- No version: the remote default branch's latest commit.
+- `commit:<sha>`: build that commit (7–40 hex characters; ambiguous short SHAs are refused).
+- `release:<tag>`: verify the tag is a published GitHub release through `gh`, then build source at the tag's commit.
+- `release:<tag>:<asset>`: use one asset from that published release instead of building source. See below.
+
+The build image is tagged with the full commit SHA. The TUI's **v** action opens a Commits/Releases picker; releases offer **Build source** or a downloadable asset. The same selection is available on the CLI:
+
+```sh
+ship prod deploy api                       # default branch HEAD
+ship prod deploy api commit:9f2c1ab        # a commit
+ship prod deploy api release:v1.2.3        # source at the release tag
+ship prod deploy api release:v1.2.3:api_linux_amd64
+```
+
+The last successfully deployed identity is stored in `/opt/apps/<app>/.ship-state` as `current`/`previous` (image tags) plus `current_ref`/`previous_ref` (`branch:main`, `commit:<sha>`, `release:<tag>` or `release:<tag>:<asset>`). Rollback and a failed deploy restore the matching refs. `status` marks `newer=yes` when the running commit is behind the remote default branch, or when a newer published release exists for a release identity. Network and authentication failures never count as newer.
+
+### Release assets from a Git URL
+
+The asset route uses the trusted repository checkout at the release tag as the Docker build context. It requires `Dockerfile.release`, or a root `Dockerfile` that declares `ARG BINARY`; the asset is copied into the context as `ship-release-binary` and passed as `BINARY`, with the tag as `VERSION`. The Dockerfile must consume `BINARY` (and unpack an archive if needed). Source `build.commands` are not run for this route. Release assets are downloaded with `gh api` on this machine, verified against GitHub's asset digest or the release's `SHA256SUMS`/`checksums.txt`, and staged outside the checkout before being copied in. Checksum files are not offered as choices. The image version includes the tag, asset name, source commit and verified payload digest, so replacing an asset or moving a tag produces a distinct image and cannot overwrite the rollback tag.
+
 ## How the version is chosen
 
 - Release apps: `latest`, or the tag you pass to `ship prod deploy <app> <tag>`. Tags match `vX.Y.Z[-suffix]`.
-- Image apps: `git describe --tags --always` in `sources.<app>`. A dirty tree refuses to build unless you pass `--allow-dirty`, which appends `-dirty-<UTC timestamp>`.
+- Directory image apps: `git describe --tags --always` in `sources.<app>`. A dirty tree refuses to build unless you pass `--allow-dirty`, which appends `-dirty-<UTC timestamp>`.
+- Git URL image apps: the commit SHA, with a typed ref as described above.
 
 The build platform is the server's detected architecture, `linux/amd64` or `linux/arm64`.
 

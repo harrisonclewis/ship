@@ -505,6 +505,128 @@ grep -q PROMOTE "$WORK/log"
 	}
 }
 
+func TestAgentStateStoresTypedRefs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the agent test harness needs bash")
+	}
+	agent, err := filepath.Abs("../../ship-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	harness := filepath.Join(work, "harness.sh")
+	script := `set -euo pipefail
+source "$AGENT"
+APPS="$WORK/apps"
+mkdir -p "$APPS/app"
+sha_a=$(printf 'a%.0s' $(seq 1 40))
+sha_b=$(printf 'b%.0s' $(seq 1 40))
+set_state app "$sha_a" "$sha_b" 'release:v1.2.3' 'branch:main'
+[ "$(state_get app current)" = "$sha_a" ]
+[ "$(state_get app previous)" = "$sha_b" ]
+[ "$(state_get app current_ref)" = "release:v1.2.3" ]
+[ "$(state_get app previous_ref)" = "branch:main" ]
+if ( set_state app "$sha_a" "$sha_b" 'bad ref' ); then
+  echo "invalid ref was accepted"; exit 1
+fi
+`
+	if err := os.WriteFile(harness, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", harness)
+	cmd.Env = append(os.Environ(), "AGENT="+agent, "WORK="+work)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("agent harness: %v\n%s", err, out)
+	}
+}
+
+func TestAgentRejectsRefBeforeContainerSwitch(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the agent test harness needs bash")
+	}
+	agent, err := filepath.Abs("../../ship-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	harness := filepath.Join(work, "harness.sh")
+	script := `set -euo pipefail
+source "$AGENT"
+APPS="$WORK/apps"
+STATE="$APPS/.ship"
+mkdir -p "$APPS/app/.ship/desired"
+printf 'source=image\nmaintenance=off\nimage_repo=ship/app\n' > "$APPS/app/.ship/desired/.ship-meta"
+validate_desired_app(){ :; }
+meta_get(){ case "$2" in source) echo image ;; maintenance) echo off ;; image_repo) echo ship/app ;; esac; }
+deploy_image(){ echo DEPLOY >> "$WORK/log"; }
+compose_app(){ echo COMPOSE >> "$WORK/log"; }
+if ( deploy_app app v1 yes desired 'bad ref' ); then
+  echo "deploy accepted an invalid ref"; exit 1
+fi
+[ ! -e "$WORK/log" ]
+`
+	if err := os.WriteFile(harness, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", harness)
+	cmd.Env = append(os.Environ(), "AGENT="+agent, "WORK="+work)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("agent harness: %v\n%s", err, out)
+	}
+}
+
+func TestAgentRollbackPreservesRefs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the agent test harness needs bash")
+	}
+	agent, err := filepath.Abs("../../ship-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	harness := filepath.Join(work, "harness.sh")
+	script := `set -euo pipefail
+source "$AGENT"
+APPS="$WORK/apps"
+STATE="$APPS/.ship"
+mkdir -p "$APPS/app/.ship/desired"
+sha_a=$(printf 'a%.0s' $(seq 1 40))
+sha_b=$(printf 'b%.0s' $(seq 1 40))
+printf 'current=%s\nprevious=%s\ncurrent_ref=branch:main\nprevious_ref=release:v1\n' "$sha_a" "$sha_b" > "$APPS/app/.ship-state"
+printf 'source=image\nmaintenance=off\nimage_repo=ship/app\n' > "$APPS/app/.ship-meta"
+printf 'source=image\nmaintenance=off\nimage_repo=ship/app\n' > "$APPS/app/.ship/desired/.ship-meta"
+validate_app(){ :; }
+validate_desired_app(){ :; }
+meta_get(){ case "$2" in source) echo image ;; maintenance) echo off ;; image_repo) echo ship/app ;; esac; }
+is_healthy(){ return 0; }
+desired_matches_running(){ return 1; }
+maintenance_mount(){ :; }
+deploy_image(){ RESOLVED_TAG=$2; DEPLOY_IMAGE="ship/app:$2"; }
+compose_app(){ :; }
+ensure_data_dirs(){ :; }
+write_ship_env(){ :; }
+promote_desired(){ :; }
+prune_images(){ :; }
+http_check(){ return 0; }
+has_data(){ return 0; }
+take_backup(){ :; }
+maintenance_app(){ :; }
+rollback_app app
+[ "$(state_get app current)" = "$sha_b" ]
+[ "$(state_get app previous)" = "$sha_a" ]
+[ "$(state_get app current_ref)" = "release:v1" ]
+[ "$(state_get app previous_ref)" = "branch:main" ]
+`
+	if err := os.WriteFile(harness, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", harness)
+	cmd.Env = append(os.Environ(), "AGENT="+agent, "WORK="+work)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("agent harness: %v\n%s", err, out)
+	}
+}
+
 func tarNames(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {

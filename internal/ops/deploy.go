@@ -136,6 +136,7 @@ func (o *Ops) deployApp(ctx context.Context, s *remote.Session, srv *config.Serv
 	}
 
 	built := false
+	sourceRef := ""
 	switch app.Source.Type {
 	case "github-release":
 		if version == "" {
@@ -144,7 +145,45 @@ func (o *Ops) deployApp(ctx context.Context, s *remote.Session, srv *config.Serv
 			return err
 		}
 	case "image":
-		if version == "" {
+		repo, gitSource, err := o.gitSource(srv.Name, name)
+		if err != nil {
+			return err
+		}
+		if gitSource {
+			// Reject a bad selector before touching the cache or network.
+			sel, err := parseGitSelector(version)
+			if err != nil {
+				return err
+			}
+			resolved := gitResolution{Commit: "dry-run", Ref: dryRunGitRef(sel), ImageVersion: "dry-run"}
+			if sel.kind == "release-asset" {
+				resolved.Tag = sel.value
+				resolved.Asset = sel.asset
+				resolved.ImageVersion = "asset-dry-run"
+			}
+			cache, err := o.ensureGitCache(ctx, s, srv.Name, repo)
+			if err != nil {
+				return err
+			}
+			if !s.DryRun {
+				resolved, err = o.resolveGitRevision(ctx, cache, repo, version)
+				if err != nil {
+					return err
+				}
+			}
+			builtVersion := resolved.ImageVersion
+			if resolved.Asset != "" {
+				builtVersion, err = o.buildReleaseAssetImage(ctx, s, srv, name, resolved, repo, cache)
+				if err != nil {
+					return err
+				}
+			} else if err := o.buildGitImage(ctx, s, srv, name, app, resolved, cache); err != nil {
+				return err
+			}
+			version = builtVersion
+			sourceRef = resolved.Ref
+			built = true
+		} else if version == "" {
 			builtVersion, err := o.buildImage(ctx, s, srv, name, allowDirty)
 			if err != nil {
 				return err
@@ -170,6 +209,9 @@ func (o *Ops) deployApp(ctx context.Context, s *remote.Session, srv *config.Serv
 		fmt.Fprintf(s.Out, "# deploy commands will run with sh -e in a one-off %s container of %s:\n%s\n",
 			service, srv.ImageRef(name, version), app.Deploy.Commands)
 	}
+	if sourceRef != "" {
+		return s.RunAgent("deploy", name, version, sourceRef)
+	}
 	return s.RunAgent("deploy", name, version)
 }
 
@@ -191,6 +233,21 @@ func checkMaintenanceSupport(s *remote.Session, srv *config.Server) error {
 	return nil
 }
 
+// checkLocalBuild keeps the local-connection warning and Docker access check
+// in one place so directory and Git builds behave the same.
+func checkLocalBuild(s *remote.Session, name string) error {
+	if !s.LocalMode {
+		return nil
+	}
+	// Building on the server needs Docker access as well as CPU and memory
+	// that the running apps share.
+	if _, err := s.OutputLocal("docker", "info"); err != nil {
+		return fmt.Errorf("cannot reach the local Docker daemon; add your user to the docker group or run ship as root: %w", err)
+	}
+	fmt.Fprintf(s.Out, "warning: building %s uses this server's CPU and memory\n", name)
+	return nil
+}
+
 func (o *Ops) buildImage(ctx context.Context, s *remote.Session, srv *config.Server, name string, allowDirty bool) (string, error) {
 	app := srv.Apps[name]
 	dir := srv.Sources[name]
@@ -203,13 +260,8 @@ func (o *Ops) buildImage(ctx context.Context, s *remote.Session, srv *config.Ser
 	if fi, err := os.Stat(filepath.Join(dir, "Dockerfile")); err != nil || fi.IsDir() {
 		return "", fmt.Errorf("image app %s has no Dockerfile in %s (see docs/guides/deploy-an-app.md)", name, dir)
 	}
-	if s.LocalMode {
-		// Building on the server needs Docker access as well as CPU and memory
-		// that the running apps share.
-		if _, err := s.OutputLocal("docker", "info"); err != nil {
-			return "", fmt.Errorf("cannot reach the local Docker daemon; add your user to the docker group or run ship as root: %w", err)
-		}
-		fmt.Fprintf(s.Out, "warning: building %s uses this server's CPU and memory\n", name)
+	if err := checkLocalBuild(s, name); err != nil {
+		return "", err
 	}
 
 	version := "dry-run"

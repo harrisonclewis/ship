@@ -45,9 +45,11 @@ type AppValues struct {
 	RedirectsText     string
 	Upstream          string
 	SourceType        string
+	SourceKind        string // release, dir or git (local source flavour)
 	SourceRepo        string
 	SourceAsset       string
 	SourcePath        string
+	SourceURL         string
 	UID               string
 	DataText          string
 	HealthPath        string

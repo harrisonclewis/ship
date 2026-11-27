@@ -61,6 +61,8 @@ type RunningApp struct {
 	Meta          map[string]string
 	Current       string
 	Previous      string
+	CurrentRef    string
+	PreviousRef   string
 }
 
 // AppliedSetup records the admin user and app:uid list the last setup applied.
@@ -313,6 +315,8 @@ func (c *ServerConfig) accept(name string, body []byte) error {
 			kv := parseKV(body)
 			ra.Current = kv["current"]
 			ra.Previous = kv["previous"]
+			ra.CurrentRef = kv["current_ref"]
+			ra.PreviousRef = kv["previous_ref"]
 		default:
 			return fmt.Errorf("config export: unexpected running file %q", name)
 		}

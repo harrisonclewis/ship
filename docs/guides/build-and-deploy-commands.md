@@ -19,6 +19,8 @@ Both are YAML block scalars and run with `sh -e`, stopping at the first failing 
 
 `build.commands` run on your machine in `sources.<app>`, after the clean-tree check and before `docker buildx build`. They are only valid for `source.type: image`.
 
+For a Git URL source they run in the isolated checkout of the resolved commit. A release-asset deploy from a Git URL (`release:<tag>:<asset>`) does not run `build.commands`: it builds from the verified prebuilt asset.
+
 Because the script comes from the server, ship treats it as untrusted on each machine. When it is new or has changed, ship prints it and asks before running it:
 
 ```text

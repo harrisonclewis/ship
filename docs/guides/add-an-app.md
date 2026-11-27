@@ -18,12 +18,11 @@ source:
 backup: {}
 ```
 
-For a release app, change `source` to `type: github-release` with `repo` and optional `asset`. The record keys are described below.
-
-For an image app, point this machine at the checkout:
+The TUI offers **Source directory**, **Git repository URL** and **GitHub release asset**. For a release-asset app, change `source` to `type: github-release` with `repo` and optional `asset`. For an image app built from a directory or Git URL, point this machine at the input:
 
 ```sh
 ship prod app set hello source.path ~/code/hello
+ship prod app set hello source.path https://github.com/acme/hello.git
 ```
 
 | Key | What it does |
@@ -31,7 +30,7 @@ ship prod app set hello source.path ~/code/hello
 | `domains` | one or more FQDNs, all served; the first is canonical |
 | `redirects` | optional FQDNs that permanently redirect to the canonical domain |
 | `upstream` | `service:port` on the `web` network |
-| `source` | `github-release`, or `image` with a local checkout in `sources.<app>` |
+| `source` | `github-release`, or `image` with a local directory or Git URL in `sources.<app>` |
 | `uid` | optional app user and data owner; required for SQLite backups |
 | `data` | server directories the app owns |
 | `health.http_path` | optional extra path checked from inside `web` after a switch |

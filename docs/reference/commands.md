@@ -28,7 +28,7 @@ With only one server in `ship.yaml`, the server name is optional.
 | `ship <server> vps reboot` | reboot the server (with confirmation) |
 | `ship <server> proxy sync` | render the Caddyfile from server records and reload Caddy with the desired `caddy_image` (`proxy update` is the old alias) |
 | `ship <server> proxy restart` | render from server records, activate the desired `caddy_image` and recreate the Caddy container, applying every pending change |
-| `ship <server> deploy <app> [version]` | deploy one app from its desired config |
+| `ship <server> deploy <app> [version]` | deploy one app from its desired config; Git URL image sources also accept `commit:<sha>`, `release:<tag>` and `release:<tag>:<asset>`, and use the remote default branch when no version is given |
 | `ship <server> deploy all` | deploy every desired app in name order |
 | `ship <server> deploy … --allow-dirty` | allow an uncommitted image build |
 | `ship <server> rollback <app>` | previous image; the database is not restored |
@@ -51,7 +51,7 @@ With only one server in `ship.yaml`, the server name is optional.
 | `ship <server> restore <app> <archive> [--yes]` | pre-restore backup, stop, restore, health-check |
 | `ship <server> diff [app]` | compare desired with running config, plus proxy and setup state |
 
-`status` without an app lists every desired app and the proxy. It prints a `config` column: `applied`, `pending deploy` or `not deployed`, plus health and version. It also notes when the proxy is out of sync or setup is pending. `backup` without an app backs up every running app. `deploy all` keeps going when an app fails, prints a summary and exits non-zero if any failed. A local archive path passed to `restore` is uploaded first (unless the server uses a local connection).
+`status` without an app lists every desired app and the proxy. It prints a `config` column: `applied`, `pending deploy` or `not deployed`, plus health and version. For Git URL image apps it also prints the typed `ref` and `newer=yes latest=…` when the remote has moved; offline and authentication failures are not reported as newer. It also notes when the proxy is out of sync or setup is pending. `backup` without an app backs up every running app. `deploy all` keeps going when an app fails, prints a summary and exits non-zero if any failed. A local archive path passed to `restore` is uploaded first (unless the server uses a local connection).
 
 ### Local connections
 
@@ -106,7 +106,7 @@ Destructive actions (`lock-ssh`, `rollback`, `vps reboot`, `restore`, `app delet
 Only these commands change local files without contacting a server:
 
 - `ship config edit` edits the local `ship.yaml`.
-- `ship <server> app set <app> source.path <path>` writes `servers.<name>.sources.<app>` in the local `ship.yaml`; an empty value clears it.
+- `ship <server> app set <app> source.path <directory|git-url>` writes `servers.<name>.sources.<app>` in the local `ship.yaml`; an empty value clears it.
 
 Every other app and server command works against the server. `--dry-run` prints the steps instead of changing anything. See [Edit config](../guides/edit-config.md).
 

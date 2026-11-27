@@ -117,7 +117,7 @@ Each desired app directory holds:
 | `.ship-env` | non-secret `env` values generated from the record |
 | `.ship-deploy.sh` | `deploy.commands` generated from the record |
 
-A successful deploy promotes those files to `/opt/apps/<name>/` as the running configuration. The running directory also holds `.ship.env`, `.env` (secrets, root 0600, edited with `ship <server> env edit`) and `.ship-state` (current and previous image).
+A successful deploy promotes those files to `/opt/apps/<name>/` as the running configuration. The running directory also holds `.ship.env`, `.env` (secrets, root 0600, edited with `ship <server> env edit`) and `.ship-state` (current and previous image, plus their typed refs for Git sources).
 
 ## Next steps
 

@@ -18,9 +18,11 @@ servers:
     # Optional: the private key for this server. Without it, ssh uses your
     # ssh config and agent.
     identity_file: ~/.ssh/id_ed25519
-    # Local checkouts for image apps built on this machine. Never uploaded.
+    # Local checkouts or Git URLs for image apps built on this machine.
+    # Never uploaded and never part of the server record.
     sources:
       web: ~/code/web
+      api: https://github.com/acme/api.git
 
     # admin_user and caddy_image are server settings, not local keys:
     #   ship prod server set admin_user ops

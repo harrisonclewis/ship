@@ -47,6 +47,8 @@ The **CONFIG** badge compares desired with running:
 | `pending deploy` | desired changed; deploy the app |
 | `not deployed` | the app has never been deployed |
 
+For a Git URL source, **CURRENT** shows the recorded ref and a **NEW** badge appears when the remote default branch has moved past the running commit, or when a newer published release exists for a running release identity. The badge appears only after a successful deploy and never from a failed network or authentication check.
+
 When anything is out of sync, an alert at the top of the page lists each item, for example `web: config changed, pending deploy`, `Caddy: domains changed, restart Caddy to apply (p)` or `Server: admin_user changed, run setup (s)`. It is hidden when everything is in sync.
 
 | Key | Action |
@@ -72,7 +74,7 @@ When anything is out of sync, an alert at the top of the page lists each item, f
 | Key | Action |
 |---|---|
 | `d` | deploy latest/build |
-| `v` | deploy a version… |
+| `v` | deploy a version…; for Git URL sources this opens the Commits/Releases picker |
 | `o` | roll back (asks first) |
 | `s` | restart |
 | `m` | maintenance on/off |
@@ -101,8 +103,9 @@ The app list, app forms, quick Edit… menu, compose/Dockerfile editor and delet
 
 - **Server form** (`a` on Servers, or `e` on a server) edits the connection in the local `ship.yaml`. Choose **Remote** for `host` and `identity_file`, or **Local** for an optional admin `user`; the other fields are hidden.
 - **Server settings** (`g` on a server) edits `admin_user` and `caddy_image` on the server. Saving may leave setup or Caddy pending; the alert says which key applies it.
-- **App form** (`a` or Edit… → All settings) edits the desired record. An image app's **Local source path** is written only to this machine's `servers.<server>.sources.<app>`.
+- **App form** (`a` or Edit… → All settings) edits the desired record. Source offers **Source directory**, **Git repository URL** and **GitHub release asset**. The directory or URL is written only to this machine's `servers.<server>.sources.<app>`; the server record stays `source.type: image`.
 - **App YAML** (Edit… → Edit app YAML) edits the full server-side record in `$VISUAL`, `$EDITOR` or `vi`.
+- **Commits/Releases picker** (Git URL source, `v`) lazy-loads the default branch's recent commits or published GitHub releases. Selecting a release then offers **Build source** or one of its downloadable assets; checksum files are hidden. Press `r` to refresh the open tab.
 - **compose.yaml / Dockerfile** (`f`, `F`) edit the desired files on the server.
 - Deleting an app removes its desired configuration and stops its stack. Data directories and `.env` are kept.
 

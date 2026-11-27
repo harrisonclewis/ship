@@ -124,6 +124,7 @@ func (m *model) newAppFormValues(server, app string, isNew bool) *appFormValues 
 		OriginalName:      app,
 		IsNew:             isNew,
 		SourceType:        "github-release",
+		SourceKind:        "release",
 		DeployMaintenance: true,
 	}
 	if isNew {
@@ -139,10 +140,21 @@ func (m *model) newAppFormValues(server, app string, isNew bool) *appFormValues 
 	v.SourceType = rec.Source.Type
 	v.SourceRepo = rec.Source.Repo
 	v.SourceAsset = rec.Source.Asset
-	if srv, err := m.backend.Server(server); err == nil && srv.Sources != nil {
-		v.SourcePath = srv.Sources[app]
+	v.SourceKind = "release"
+	if rec.Source.Type == "image" {
+		v.SourceKind = "dir"
+		var localSource string
+		if srv, err := m.backend.Server(server); err == nil && srv.Sources != nil {
+			localSource = srv.Sources[app]
+		}
+		localSource = firstNonEmpty(localSource, rec.Source.Path)
+		if repo, ok := config.GitSource(localSource); ok {
+			v.SourceKind = "git"
+			v.SourceURL = repo.Transport
+		} else {
+			v.SourcePath = localSource
+		}
 	}
-	v.SourcePath = firstNonEmpty(v.SourcePath, rec.Source.Path)
 	if rec.UID != nil {
 		v.UID = strconv.Itoa(*rec.UID)
 	}
@@ -162,6 +174,41 @@ func (m *model) newAppFormValues(server, app string, isNew bool) *appFormValues 
 	return v
 }
 
+// localSourceFromForm returns the value to write to
+// servers.<server>.sources.<app> and whether the entry should be kept.
+func localSourceFromForm(v *appFormValues) (string, bool, error) {
+	switch v.SourceKind {
+	case "git":
+		value := strings.TrimSpace(v.SourceURL)
+		if value == "" {
+			return "", false, fmt.Errorf("a Git repository URL is required")
+		}
+		source, err := config.ParseLocalSource(value)
+		if err != nil {
+			return "", false, err
+		}
+		if !source.IsGit {
+			return "", false, fmt.Errorf("want a Git repository URL, not a directory")
+		}
+		return value, true, nil
+	case "dir":
+		value := strings.TrimSpace(v.SourcePath)
+		if value == "" {
+			return "", false, nil
+		}
+		source, err := config.ParseLocalSource(value)
+		if err != nil {
+			return "", false, err
+		}
+		if source.IsGit {
+			return "", false, fmt.Errorf("want a source directory, not a Git repository URL")
+		}
+		return value, true, nil
+	default:
+		return "", false, nil
+	}
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, v := range values {
 		if v != "" {
@@ -174,14 +221,31 @@ func firstNonEmpty(values ...string) string {
 // appFromForm builds a desired record from the form. source.path is deliberately
 // omitted: it belongs only to this machine's local ship.yaml.
 func appFromForm(v *appFormValues) (*config.App, error) {
+	sourceType := strings.TrimSpace(v.SourceType)
+	repo := strings.TrimSpace(v.SourceRepo)
+	asset := strings.TrimSpace(v.SourceAsset)
+	kind := v.SourceKind
+	if kind == "" {
+		kind = "release"
+		if sourceType == "image" {
+			kind = "dir"
+		}
+	}
+	switch kind {
+	case "release":
+		sourceType = "github-release"
+		v.BuildCommands = ""
+	case "dir", "git":
+		sourceType, repo, asset = "image", "", ""
+	}
 	app := &config.App{
 		Domains:   splitCSV(v.DomainsText),
 		Redirects: splitCSV(v.RedirectsText),
 		Upstream:  strings.TrimSpace(v.Upstream),
 		Source: config.Source{
-			Type:  strings.TrimSpace(v.SourceType),
-			Repo:  strings.TrimSpace(v.SourceRepo),
-			Asset: strings.TrimSpace(v.SourceAsset),
+			Type:  sourceType,
+			Repo:  repo,
+			Asset: asset,
 		},
 		Data:   splitCSV(v.DataText),
 		Health: config.Health{HTTPPath: strings.TrimSpace(v.HealthPath)},
@@ -223,6 +287,16 @@ func appRoutingFields(v *appFormValues) []huh.Field {
 	}
 }
 
+func appSourceKindField(v *appFormValues) huh.Field {
+	return huh.NewSelect[string]().Title("Source").
+		Options(
+			huh.NewOption("Source directory", "dir"),
+			huh.NewOption("Git repository URL", "git"),
+			huh.NewOption("GitHub release asset", "release"),
+		).
+		Value(&v.SourceKind)
+}
+
 func appSourceReleaseFields(v *appFormValues) []huh.Field {
 	return []huh.Field{
 		huh.NewInput().Title("Repository (owner/repo)").Value(&v.SourceRepo),
@@ -232,9 +306,17 @@ func appSourceReleaseFields(v *appFormValues) []huh.Field {
 
 func appSourceImageFields(v *appFormValues) []huh.Field {
 	return []huh.Field{
-		huh.NewInput().Title("Local source path").
-			Description("Stored only in this machine's ship.yaml, never on the server.").
+		huh.NewInput().Title("Source directory").
+			Description("An absolute or ~/ path, stored only in this machine's ship.yaml, never on the server.").
 			Value(&v.SourcePath),
+	}
+}
+
+func appSourceGitFields(v *appFormValues) []huh.Field {
+	return []huh.Field{
+		huh.NewInput().Title("Git repository URL").
+			Description("https://, ssh:// or git@host:path. Stored only in this machine's ship.yaml, never on the server.").
+			Value(&v.SourceURL),
 	}
 }
 
@@ -312,17 +394,17 @@ func (m *model) buildForm(f *formHost) *huh.Form {
 			huh.NewInput().Title("Health path (optional)").Value(&v.HealthPath),
 			huh.NewText().Title("Environment").Description("One KEY=VALUE per line; no secrets here.").Lines(4).Value(&v.Env),
 		)
-		source := huh.NewGroup(
-			huh.NewSelect[string]().Title("Source type").
-				Options(huh.NewOption("GitHub release", "github-release"), huh.NewOption("Local image", "image")).
-				Value(&v.SourceType),
-		)
+		source := huh.NewGroup(appSourceKindField(v))
 		release := huh.NewGroup(appSourceReleaseFields(v)...).
-			WithHideFunc(func() bool { return v.SourceType != "github-release" })
+			WithHideFunc(func() bool { return v.SourceKind != "release" })
 		imageFields := appSourceImageFields(v)
 		imageFields = append(imageFields, appBuildFields(v)...)
 		image := huh.NewGroup(imageFields...).
-			WithHideFunc(func() bool { return v.SourceType != "image" })
+			WithHideFunc(func() bool { return v.SourceKind != "dir" })
+		gitFields := appSourceGitFields(v)
+		gitFields = append(gitFields, appBuildFields(v)...)
+		gitSource := huh.NewGroup(gitFields...).
+			WithHideFunc(func() bool { return v.SourceKind != "git" })
 		backup := huh.NewGroup(
 			huh.NewInput().Title("SQLite backups (comma separated)").Value(&v.BackupSQLite),
 			huh.NewInput().Title("File backups (comma separated)").Value(&v.BackupFiles),
@@ -331,17 +413,21 @@ func (m *model) buildForm(f *formHost) *huh.Form {
 			huh.NewInput().Title("Postgres user").Value(&v.PostgresUser),
 		)
 		deploy := huh.NewGroup(appDeployFields(v)...)
-		return huh.NewForm(basics, storage, source, release, image, backup, deploy).WithWidth(width)
+		return huh.NewForm(basics, storage, source, release, image, gitSource, backup, deploy).WithWidth(width)
 	case formEditAppSource, formEditAppDomains, formEditAppCommands:
 		v := f.app
 		f.title = "Edit " + v.Name
 		switch f.purpose {
 		case formEditAppSource:
 			f.title = "Source · " + v.Name
-			if v.SourceType == "image" {
-				return huh.NewForm(huh.NewGroup(appSourceImageFields(v)...)).WithWidth(width)
-			}
-			return huh.NewForm(huh.NewGroup(appSourceReleaseFields(v)...)).WithWidth(width)
+			kind := huh.NewGroup(appSourceKindField(v))
+			release := huh.NewGroup(appSourceReleaseFields(v)...).
+				WithHideFunc(func() bool { return v.SourceKind != "release" })
+			dir := huh.NewGroup(appSourceImageFields(v)...).
+				WithHideFunc(func() bool { return v.SourceKind != "dir" })
+			gitSource := huh.NewGroup(appSourceGitFields(v)...).
+				WithHideFunc(func() bool { return v.SourceKind != "git" })
+			return huh.NewForm(kind, release, dir, gitSource).WithWidth(width)
 		case formEditAppDomains:
 			f.title = "Domains & redirects · " + v.Name
 			return huh.NewForm(huh.NewGroup(appRoutingFields(v)...)).WithWidth(width)

@@ -91,6 +91,9 @@ type Backend interface {
 	PutServerSettings(ctx context.Context, server, adminUser, caddyImage, expectedHash string) (string, error)
 	RemoveDesiredApp(ctx context.Context, server, app, expectedHash string) error
 	RecordBuildApproval(ctx context.Context, server, app, script string) error
+	GitCommits(ctx context.Context, server, app string) ([]ops.GitCommit, error)
+	GitReleases(ctx context.Context, server, app string) ([]ops.GitRelease, error)
+	GitReleaseAssets(ctx context.Context, server, app, tag string) ([]ops.GitAsset, error)
 	TerminalCommand(ctx context.Context, req TerminalRequest) (cmd *exec.Cmd, display string, err error)
 }
 
@@ -145,6 +148,18 @@ func (b *realBackend) RemoveDesiredApp(ctx context.Context, server, app, expecte
 
 func (b *realBackend) RecordBuildApproval(ctx context.Context, server, app, script string) error {
 	return b.ops(io.Discard).RecordBuildApproval(server, app, script)
+}
+
+func (b *realBackend) GitCommits(ctx context.Context, server, app string) ([]ops.GitCommit, error) {
+	return b.ops(io.Discard).GitCommits(ctx, server, app)
+}
+
+func (b *realBackend) GitReleases(ctx context.Context, server, app string) ([]ops.GitRelease, error) {
+	return b.ops(io.Discard).GitReleases(ctx, server, app)
+}
+
+func (b *realBackend) GitReleaseAssets(ctx context.Context, server, app, tag string) ([]ops.GitAsset, error) {
+	return b.ops(io.Discard).GitReleaseAssets(ctx, server, app, tag)
 }
 
 func (b *realBackend) ListBackups(ctx context.Context, server, app string) ([]BackupEntry, error) {

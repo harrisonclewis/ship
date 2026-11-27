@@ -44,6 +44,8 @@ func (m *model) View() string {
 			content = m.viewRestorePick()
 		case pageCompare:
 			content = m.viewCompare()
+		case pageDeployPick:
+			content = m.viewDeployPick()
 		}
 	}
 
@@ -115,6 +117,8 @@ func (m *model) crumbs() []string {
 		return []string{"Servers", m.serverName, m.appName, "Restore"}
 	case m.page == pageCompare:
 		return []string{"Servers", m.serverName, m.appName, "Compare"}
+	case m.page == pageDeployPick:
+		return []string{"Servers", m.serverName, m.appName, "Deploy"}
 	case m.page == pageActivity:
 		return []string{"Activity"}
 	}
@@ -160,6 +164,8 @@ func (m *model) hints() []keyHint {
 		return []keyHint{{"enter", "restore"}, {"p", "local path"}, {"r", "refresh"}, {"esc", "back"}}
 	case pageCompare:
 		return []keyHint{{"esc", "back"}, {"↑/↓", "scroll"}}
+	case pageDeployPick:
+		return []keyHint{{"enter", "deploy"}, {"tab", "commits/releases"}, {"r", "refresh"}, {"esc", "back"}}
 	default:
 		return []keyHint{{"enter", "open"}, {"a", "add server"}, {"e", "edit ship.yaml"}, {"r", "refresh"}, {"tab", "switch"}, {"q", "quit"}}
 	}
@@ -517,11 +523,15 @@ func (m *model) viewApps(height int) string {
 			st, deployed := m.appStatus(m.serverName, name)
 			current, previous, health := "", "", ""
 			maintenance := false
+			badge := ""
 			if deployed {
-				current = displayAppValue(st.Current)
+				current = displayAppCurrent(st)
 				previous = displayAppValue(st.Previous)
 				health = displayAppValue(st.Health)
 				maintenance = st.Maintenance
+				if st.Newer {
+					badge = "NEW"
+				}
 			} else if loading && !haveStatus {
 				current, previous, health = "…", "…", "…"
 			} else {
@@ -537,7 +547,6 @@ func (m *model) viewApps(height int) string {
 				configText = "?"
 			}
 
-			badge := ""
 			if maintenance {
 				badge = "MAINT"
 			}
@@ -608,6 +617,16 @@ func displayAppValue(v string) string {
 		return "-"
 	}
 	return v
+}
+
+func displayAppCurrent(st ops.AppStatus) string {
+	if tag, ok := strings.CutPrefix(st.Ref, "release:"); ok {
+		return tag
+	}
+	if st.SourceKind == "git" && len(st.Current) > 12 {
+		return st.Current[:12]
+	}
+	return displayAppValue(st.Current)
 }
 
 func healthKind(health string) string {
@@ -727,6 +746,99 @@ func (m *model) viewOutput() string {
 		content = styleMuted.Render("No run selected.")
 	}
 	return panel(title, content, m.width, m.bodyHeight(), true)
+}
+
+func (m *model) viewDeployPick() string {
+	inner := m.width - 2
+	if m.pickReleaseTag != "" {
+		body := []string{"Release " + m.pickReleaseTag, ""}
+		switch {
+		case m.pickAssetLoad:
+			body = append(body, styleAccent.Render(spinner(m.spinnerFrame)+" loading release assets…"))
+		case m.pickAssetErr != "":
+			body = append(body, styleWarning.Render(clip("Could not load assets: "+m.pickAssetErr, inner-2)))
+			body = append(body, "")
+		}
+		if !m.pickAssetLoad && m.pickAssetsReady {
+			choices := []string{"Build source at " + m.pickReleaseTag}
+			for _, a := range m.pickAssets {
+				choices = append(choices, "Use asset "+a.Name)
+			}
+			start := windowStart(m.pickChoiceCur, len(choices), max(1, m.bodyHeight()-6))
+			for i := start; i < len(choices) && i < start+max(1, m.bodyHeight()-6); i++ {
+				plain := cursorFor(i == m.pickChoiceCur) + " " + choices[i]
+				if i == m.pickChoiceCur {
+					body = append(body, styleSelection.Render(fit(plain, inner)))
+				} else {
+					body = append(body, styleText.Render(fit(plain, inner)))
+				}
+			}
+		}
+		return panel("Deploy "+m.pickApp, strings.Join(body, "\n"), m.width, m.bodyHeight(), false)
+	}
+	tabs := "Commits   Releases"
+	if m.pickTab == 0 {
+		tabs = styleSelection.Render("Commits") + "   " + styleMuted.Render("Releases")
+	} else {
+		tabs = styleMuted.Render("Commits") + "   " + styleSelection.Render("Releases")
+	}
+	body := []string{fit("  "+tabs, inner), ""}
+	tab := m.pickTab
+	switch {
+	case m.pickLoading[tab]:
+		body = append(body, styleAccent.Render(spinner(m.spinnerFrame)+" loading…"))
+	case m.pickErr[tab] != "":
+		body = append(body, styleError.Render(clip(m.pickErr[tab], inner-2)))
+	}
+	rows := max(1, m.bodyHeight()-6)
+	if tab == 0 {
+		if !m.pickLoading[tab] && len(m.pickCommits) == 0 && m.pickErr[tab] == "" {
+			body = append(body, styleMuted.Render("No commits on the default branch."))
+		}
+		st, _ := m.appStatus(m.pickServer, m.pickApp)
+		start := windowStart(m.pickCursor, len(m.pickCommits), rows)
+		for i := start; i < len(m.pickCommits) && i < start+rows; i++ {
+			c := m.pickCommits[i]
+			marker := ""
+			if st.Current == c.SHA {
+				marker = "  current"
+			}
+			subject := strings.Join(strings.Fields(ansi.Strip(c.Subject)), " ")
+			plain := fmt.Sprintf("%s %-9s %-12s %s", cursorFor(i == m.pickCursor), c.Short, c.Time.Format("2006-01-02"), clip(subject, inner-44)+marker)
+			if i == m.pickCursor {
+				body = append(body, styleSelection.Render(fit(plain, inner)))
+			} else {
+				body = append(body, styleText.Render(fit(plain, inner)))
+			}
+		}
+	} else {
+		if !m.pickLoading[tab] && len(m.pickReleases) == 0 && m.pickErr[tab] == "" {
+			body = append(body, styleMuted.Render("No published releases."))
+		}
+		st, _ := m.appStatus(m.pickServer, m.pickApp)
+		start := windowStart(m.pickCursor, len(m.pickReleases), rows)
+		for i := start; i < len(m.pickReleases) && i < start+rows; i++ {
+			r := m.pickReleases[i]
+			label := r.Tag
+			if r.Name != "" && r.Name != r.Tag {
+				label += "  " + strings.Join(strings.Fields(ansi.Strip(r.Name)), " ")
+			}
+			if r.Latest {
+				label += "  latest"
+			}
+			if st.Ref == "release:"+r.Tag || strings.HasPrefix(st.Ref, "release:"+r.Tag+":") {
+				label += "  current"
+			}
+			plain := fmt.Sprintf("%s %-18s %-12s %s", cursorFor(i == m.pickCursor), clip(label, 46), r.Published.Format("2006-01-02"), "")
+			plain = strings.TrimRight(plain, " ")
+			if i == m.pickCursor {
+				body = append(body, styleSelection.Render(fit(plain, inner)))
+			} else {
+				body = append(body, styleText.Render(fit(plain, inner)))
+			}
+		}
+	}
+	return panel("Deploy "+m.pickApp, strings.Join(body, "\n"), m.width, m.bodyHeight(), false)
 }
 
 func (m *model) viewCompare() string {

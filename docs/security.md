@@ -1,6 +1,8 @@
 # Security
 
 - **Verified releases.** App release binaries are checked against the release's `SHA256SUMS` or `checksums.txt`, and the built image must report the tag. See [Deploy an app](guides/deploy-an-app.md#github-release-apps).
+- **Local Git sources.** A Git repository URL is stored only in this machine's `sources.<app>`, never in a server record. A server cannot choose the build input or cause ship to use local Git credentials. URLs with credentials, query strings, fragments, `file://`, `ext::` and unsafe path segments are rejected before Git runs.
+- **Verified release assets.** Release assets selected from a Git URL source are downloaded with `gh api` on this machine and verified against GitHub's asset digest or the release's `SHA256SUMS`/`checksums.txt`. Downloads are staged away from the checkout, and the verified file is copied into a dedicated build filename without following symlinks. Checksum files are never offered as assets. The image version binds the tag, asset name, source commit and payload digest.
 - **Signed updates.** `ship update` installs only releases whose `SHA256SUMS` carries a valid Ed25519 signature bound to the version. See [Update ship](guides/update-ship.md).
 - **No registry.** Image apps go straight from your machine to the server over SSH, so there are no registry tokens to leak.
 - **Backups before changes.** A backup is taken before a switch when the app has data on the server, and before every restore (`pre-restore`).

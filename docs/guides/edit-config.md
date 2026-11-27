@@ -29,7 +29,7 @@ The server name is required because the app is stored on that server; with exact
 | Key | Value |
 |---|---|
 | `source.type` | `github-release` or `image` |
-| `source.path` | local checkout for an image app; writes local `sources.<app>`, not the server |
+| `source.path` | local directory or Git repository URL for an image app; writes local `sources.<app>`, not the server |
 | `source.repo` | GitHub `owner/repo` |
 | `source.asset` | release asset pattern; empty restores the default |
 | `domains` | one or more domains, replacing the list |
@@ -44,10 +44,11 @@ An unknown key lists the valid ones. For `build.commands` and `deploy.commands`,
 ship prod app set hello deploy.commands - < deploy.sh
 ```
 
-`source.path` is special: it edits the local `servers.prod.sources.hello` entry and never contacts the server. An empty value clears it:
+`source.path` is special: it edits the local `servers.prod.sources.hello` entry and never contacts the server. It accepts a directory or a supported Git URL. An empty value clears it:
 
 ```sh
 ship prod app set web source.path ~/code/web
+ship prod app set api source.path https://github.com/acme/api.git
 ship prod app set web source.path ""
 ```
 
