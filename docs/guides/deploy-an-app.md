@@ -94,6 +94,7 @@ ship prod deploy web release:v1.2.3:web_linux_amd64  # a release asset
 - `release:<tag>:<asset>` downloads the asset with `gh api`, verifies it, and builds from the tag's checkout. The asset build uses `Dockerfile.release` when present; otherwise the root `Dockerfile` must declare `ARG BINARY`. The asset is copied in as `ship-release-binary` and passed as `BINARY`, with the tag as `VERSION`. The build directory and Docker context follow `build_dirs.<app>`. Source build commands are skipped on this route.
 - Checksum assets are not offered in the picker. Both the selected asset and the release checksum files are staged separately from the checkout, and a verified copy is placed into the build input.
 - The image version for an asset includes the tag, asset name, source commit, verified payload digest and, when set, the build directory, so a replaced asset, moved tag or changed build directory never collides with the rollback image.
+- Git never prompts. An unknown SSH host key fails with an error naming the host and the `ssh -T` command to run; the TUI offers `t` to run it in your terminal. A changed host key is never trusted automatically.
 
 The TUI **v** action opens a Commits/Releases picker. Select a release to choose **Build source** or one of its assets. Caches live in `~/.ship/servers/<server>/repositories/`; each build uses a separate directory under `~/.ship/servers/<server>/builds/<app>/`.
 

@@ -1103,6 +1103,125 @@ func TestGitReleasePickerBuildsSourceOrAsset(t *testing.T) {
 	}
 }
 
+func TestDeployHostKeyErrorOffersTrustForUnknownKey(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	appWithState(t, m, fake)
+	fake.runFn = func(ctx context.Context, req Request, out io.Writer) (Result, error) {
+		return Result{}, &ops.GitHostKeyError{Host: "git.example.com", User: "deploy", Port: "2222"}
+	}
+	runCmd(t, m, m.startRun(Request{Action: ActDeploy, Server: "prod", App: "app"}))
+	if m.confirm == nil {
+		t.Fatal("host key error did not open an alert")
+	}
+	if m.confirm.trustHost != "git.example.com" || m.confirm.trust == nil {
+		t.Fatalf("alert does not offer trust: %+v", m.confirm)
+	}
+	if !strings.Contains(m.confirm.body, "ssh -T -p 2222 deploy@git.example.com") {
+		t.Fatalf("alert does not show the trust command: %q", m.confirm.body)
+	}
+	if !hasHint(m.hints(), "t", "trust git.example.com") {
+		t.Fatalf("no trust hint: %+v", m.hints())
+	}
+	if cmd := sshTrustCommand(&ops.GitHostKeyError{Host: "git.example.com", User: "deploy", Port: "2222"}); strings.Join(cmd.Args, " ") != "ssh -T -p 2222 deploy@git.example.com" {
+		t.Fatalf("trust command = %v", cmd.Args)
+	}
+	_, cmd := press(t, m, "t")
+	if m.confirm != nil {
+		t.Fatal("alert stayed open after trust")
+	}
+	if cmd == nil {
+		t.Fatal("trust did not start the terminal handoff")
+	}
+}
+
+func TestDeployHostKeyErrorChangedKeyOffersNoTrust(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	appWithState(t, m, fake)
+	fake.runFn = func(ctx context.Context, req Request, out io.Writer) (Result, error) {
+		return Result{}, &ops.GitHostKeyError{Host: "github.com", User: "git", Changed: true}
+	}
+	runCmd(t, m, m.startRun(Request{Action: ActDeploy, Server: "prod", App: "app"}))
+	if m.confirm == nil {
+		t.Fatal("changed host key did not open an alert")
+	}
+	if m.confirm.trustHost != "" || m.confirm.trust != nil {
+		t.Fatalf("changed key offers trust: %+v", m.confirm)
+	}
+	if !strings.Contains(m.confirm.body, "has changed") {
+		t.Fatalf("changed-key alert is unclear: %q", m.confirm.body)
+	}
+	if hasHint(m.hints(), "t", "trust github.com") {
+		t.Fatalf("changed key shows a trust hint: %+v", m.hints())
+	}
+}
+
+func TestDeployPickerHostKeyErrorOffersTrust(t *testing.T) {
+	doc := strings.Replace(tuiTestDoc, "web: ~/web", "web: git@github.com:acme/web.git", 1)
+	m, fake := testModel(t, doc)
+	state := testState("staging", map[string]*config.App{
+		"web": decodedRecord(t, "domains: [web.example.com]\nupstream: web:8080\nsource: {type: image}\n"),
+	})
+	setVariances(m, fake, "staging", ops.VarianceReport{
+		Server: "staging",
+		State:  state,
+		Apps:   []ops.AppVariance{{App: "web", State: ops.VarianceApplied}},
+	})
+	fake.commitsFn = func(server, app string) ([]ops.GitCommit, error) {
+		return nil, &ops.GitHostKeyError{Host: "github.com", User: "git"}
+	}
+	m.serverName = "staging"
+	m.appName = "web"
+	m.page = pageAppActions
+
+	runCmd(t, m, m.openDeployPicker())
+	if m.page != pageDeployPick {
+		t.Fatalf("page = %v", m.page)
+	}
+	if m.pickHostKey == nil || m.pickHostKey.Host != "github.com" {
+		t.Fatalf("picker did not keep the host key error: %+v", m.pickHostKey)
+	}
+	if !hasHint(m.hints(), "t", "trust github.com") {
+		t.Fatalf("no trust hint: %+v", m.hints())
+	}
+	if view := m.View(); !strings.Contains(view, "trust github.com") {
+		t.Fatalf("picker error does not offer trust:\n%s", view)
+	}
+	_, cmd := press(t, m, "t")
+	if cmd == nil {
+		t.Fatal("trust did not start the terminal handoff")
+	}
+}
+
+func TestDeployPickerChangedHostKeyOffersNoTrust(t *testing.T) {
+	doc := strings.Replace(tuiTestDoc, "web: ~/web", "web: git@github.com:acme/web.git", 1)
+	m, fake := testModel(t, doc)
+	state := testState("staging", map[string]*config.App{
+		"web": decodedRecord(t, "domains: [web.example.com]\nupstream: web:8080\nsource: {type: image}\n"),
+	})
+	setVariances(m, fake, "staging", ops.VarianceReport{
+		Server: "staging",
+		State:  state,
+		Apps:   []ops.AppVariance{{App: "web", State: ops.VarianceApplied}},
+	})
+	fake.commitsFn = func(server, app string) ([]ops.GitCommit, error) {
+		return nil, &ops.GitHostKeyError{Host: "github.com", User: "git", Changed: true}
+	}
+	m.serverName = "staging"
+	m.appName = "web"
+	m.page = pageAppActions
+
+	runCmd(t, m, m.openDeployPicker())
+	if m.pickHostKey != nil {
+		t.Fatalf("changed key offered trust: %+v", m.pickHostKey)
+	}
+	if !strings.Contains(m.pickErr[0], "has changed") {
+		t.Fatalf("picker error is unclear: %q", m.pickErr[0])
+	}
+	if hasHint(m.hints(), "t", "trust github.com") {
+		t.Fatalf("changed key shows a trust hint: %+v", m.hints())
+	}
+}
+
 func TestRestartAndSyncCaddyActions(t *testing.T) {
 	m, fake := testModel(t, tuiTestDoc)
 	appWithState(t, m, fake)

@@ -109,6 +109,8 @@ ship prod deploy web
 
 ### Git URL builds
 
+Ship runs every Git command non-interactively: ssh is given `BatchMode=yes`, and an existing `GIT_SSH_COMMAND` or `core.sshCommand` is kept and extended. A bare `GIT_SSH` is left alone. Ship never accepts a host key automatically and never writes to `known_hosts`. If the host key is unknown, the error names the host and shows the check to run (`ssh -T git@<host>`, including the user and port from the source URL); trust it once in a terminal, then retry. If the host key has **changed**, Ship refuses to offer that step: check the key manually first. An `https://` URL avoids SSH keys entirely.
+
 A Git URL is fetched into `~/.ship/servers/<server>/repositories/<host>/...`, keyed by the full host and repository path so two repositories with the same basename do not collide. The cache origin is checked before every use. Each build clones the resolved commit into a separate directory under `~/.ship/servers/<server>/builds/<app>/`; a failed or concurrent build cannot change another build's or the cache's inputs. Builds use the server's architecture, just like a directory build.
 
 A `build_dirs.<app>` setting changes the build directory inside that isolated checkout. Build commands run there, the Dockerfile or `Dockerfile.release` is selected there, and Docker uses it as the context. The complete checkout is still present and is removed after the build. Blank means the repository root.

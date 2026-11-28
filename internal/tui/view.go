@@ -137,7 +137,11 @@ func (m *model) hints() []keyHint {
 	}
 	if m.confirm != nil {
 		if m.confirm.ack {
-			return []keyHint{{"enter", "close"}}
+			hints := []keyHint{{"enter", "close"}}
+			if m.confirm.trustHost != "" {
+				hints = append([]keyHint{{"t", "trust " + m.confirm.trustHost}}, hints...)
+			}
+			return hints
 		}
 		yes, no := "confirm", "cancel"
 		if m.confirm.yesHint != "" {
@@ -146,7 +150,11 @@ func (m *model) hints() []keyHint {
 		if m.confirm.noHint != "" {
 			no = m.confirm.noHint
 		}
-		return []keyHint{{"enter/y", yes}, {"esc/n", no}}
+		hints := []keyHint{{"enter/y", yes}, {"esc/n", no}}
+		if m.confirm.trustHost != "" {
+			hints = append(hints, keyHint{"t", "trust " + m.confirm.trustHost})
+		}
+		return hints
 	}
 	switch m.page {
 	case pageActivity:
@@ -171,7 +179,11 @@ func (m *model) hints() []keyHint {
 	case pageCompare:
 		return []keyHint{{"esc", "back"}, {"↑/↓", "scroll"}}
 	case pageDeployPick:
-		return []keyHint{{"enter", "deploy"}, {"tab", "commits/releases"}, {"r", "refresh"}, {"esc", "back"}}
+		hints := []keyHint{{"enter", "deploy"}, {"tab", "commits/releases"}, {"r", "refresh"}, {"esc", "back"}}
+		if m.pickHostKey != nil {
+			hints = append([]keyHint{{"t", "trust " + m.pickHostKey.Host}}, hints...)
+		}
+		return hints
 	default:
 		return []keyHint{{"enter", "open"}, {"a", "add server"}, {"e", "edit ship.yaml"}, {"r", "refresh"}, {"tab", "switch"}, {"q", "quit"}}
 	}
@@ -795,6 +807,9 @@ func (m *model) viewDeployPick() string {
 		body = append(body, styleAccent.Render(spinner(m.spinnerFrame)+" loading…"))
 	case m.pickErr[tab] != "":
 		body = append(body, styleError.Render(clip(m.pickErr[tab], inner-2)))
+		if m.pickHostKey != nil {
+			body = append(body, styleMuted.Render("t  trust "+m.pickHostKey.Host))
+		}
 	}
 	rows := max(1, m.bodyHeight()-6)
 	if tab == 0 {
@@ -955,6 +970,9 @@ func (m *model) viewConfirm() string {
 			no = c.noHint
 		}
 		footer = "Enter/y " + yes + "   ·   Esc/n " + no
+	}
+	if c.trustHost != "" {
+		footer = "t trust " + c.trustHost + "   ·   " + footer
 	}
 	lines := append([]string{}, content...)
 	if c.scrollable {

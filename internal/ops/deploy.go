@@ -32,16 +32,30 @@ type DeploySummary struct {
 // OK reports whether every app deployed.
 func (s DeploySummary) OK() bool { return len(s.Failed) == 0 }
 
+type deploySummaryError struct {
+	message string
+	errs    []error
+}
+
+func (e *deploySummaryError) Error() string { return e.message }
+
+func (e *deploySummaryError) Unwrap() []error { return e.errs }
+
 func (s DeploySummary) summaryError() error {
 	if s.OK() {
 		return nil
 	}
 	parts := make([]string, 0, len(s.Failed))
+	errs := make([]error, 0, len(s.Failed))
 	for _, f := range s.Failed {
 		parts = append(parts, f.App+": "+f.Err.Error())
+		errs = append(errs, f.Err)
 	}
-	return fmt.Errorf("%d of %d deploys failed on %s: %s",
-		len(s.Failed), len(s.Succeeded)+len(s.Failed), s.Server, strings.Join(parts, "; "))
+	return &deploySummaryError{
+		message: fmt.Sprintf("%d of %d deploys failed on %s: %s",
+			len(s.Failed), len(s.Succeeded)+len(s.Failed), s.Server, strings.Join(parts, "; ")),
+		errs: errs,
+	}
 }
 
 // Deploy deploys one app on a server. An empty version builds the current git

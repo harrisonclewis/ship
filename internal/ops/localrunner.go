@@ -58,7 +58,8 @@ func (execLocalRunner) Download(ctx context.Context, dir string, env []string, w
 }
 
 // gitEnv disables interactive credential prompts so a background refresh or
-// deploy cannot hang waiting for a terminal.
+// deploy cannot hang waiting for a terminal. SSH is made non-interactive
+// separately in gitEnvironment.
 func gitEnv() []string {
 	return []string{
 		"GIT_TERMINAL_PROMPT=0",

@@ -198,7 +198,7 @@ func (o *Ops) ensureGitCache(ctx context.Context, s *remote.Session, server stri
 	if fi, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
 		if err := gitSessionRun(ctx, s, "clone", "--mirror", "--", repo.Transport, dir); err != nil {
 			_ = os.RemoveAll(dir)
-			return "", fmt.Errorf("clone repository into the cache: %w", err)
+			return "", fmt.Errorf("clone repository into the cache: %w", wrapGitHostKeyError(err, repo))
 		}
 	} else if err != nil {
 		return "", err
@@ -214,7 +214,7 @@ func (o *Ops) ensureGitCache(ctx context.Context, s *remote.Session, server stri
 		}
 		if err := gitSessionRun(ctx, s, "-C", dir, "fetch", "--prune", "origin",
 			"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"); err != nil {
-			return "", fmt.Errorf("fetch repository: %w", err)
+			return "", fmt.Errorf("fetch repository: %w", wrapGitHostKeyError(err, repo))
 		}
 	}
 	return dir, nil
@@ -244,30 +244,28 @@ func acquireGitLock(ctx context.Context, path string) (func(), error) {
 }
 
 func gitSessionRun(ctx context.Context, s *remote.Session, args ...string) error {
-	return s.Runner.Run(remote.Cmd{
+	stderr := &captureWriter{w: s.Err}
+	err := s.Runner.Run(remote.Cmd{
 		Path:    "git",
 		Args:    args,
 		Context: ctx,
 		Stdout:  s.Out,
-		Stderr:  s.Err,
+		Stderr:  stderr,
 		Env:     gitEnvironment(),
 	})
+	return gitError(err, stderr.buf.String())
 }
 
 func gitSessionOutput(ctx context.Context, s *remote.Session, args ...string) ([]byte, error) {
-	return s.Runner.Output(remote.Cmd{
+	stderr := &captureWriter{w: s.Err}
+	out, err := s.Runner.Output(remote.Cmd{
 		Path:    "git",
 		Args:    args,
 		Context: ctx,
-		Stderr:  s.Err,
+		Stderr:  stderr,
 		Env:     gitEnvironment(),
 	})
-}
-
-// gitEnvironment keeps the user's HOME, SSH agent and Git configuration while
-// disabling terminal credential prompts.
-func gitEnvironment() []string {
-	return mergeEnv(os.Environ(), gitEnv())
+	return out, gitError(err, stderr.buf.String())
 }
 
 // resolveGitRevision turns a deploy version selector into a commit and a
@@ -313,7 +311,8 @@ func (o *Ops) resolveGitRevision(ctx context.Context, cache string, repo config.
 		}
 		return resolved, nil
 	default:
-		return o.defaultBranchRevision(ctx, cache)
+		resolved, err := o.defaultBranchRevision(ctx, cache)
+		return resolved, wrapGitHostKeyError(err, repo)
 	}
 }
 
@@ -339,7 +338,7 @@ func (o *Ops) defaultBranchRevision(ctx context.Context, cache string) (gitResol
 	out, err = o.gitOutput(ctx, nil, "-C", cache, "rev-parse", "--verify", "refs/heads/"+branch+"^{commit}")
 	if err != nil {
 		// The branch appeared or moved after the fetch; fetch and retry once.
-		if _, fetchErr := o.local.Output(ctx, "", gitEnv(), "git", "-C", cache, "fetch", "--prune", "origin",
+		if _, fetchErr := o.local.Output(ctx, "", gitEnvironment(), "git", "-C", cache, "fetch", "--prune", "origin",
 			"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"); fetchErr != nil {
 			return gitResolution{}, fmt.Errorf("fetch the default branch: %w", fetchErr)
 		}
@@ -404,7 +403,7 @@ func (o *Ops) GitCommits(ctx context.Context, server, app string) ([]GitCommit, 
 	}
 	resolved, err := o.defaultBranchRevision(ctx, cache)
 	if err != nil {
-		return nil, err
+		return nil, wrapGitHostKeyError(err, repo)
 	}
 	out, err := o.gitOutput(ctx, nil, "-C", cache, "log", "-n", fmt.Sprint(gitCommitLimit), "--format=%H%x00%h%x00%cI%x00%s", resolved.Commit)
 	if err != nil {
@@ -530,7 +529,7 @@ func (o *Ops) newerAvailable(ctx context.Context, repo config.GitRepo, current, 
 	}
 	out, err := o.gitOutput(ctx, nil, "ls-remote", "--symref", repo.Transport, "HEAD")
 	if err != nil {
-		return false, "", err
+		return false, "", wrapGitHostKeyError(err, repo)
 	}
 	sha := ""
 	for _, line := range strings.Split(string(out), "\n") {
@@ -553,7 +552,7 @@ func (o *Ops) gitOutput(ctx context.Context, s *remote.Session, args ...string) 
 	if s != nil {
 		return gitSessionOutput(ctx, s, args...)
 	}
-	return o.local.Output(ctx, "", gitEnv(), "git", args...)
+	return o.local.Output(ctx, "", gitEnvironment(), "git", args...)
 }
 
 func (o *Ops) ghOutput(ctx context.Context, args ...string) ([]byte, error) {

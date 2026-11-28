@@ -161,6 +161,8 @@ type confirmDialog struct {
 	ack        bool
 	yesHint    string
 	noHint     string
+	trustHost  string
+	trust      func() tea.Cmd
 }
 
 type editKind int
@@ -258,6 +260,7 @@ type model struct {
 	pickAssetErr    string
 	pickChoiceCur   int
 	pickAssetsReady bool
+	pickHostKey     *ops.GitHostKeyError
 
 	vp            viewport.Model
 	spinnerFrame  int
@@ -493,8 +496,16 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pickLoading[0] = false
 		m.pickLoaded[0] = true
 		m.pickCommits = msg.items
+		m.pickHostKey = nil
 		if msg.err != nil {
-			m.pickErr[0] = msg.err.Error()
+			if hostKey := asHostKeyError(msg.err); hostKey != nil {
+				m.pickErr[0] = hostKey.Error()
+				if !hostKey.Changed {
+					m.pickHostKey = hostKey
+				}
+			} else {
+				m.pickErr[0] = msg.err.Error()
+			}
 		} else {
 			m.pickErr[0] = ""
 		}
@@ -507,6 +518,7 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pickLoading[1] = false
 		m.pickLoaded[1] = true
 		m.pickReleases = msg.items
+		m.pickHostKey = nil
 		if msg.err != nil {
 			m.pickErr[1] = msg.err.Error()
 		} else {
@@ -543,6 +555,20 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case terminalReadyMsg:
 		return m, m.terminalReady(msg)
 	case terminalDoneMsg:
+		if msg.trustHost != "" {
+			var startErr *exec.Error
+			if errors.As(msg.err, &startErr) {
+				m.showToast(toastError, "Could not run ssh: "+msg.err.Error())
+				return m, nil
+			}
+			// ssh -T exits 1 even after the host key was accepted, so the
+			// only reliable success signal is that the TUI resumed.
+			m.showToast(toastInfo, "Checked "+msg.trustHost+"; retry when ready.")
+			if m.page == pageDeployPick {
+				return m, m.loadDeployTab(m.pickTab, true)
+			}
+			return m, nil
+		}
 		if msg.err != nil {
 			m.showToast(toastError, msg.err.Error())
 		} else {
@@ -591,7 +617,8 @@ func (m *model) sourceFormInDetails() bool {
 }
 
 type terminalDoneMsg struct {
-	err error
+	err       error
+	trustHost string
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -612,6 +639,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if m.confirm != nil {
+		if key == "t" && m.confirm.trust != nil {
+			trust := m.confirm.trust
+			m.confirm = nil
+			return m, trust()
+		}
 		if m.confirm.ack {
 			switch key {
 			case "y", "enter", "n", "esc", "q":
@@ -979,6 +1011,7 @@ func (m *model) openDeployPicker() tea.Cmd {
 	m.pickAssetErr = ""
 	m.pickChoiceCur = 0
 	m.pickAssetsReady = false
+	m.pickHostKey = nil
 	m.page = pageDeployPick
 	return m.loadDeployTab(0, true)
 }
@@ -992,6 +1025,7 @@ func (m *model) loadDeployTab(tab int, force bool) tea.Cmd {
 	}
 	m.pickLoading[tab] = true
 	m.pickErr[tab] = ""
+	m.pickHostKey = nil
 	backend := m.backend
 	server, app := m.pickServer, m.pickApp
 	if tab == 0 {
@@ -1041,6 +1075,9 @@ func (m *model) pickChoiceLength() int {
 }
 
 func (m *model) handleDeployPickKey(key string) (tea.Model, tea.Cmd) {
+	if key == "t" && m.pickHostKey != nil {
+		return m, m.trustHost(m.pickHostKey)
+	}
 	if m.pickReleaseTag != "" {
 		// Choice view for one selected release.
 		switch key {
@@ -1434,10 +1471,13 @@ func (m *model) finishRun(msg runDoneMsg) tea.Cmd {
 	entry.endTime = time.Now()
 	entry.cancel()
 	var approval *ops.BuildApprovalError
+	var hostKey *ops.GitHostKeyError
 	if msg.err != nil {
 		entry.state = runFailed
 		if errors.Is(msg.err, context.Canceled) {
 			m.showToast(toastWarning, entry.label+" on "+entry.req.Server+" was cancelled.")
+		} else if errors.As(msg.err, &hostKey) {
+			m.openGitHostKeyError(hostKey)
 		} else if errors.As(msg.err, &approval) {
 			m.showToast(toastWarning, entry.label+" needs build approval.")
 			m.openBuildApproval(approval, entry.req)
@@ -1530,6 +1570,40 @@ func (m *model) openConfirmChoice(title, body string, yes, no func() tea.Cmd) {
 
 func (m *model) openNotice(title, body string) {
 	m.confirm = &confirmDialog{title: title, body: body, ack: true}
+}
+
+// openGitHostKeyError shows the SSH failure and, for an unknown key, offers to
+// run the interactive ssh check. A changed key is never offered.
+func (m *model) openGitHostKeyError(e *ops.GitHostKeyError) {
+	dialog := &confirmDialog{title: "SSH host key", body: e.Error(), ack: true}
+	if !e.Changed {
+		dialog.trustHost = e.Host
+		dialog.trust = func() tea.Cmd { return m.trustHost(e) }
+	}
+	m.confirm = dialog
+}
+
+// trustHost runs ssh in the terminal so the user can check the fingerprint and
+// answer the prompt. The command is built only from the configured source.
+func (m *model) trustHost(e *ops.GitHostKeyError) tea.Cmd {
+	cmd := sshTrustCommand(e)
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+		return terminalDoneMsg{err: err, trustHost: e.Host}
+	})
+}
+
+// sshTrustCommand is the interactive check for one parsed host. The host, user
+// and port come from the app's configured Git source, never from free text.
+func sshTrustCommand(e *ops.GitHostKeyError) *exec.Cmd {
+	return exec.Command("ssh", e.SSHArgs()...)
+}
+
+func asHostKeyError(err error) *ops.GitHostKeyError {
+	var hostKey *ops.GitHostKeyError
+	if errors.As(err, &hostKey) {
+		return hostKey
+	}
+	return nil
 }
 
 func (m *model) openBuildApproval(e *ops.BuildApprovalError, req Request) {
