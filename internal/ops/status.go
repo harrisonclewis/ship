@@ -20,6 +20,9 @@ type AppStatus struct {
 	Health      string
 	Maintenance bool
 	Config      string
+	// LastDeployed is the server-recorded UTC RFC3339 time of the last
+	// healthy deploy that switched or applied the stack. Empty means unknown.
+	LastDeployed string
 	// Newer is set only after a successful deploy and a fresh remote check.
 	Newer  bool
 	Latest string
@@ -159,11 +162,12 @@ func ParseStatusKV(out []byte) (StatusReport, error) {
 				return report, fmt.Errorf("status app record has no name: %q", line)
 			}
 			report.Apps = append(report.Apps, AppStatus{
-				App:         name,
-				Current:     dashValue(kv["current"]),
-				Previous:    dashValue(kv["previous"]),
-				Health:      dashValue(kv["health"]),
-				Maintenance: kv["maintenance"] == "on",
+				App:          name,
+				Current:      dashValue(kv["current"]),
+				Previous:     dashValue(kv["previous"]),
+				Health:       dashValue(kv["health"]),
+				Maintenance:  kv["maintenance"] == "on",
+				LastDeployed: dashValue(kv["last_deployed"]),
 			})
 		default:
 			return report, fmt.Errorf("unexpected status record %q", fields[0])
@@ -195,7 +199,7 @@ func (o *Ops) printStatus(report StatusReport) {
 		if a.Ref != "" {
 			fmt.Fprintf(o.opts.Out, " ref=%s", a.Ref)
 		}
-		fmt.Fprintf(o.opts.Out, " health=%s config=%s", displayValue(a.Health), displayValue(a.Config))
+		fmt.Fprintf(o.opts.Out, " health=%s config=%s last_deployed=%s", displayValue(a.Health), displayValue(a.Config), displayValue(a.LastDeployed))
 		if a.Maintenance {
 			fmt.Fprint(o.opts.Out, " maintenance=on")
 		}

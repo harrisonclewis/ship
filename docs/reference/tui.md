@@ -89,7 +89,7 @@ When anything is out of sync, an alert at the top of the page lists each item, f
 | `c` | compare running with desired |
 | `x` | delete the app (asks first) |
 
-`↑`/`↓`, `j`/`k` move, `Enter` runs, `Esc` goes back. The app actions page shows the app's **CONFIG** and health badges.
+`↑`/`↓`, `j`/`k` move, `Enter` runs, `Esc` goes back. The app actions page shows the app's **CONFIG** and health badges, plus the server-recorded **LAST DEPLOYED** time (UTC RFC3339, or `-` when no time was stored for an older deploy). A no-op deploy, failed deploy or restart keeps the previous time.
 
 ## Server actions screen
 

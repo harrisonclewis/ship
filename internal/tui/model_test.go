@@ -1347,6 +1347,37 @@ func TestMaintenanceBadgeAndToggle(t *testing.T) {
 	}
 }
 
+func TestAppActionsShowsLastDeployed(t *testing.T) {
+	m, fake := testModel(t, tuiTestDoc)
+	appWithState(t, m, fake)
+	m.Update(statusFor("prod", ops.AppStatus{
+		App:          "app",
+		Current:      "v1.2.3",
+		Health:       "healthy",
+		LastDeployed: "2026-11-27T12:34:56Z",
+	}))
+	m.appName = "app"
+	m.page = pageAppActions
+	view := m.View()
+	for _, want := range []string{"LAST DEPLOYED", "2026-11-27T12:34:56Z"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("app actions view missing %q:\n%s", want, view)
+		}
+	}
+
+	m.Update(statusFor("prod", ops.AppStatus{App: "app", Current: "v1.2.3", Health: "healthy"}))
+	view = m.View()
+	if !strings.Contains(view, "LAST DEPLOYED -") {
+		t.Errorf("app actions view missing the missing-value convention:\n%s", view)
+	}
+
+	delete(m.statuses, "prod")
+	view = m.View()
+	if !strings.Contains(view, "LAST DEPLOYED -") {
+		t.Errorf("app actions view with no status missing the same dash:\n%s", view)
+	}
+}
+
 func TestConfirmGatesDeployAll(t *testing.T) {
 	m, fake := testModel(t, tuiTestDoc)
 	appWithState(t, m, fake)

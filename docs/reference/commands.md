@@ -51,7 +51,7 @@ With only one server in `ship.yaml`, the server name is optional.
 | `ship <server> restore <app> <archive> [--yes]` | pre-restore backup, stop, restore, health-check |
 | `ship <server> diff [app]` | compare desired with running config, plus proxy and setup state |
 
-`status` without an app lists every desired app and the proxy. It prints a `config` column: `applied`, `pending deploy` or `not deployed`, plus health and version. For Git URL image apps it also prints the typed `ref` and `newer=yes latest=…` when the remote has moved; offline and authentication failures are not reported as newer. It also notes when the proxy is out of sync or setup is pending. `backup` without an app backs up every running app. `deploy all` keeps going when an app fails, prints a summary and exits non-zero if any failed. A local archive path passed to `restore` is uploaded first (unless the server uses a local connection).
+`status` without an app lists every desired app and the proxy. It prints a `config` column: `applied`, `pending deploy` or `not deployed`, plus health, version and the server-recorded `last_deployed` time in UTC RFC3339 (`-` when there is no recorded time, such as for an older app). For Git URL image apps it also prints the typed `ref` and `newer=yes latest=…` when the remote has moved; offline and authentication failures are not reported as newer. It also notes when the proxy is out of sync or setup is pending. `backup` without an app backs up every running app. `deploy all` keeps going when an app fails, prints a summary and exits non-zero if any failed. A local archive path passed to `restore` is uploaded first (unless the server uses a local connection).
 
 ### Local connections
 

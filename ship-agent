@@ -161,14 +161,17 @@ valid_deploy_ref() {
 }
 
 set_state() {
-  local app=$1 cur=$2 prev=$3 cur_ref=${4:-} prev_ref=${5:-} tmp
+  local app=$1 cur=$2 prev=$3 cur_ref=${4:-} prev_ref=${5:-} last_deployed=${6:-} tmp
   [[ $cur =~ $VER_RE ]] || die "refusing to record version '$cur'"
   [ -z "$prev" ] || [[ $prev =~ $VER_RE ]] || die "refusing to record previous '$prev'"
   valid_deploy_ref "$cur_ref" || die "refusing to record ref '$cur_ref'"
   valid_deploy_ref "$prev_ref" || die "refusing to record previous ref '$prev_ref'"
+  # Only a deploy that actually switches a healthy stack stamps this field.
+  # Ref changes and recovery after a failed deploy keep the previous time.
+  [ -n "$last_deployed" ] || last_deployed=$(state_get "$app" last_deployed)
   tmp=$(mktemp "$APPS/$app/.ship-state.XXXXXX")
-  printf 'current=%s\nprevious=%s\ncurrent_ref=%s\nprevious_ref=%s\n' \
-    "$cur" "$prev" "$cur_ref" "$prev_ref" > "$tmp"
+  printf 'current=%s\nprevious=%s\ncurrent_ref=%s\nprevious_ref=%s\nlast_deployed=%s\n' \
+    "$cur" "$prev" "$cur_ref" "$prev_ref" "$last_deployed" > "$tmp"
   chmod 0644 "$tmp"
   mv "$tmp" "$APPS/$app/.ship-state"
 }
@@ -1004,7 +1007,7 @@ promote_desired() {
 # belongs to the version being rolled back from, not to the restored image.
 deploy_app() {
   local app=$1 version=$2 run_commands=${3:-yes} config=${4:-desired} ref=${5:-}
-  local source prev prevprev cur_ref prev_ref image resolved maintenance archive deploy_script desired
+  local source prev prevprev cur_ref prev_ref image resolved maintenance archive deploy_script desired last_deployed
   if [ "$config" = running ]; then
     validate_app "$app"
   else
@@ -1126,17 +1129,21 @@ deploy_app() {
 
   note "starting $app $resolved"
   if compose_app "$app" up -d --wait --wait-timeout 120 && is_healthy "$app" && http_check "$app"; then
+    # Promote first so the timestamp is recorded only after the running
+    # configuration is applied. The state write still comes before prune,
+    # which reads current and previous from .ship-state.
+    if [ "$config" = desired ]; then
+      promote_desired "$app"
+    fi
+    last_deployed=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     if [ "$prev" != "$resolved" ]; then
-      set_state "$app" "$resolved" "${prev:-}" "$ref" "$cur_ref"
+      set_state "$app" "$resolved" "${prev:-}" "$ref" "$cur_ref" "$last_deployed"
     else
-      set_state "$app" "$resolved" "$prevprev" "$ref" "$prev_ref"
+      set_state "$app" "$resolved" "$prevprev" "$ref" "$prev_ref" "$last_deployed"
     fi
     prune_images "$app"
     if [ "$maintenance" = on ]; then
       maintenance_app "$app" off
-    fi
-    if [ "$config" = desired ]; then
-      promote_desired "$app"
     fi
     note "$app $resolved is running and healthy"
     return 0
@@ -1213,14 +1220,15 @@ reboot_flag() {
 }
 
 status_app_kv() {
-  local app=$1 cur prev h maintenance=off
+  local app=$1 cur prev h maintenance=off last_deployed
   validate_app "$app"
   cur=$(state_get "$app" current)
   prev=$(state_get "$app" previous)
+  last_deployed=$(state_get "$app" last_deployed)
   h=$(health_status "$app")
   [ -f "$PROXY/maintenance/$app" ] && maintenance=on
-  printf 'app name=%s current=%s previous=%s health=%s maintenance=%s\n' \
-    "$app" "${cur:--}" "${prev:--}" "$h" "$maintenance"
+  printf 'app name=%s current=%s previous=%s health=%s maintenance=%s last_deployed=%s\n' \
+    "$app" "${cur:--}" "${prev:--}" "$h" "$maintenance" "${last_deployed:--}"
 }
 
 status_cmd() {

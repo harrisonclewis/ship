@@ -359,7 +359,7 @@ source "$AGENT"
 APPS="$WORK/apps"
 STATE="$APPS/.ship"
 mkdir -p "$APPS/app/.ship/desired"
-printf 'current=v1\nprevious=v0\n' > "$APPS/app/.ship-state"
+printf 'current=v1\nprevious=v0\nlast_deployed=2020-01-02T03:04:05Z\n' > "$APPS/app/.ship-state"
 printf 'source=image\nmaintenance=off\nimage_repo=ship/app\n' > "$APPS/app/.ship-meta"
 validate_desired_app(){ :; }
 meta_get(){ case "$2" in source) echo image ;; maintenance) echo off ;; esac; }
@@ -371,6 +371,7 @@ take_backup(){ echo BACKUP >> "$WORK/log"; }
 maintenance_app(){ echo MAINT >> "$WORK/log"; }
 promote_desired(){ echo PROMOTE >> "$WORK/log"; }
 deploy_app app v1 yes
+[ "$(state_get app last_deployed)" = "2020-01-02T03:04:05Z" ]
 [ ! -e "$WORK/log" ]
 `
 	if err := os.WriteFile(harness, []byte(script), 0o644); err != nil {
@@ -521,14 +522,96 @@ APPS="$WORK/apps"
 mkdir -p "$APPS/app"
 sha_a=$(printf 'a%.0s' $(seq 1 40))
 sha_b=$(printf 'b%.0s' $(seq 1 40))
+printf 'last_deployed=2026-01-02T03:04:05Z\n' > "$APPS/app/.ship-state"
 set_state app "$sha_a" "$sha_b" 'release:v1.2.3' 'branch:main'
 [ "$(state_get app current)" = "$sha_a" ]
 [ "$(state_get app previous)" = "$sha_b" ]
 [ "$(state_get app current_ref)" = "release:v1.2.3" ]
 [ "$(state_get app previous_ref)" = "branch:main" ]
+[ "$(state_get app last_deployed)" = "2026-01-02T03:04:05Z" ]
+set_state app "$sha_a" "$sha_b" 'release:v1.2.3' 'branch:main' 2026-02-03T04:05:06Z
+[ "$(state_get app last_deployed)" = "2026-02-03T04:05:06Z" ]
 if ( set_state app "$sha_a" "$sha_b" 'bad ref' ); then
   echo "invalid ref was accepted"; exit 1
 fi
+`
+	if err := os.WriteFile(harness, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", harness)
+	cmd.Env = append(os.Environ(), "AGENT="+agent, "WORK="+work)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("agent harness: %v\n%s", err, out)
+	}
+}
+
+func TestAgentLastDeployedLifecycle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the agent test harness needs bash")
+	}
+	agent, err := filepath.Abs("../../ship-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	harness := filepath.Join(work, "harness.sh")
+	script := `set -euo pipefail
+source "$AGENT"
+APPS="$WORK/apps"
+PROXY="$WORK/proxy"
+old=2020-01-02T03:04:05Z
+mkdir -p "$APPS/app/.ship/desired" "$APPS/legacy" "$PROXY"
+printf 'current=v1\nprevious=v0\ncurrent_ref=branch:main\nprevious_ref=release:v0\nlast_deployed=%s\n' "$old" > "$APPS/app/.ship-state"
+printf 'source=image\nmaintenance=off\nimage_repo=ship/app\n' > "$APPS/app/.ship-meta"
+printf 'source=image\nmaintenance=off\nimage_repo=ship/app\n' > "$APPS/app/.ship/desired/.ship-meta"
+printf 'source=image\nmaintenance=off\n' > "$APPS/legacy/.ship-meta"
+printf 'current=v2\nprevious=v1\n' > "$APPS/legacy/.ship-state"
+validate_desired_app(){ :; }
+meta_get(){ case "$2" in source) echo image ;; maintenance) echo off ;; image_repo) echo ship/app ;; esac; }
+lock_state(){ :; }
+unlock_state(){ :; }
+is_healthy(){ return 0; }
+desired_matches_running(){ return 1; }
+maintenance_mount(){ :; }
+deploy_image(){ RESOLVED_TAG=$2; DEPLOY_IMAGE="ship/app:$2"; }
+compose_app(){ :; }
+ensure_data_dirs(){ :; }
+write_ship_env(){ :; }
+promote_desired(){
+  [ "$(state_get app current)" = v1 ]
+  [ "$(state_get app last_deployed)" = "$old" ]
+  echo PROMOTE >> "$WORK/log"
+}
+prune_images(){
+  [ "$(state_get app current)" = v2 ]
+  ts=$(state_get app last_deployed)
+  [[ $ts =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+  [ "$ts" != "$old" ]
+  echo PRUNE >> "$WORK/log"
+}
+http_check(){ return 0; }
+has_data(){ return 0; }
+take_backup(){ :; }
+maintenance_app(){ :; }
+deploy_app app v2 yes
+ts=$(state_get app last_deployed)
+[[ $ts =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+[ "$ts" != "$old" ]
+grep -qx PROMOTE "$WORK/log"
+grep -qx PRUNE "$WORK/log"
+status_app_kv app | grep -q "last_deployed=$ts"
+status_app_kv legacy | grep -q 'last_deployed=-'
+
+# A failed deploy's restore rewrites current/previous but keeps the time.
+rollback_to app v1 v0 release:v1 branch:main
+[ "$(state_get app current)" = v1 ]
+[ "$(state_get app last_deployed)" = "$ts" ]
+
+# Ordinary state rewrites preserve the time; an explicit stamp replaces it.
+set_state app v3 v2 commit:abc branch:main
+[ "$(state_get app last_deployed)" = "$ts" ]
+set_state app v3 v2 commit:abc branch:main 2026-02-03T04:05:06Z
+[ "$(state_get app last_deployed)" = "2026-02-03T04:05:06Z" ]
 `
 	if err := os.WriteFile(harness, []byte(script), 0o644); err != nil {
 		t.Fatal(err)
@@ -592,7 +675,8 @@ STATE="$APPS/.ship"
 mkdir -p "$APPS/app/.ship/desired"
 sha_a=$(printf 'a%.0s' $(seq 1 40))
 sha_b=$(printf 'b%.0s' $(seq 1 40))
-printf 'current=%s\nprevious=%s\ncurrent_ref=branch:main\nprevious_ref=release:v1\n' "$sha_a" "$sha_b" > "$APPS/app/.ship-state"
+old=2020-01-02T03:04:05Z
+printf 'current=%s\nprevious=%s\ncurrent_ref=branch:main\nprevious_ref=release:v1\nlast_deployed=%s\n' "$sha_a" "$sha_b" "$old" > "$APPS/app/.ship-state"
 printf 'source=image\nmaintenance=off\nimage_repo=ship/app\n' > "$APPS/app/.ship-meta"
 printf 'source=image\nmaintenance=off\nimage_repo=ship/app\n' > "$APPS/app/.ship/desired/.ship-meta"
 validate_app(){ :; }
@@ -616,6 +700,9 @@ rollback_app app
 [ "$(state_get app previous)" = "$sha_a" ]
 [ "$(state_get app current_ref)" = "release:v1" ]
 [ "$(state_get app previous_ref)" = "branch:main" ]
+ts=$(state_get app last_deployed)
+[[ $ts =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+[ "$ts" != "$old" ]
 `
 	if err := os.WriteFile(harness, []byte(script), 0o644); err != nil {
 		t.Fatal(err)

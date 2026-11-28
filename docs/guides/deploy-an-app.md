@@ -41,7 +41,7 @@ If this machine still has an old full-format `ship.yaml`, migrate it once per se
 
 With `deploy.maintenance: false`, steps 5 and 10 are skipped and the site stays up while the new version starts.
 
-Current and previous images are recorded in `.ship-state`; only those two are kept.
+Ship records and retains the current and previous images in `.ship-state`. The file also records the last successful deploy or rollback time in UTC. No-op deploys, failed deploys and restarts keep the existing time.
 
 ## When a deploy fails
 

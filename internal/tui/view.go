@@ -680,12 +680,15 @@ func (m *model) viewAppActions() string {
 		config = "…"
 	}
 	health := "—"
+	lastDeployed := "-"
 	if st, ok := m.appStatus(m.serverName, m.appName); ok {
 		health = displayAppValue(st.Health)
+		lastDeployed = displayAppValue(st.LastDeployed)
 	}
 	header := styleMuted.Render("CONFIG ") + configStyle(config).Render(config) +
 		styleMuted.Render("   HEALTH ") + colourFor(healthKind(health)).Render(health)
-	body = append(body, header, "")
+	body = append(body, header,
+		styleMuted.Render("LAST DEPLOYED ")+styleText.Render(lastDeployed))
 	for i, def := range defs {
 		line := actionLine(def.key, def.label, def.desc, def.danger, i == m.appActCur, inner)
 		body = append(body, line)

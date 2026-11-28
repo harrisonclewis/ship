@@ -1,8 +1,11 @@
 package ops
 
 import (
+	"bytes"
 	"strings"
 	"testing"
+
+	"github.com/harrisonclewis/ship/internal/config"
 )
 
 func TestParseStatusKV(t *testing.T) {
@@ -27,6 +30,52 @@ app name=commerce current=v2.0.0 previous=- health=starting
 	second := report.Apps[1]
 	if second.App != "commerce" || second.Current != "v2.0.0" || second.Previous != "" || second.Health != "starting" {
 		t.Fatalf("second app = %+v", second)
+	}
+}
+
+func TestParseStatusKVLastDeployed(t *testing.T) {
+	out := `server proxy=running reboot_required=no
+app name=new current=v1.2.3 previous=v1.2.2 health=healthy maintenance=off last_deployed=2026-11-27T12:34:56Z
+app name=missing current=v2.0.0 previous=- health=healthy maintenance=off last_deployed=-
+app name=old current=v3.0.0 previous=v2.9.0 health=healthy maintenance=off
+`
+	report, err := ParseStatusKV([]byte(out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Apps) != 3 {
+		t.Fatalf("apps = %#v", report.Apps)
+	}
+	if got := report.Apps[0].LastDeployed; got != "2026-11-27T12:34:56Z" {
+		t.Errorf("new app last deployed = %q", got)
+	}
+	if got := report.Apps[1].LastDeployed; got != "" {
+		t.Errorf("missing timestamp = %q, want empty", got)
+	}
+	if got := report.Apps[2].LastDeployed; got != "" {
+		t.Errorf("old output timestamp = %q, want empty", got)
+	}
+}
+
+func TestPrintStatusLastDeployed(t *testing.T) {
+	var out bytes.Buffer
+	o := New(&config.Config{}, Options{Out: &out})
+	o.printStatus(StatusReport{
+		Server: "prod",
+		Proxy:  "running",
+		Apps: []AppStatus{
+			{App: "new", Current: "v1", Health: "healthy", Config: "applied", LastDeployed: "2026-11-27T12:34:56Z"},
+			{App: "old", Current: "v2", Health: "healthy", Config: "applied"},
+		},
+	})
+	got := out.String()
+	if !strings.Contains(got, "last_deployed=2026-11-27T12:34:56Z") {
+		t.Errorf("status output missing timestamp:\n%s", got)
+	}
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "old") && !strings.Contains(line, "last_deployed=-") {
+			t.Errorf("old app line = %q, want last_deployed=-", line)
+		}
 	}
 }
 
