@@ -499,7 +499,8 @@ deploy_release() {
   [ "$want" = "$got" ] || die "checksum mismatch for $asset: want $want, got $got"
   note "sha256 ok ($got)"
 
-  cp "$work/$asset" "$work/$app"
+  # Downloads have no executable bit. Stage the verified binary for Docker COPY.
+  install -m 0755 "$work/$asset" "$work/$app"
   local df="${META_DIR:-$APPS/$app}/Dockerfile"
   [ -f "$df" ] || die "missing $df"
   docker build -q --build-arg "VERSION=$tag" --build-arg "BINARY=$app" \

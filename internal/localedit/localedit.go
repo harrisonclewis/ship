@@ -205,8 +205,11 @@ func (b *Buffer) Changed() (bool, error) {
 	return !bytes.Equal(data, b.original), nil
 }
 
-// Validate reads the temporary copy and runs the caller's validator.
+// Validate runs the caller's validator on the temporary copy when one is supplied.
 func (b *Buffer) Validate(validate Validator) error {
+	if validate == nil {
+		return nil
+	}
 	data, err := b.Read()
 	if err != nil {
 		return err

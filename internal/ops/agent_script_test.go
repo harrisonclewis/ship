@@ -455,6 +455,51 @@ grep -q "docker image inspect ship/app:v1" "$WORK/log"
 	}
 }
 
+func TestAgentStagesExecutableReleaseBinary(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the release agent targets Linux")
+	}
+	for _, tool := range []string{"bash", "sha256sum"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s is not installed", tool)
+		}
+	}
+	agent, err := filepath.Abs("../../ship-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", "-c", `set -euo pipefail
+source "$AGENT"
+umask 022
+APPS="$WORK/apps"
+mkdir -p "$APPS/app"
+printf 'repo=owner/repo\nasset=app-linux\n' > "$APPS/app/.ship-meta"
+printf 'FROM scratch\nARG BINARY\nCOPY ${BINARY} /app\n' > "$APPS/app/Dockerfile"
+printf 'release payload\n' > "$WORK/app-linux"
+(cd "$WORK" && sha256sum app-linux > SHA256SUMS)
+curl(){
+  local url=${!#}
+  cp "$WORK/${url##*/}" "$5"
+}
+docker(){
+  case "$1" in
+    image) return 1 ;;
+    build)
+      [ -x "${!#}/app" ] || die "staged release binary is not executable"
+      cmp "$WORK/app-linux" "${!#}/app" ;;
+    run) printf 'v1.2.3\n' ;;
+    *) die "unexpected docker command: $*" ;;
+  esac
+}
+deploy_release app v1.2.3
+[ "$DEPLOY_IMAGE" = app:v1.2.3 ]
+`)
+	cmd.Env = append(os.Environ(), "AGENT="+agent, "WORK="+t.TempDir())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("agent harness: %v\n%s", err, out)
+	}
+}
+
 func TestAgentFirstDeployUsesMaintenanceWithoutBackup(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the agent test harness needs bash")

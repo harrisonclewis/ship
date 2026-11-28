@@ -191,6 +191,20 @@ func TestBufferTracksChangesWithoutATargetFile(t *testing.T) {
 	}
 }
 
+func TestBufferAcceptsDockerfileEditWithoutValidator(t *testing.T) {
+	buf, err := BeginBuffer("Dockerfile", []byte("FROM scratch\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer buf.Close()
+	if err := os.WriteFile(buf.TempPath(), []byte("FROM alpine\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := buf.Validate(nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSessionCreatesMissingFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "apps", "app", "compose.yaml")
 	s, err := Begin(path)
